@@ -20,10 +20,13 @@ MODEL = os.getenv("GEMINI_TTS_MODEL", "gemini-3.8-flash-tts")
 VOICE = os.getenv("GEMINI_TTS_VOICE", "Kore")
 FONT_PATH = Path(tempfile.gettempdir()) / "NotoSansEthiopic-Regular.ttf"
 FONT_URL = "https://raw.githubusercontent.com/google/fonts/main/ofl/notosansethiopic/NotoSansEthiopic%5Bwght%5D.ttf"
+_FONT_DOWNLOAD_ATTEMPTED = False
 
 
 def _get_font(size, bold=False):
-    if not FONT_PATH.exists():
+    global _FONT_DOWNLOAD_ATTEMPTED
+    if not FONT_PATH.exists() and not _FONT_DOWNLOAD_ATTEMPTED:
+        _FONT_DOWNLOAD_ATTEMPTED = True
         try:
             response = requests.get(FONT_URL, timeout=(5, 20))
             response.raise_for_status()
