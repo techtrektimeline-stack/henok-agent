@@ -1,0 +1,13 @@
+name: Keep Henok Agent Alive 24/7
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping Render Server
+        run: curl -s https://henok-agent.onrender.com
