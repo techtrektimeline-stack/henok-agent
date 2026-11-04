@@ -7,12 +7,12 @@ import os
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-# Render ሰርቨር 24/7 "Live" ብሎ እንዲያቆየው የሚረዳ አነስተኛ የጀርባ ዌብ ሰርቨር
+# 1. Render ሰርቨር 24/7 Live ሆኖ እንዲቆይ የሚረዳ አነስተኛ ዌብ ሰርቨር
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Henok Agent is running 24/7!")
+        self.wfile.write(b"Henok Autonomous AI Router is LIVE 24/7!")
     def log_message(self, format, *args):
         return
 
@@ -23,8 +23,10 @@ def start_health_server():
 
 threading.Thread(target=start_health_server, daemon=True).start()
 
+# 2. ቁልፎች (Environment Variables)
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
 
 bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
 pending_actions = {}
@@ -37,40 +39,85 @@ Henok manages multiple brands and channels:
 - E-commerce & Monetization: Amazon KDP, Ye-buna (የቡና), Whop Viral Clipping Campaigns.
 - Marketing & Ads: Sekela Marketing (የሰከላ ማርኬቲንግ), Meta/Facebook Ads.
 
-Your Capabilities:
-1. Multimodal Analysis: When Henok sends you an image, a PDF document, an audio note, or a video file, carefully inspect and analyze the content.
-2. For Video & Clipping: Pinpoint exact viral moments/timestamps (e.g., best 30s clips), provide catchy hooks, write platform-ready captions, and extract hashtags.
-3. For PDF/Docs: Summarize, analyze campaign criteria (e.g. Whop requirements), or extract key action items.
-4. Social Media Posting: Draft tailored posts for Telegram, TikTok, Instagram, and YouTube.
-
-Always respond respectfully, practically, and creatively in Amharic (or English when requested), calling him 'ሄኖክ'.
+Your Mission:
+Deliver the highest quality, practical, and polished output. Be creative, persuasive, and structured.
+Always respond in Amharic (or English when requested), calling him 'ሄኖክ'.
 """
 
-def call_gemini_api(parts):
-    models = [
-        "models/gemini-flash-latest",
-        "models/gemini-flash-lite-latest",
-        "models/gemini-pro-latest"
-    ]
-    headers = {"Content-Type": "application/json"}
-    payload = {
-        "contents": [{"parts": parts}]
+# 3. የ OpenRouter ሞዴሎችን የመጥሪያ ፈንክሽን
+def call_openrouter(user_prompt, model_name):
+    if not OPENROUTER_API_KEY:
+        return None
+    url = "https://openrouter.ai/api/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://henok-agent.onrender.com",
+        "X-Title": "Henok Autonomous Agent"
     }
+    payload = {
+        "model": model_name,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt}
+        ]
+    }
+    try:
+        r = requests.post(url, headers=headers, json=payload, timeout=35)
+        if r.status_code == 200:
+            return r.json()["choices"][0]["message"]["content"]
+    except Exception:
+        pass
+    return None
+
+# 4. የ Gemini ጽሑፍ መጥሪያ ፈንክሽን (Fallback)
+def ask_gemini_text(user_prompt):
+    models = ["models/gemini-flash-latest", "models/gemini-flash-lite-latest", "models/gemini-pro-latest"]
+    headers = {"Content-Type": "application/json"}
+    payload = {"contents": [{"parts": [{"text": f"{SYSTEM_PROMPT}\n\nየሄኖክ ጥያቄ/ትዕዛዝ: {user_prompt}"}]}]}
     for model in models:
         url = f"https://generativelanguage.googleapis.com/v1beta/{model}:generateContent?key={GEMINI_API_KEY}"
         try:
-            response = requests.post(url, headers=headers, json=payload, timeout=40)
-            if response.status_code == 200:
-                data = response.json()
-                return data["candidates"][0]["content"]["parts"][0]["text"]
+            res = requests.post(url, headers=headers, json=payload, timeout=35)
+            if res.status_code == 200:
+                return res.json()["candidates"][0]["content"]["parts"][0]["text"]
         except Exception:
             continue
     return "ይቅርታ ሄኖክ፣ ምላሽ ለመስጠት አልተቻለም፤ እባክህ ትንሽ ቆይተህ እንደገና ሞክር።"
 
-def ask_gemini_text(user_prompt):
-    parts = [{"text": f"{SYSTEM_PROMPT}\n\nየሄኖክ ጥያቄ/ትዕዛዝ: {user_prompt}"}]
-    return call_gemini_api(parts)
+# 5. ራሱን ችሎ የተሻለውን AI የሚመርጠው ብልህ ሞተር (Autonomous Smart Router)
+def autonomous_smart_router(user_prompt):
+    text_lower = user_prompt.lower()
+    
+    # ሀ. ለኮዲንግ፣ ለቴክኒክ፣ ለስሌት ወይም አመክንዮ -> DeepSeek R1 / V3 ይመረጣል
+    coding_words = ["code", "python", "html", "css", "js", "api", "bug", "algorithm", "ኮድ", "ስሌት", "ሂሳብ", "ፕሮግራም"]
+    if any(w in text_lower for w in coding_words):
+        resp = call_openrouter(user_prompt, "deepseek/deepseek-chat")
+        if not resp:
+            resp = call_openrouter(user_prompt, "deepseek/deepseek-r1:free")
+        if resp:
+            return f"🤖 **[በ DeepSeek የተዘጋጀ]**\n\n{resp}"
+            
+    # ለ. ለፈጠራ ጽሑፍ፣ ለቪዲዮ ስክሪፕት፣ ለማርኬቲንግ እና ለስቶሪቴሊንግ -> Claude 3.5 Sonnet ይመረጣል
+    creative_words = ["script", "hook", "story", "tiktok", "reels", "youtube", "proposal", "caption", "ስክሪፕት", "ርዕስ", "ማስታወቂያ", "ፕሮፖዛል", "ይዘት", "ታሪክ", "ካፕሽን"]
+    if any(w in text_lower for w in creative_words):
+        resp = call_openrouter(user_prompt, "anthropic/claude-3.5-sonnet")
+        if not resp:
+            resp = call_openrouter(user_prompt, "deepseek/deepseek-chat")
+        if resp:
+            return f"✨ **[በ Claude 3.5 የተዘጋጀ]**\n\n{resp}"
+            
+    # ሐ. ለአጠቃላይ ጥያቄዎች እና ስትራቴጂ -> መጀመሪያ Claude/DeepSeek ከዚያ Gemini
+    resp = call_openrouter(user_prompt, "anthropic/claude-3.5-sonnet")
+    if not resp:
+        resp = call_openrouter(user_prompt, "deepseek/deepseek-chat")
+    if resp:
+        return f"💡 **[በ AI ኤጀንት የተዘጋጀ]**\n\n{resp}"
+        
+    # መ. ሁልጊዜ ክፍት የሆነው Gemini Flash ያዘጋጃል
+    return f"⚡ **[በ Gemini የተዘጋጀ]**\n\n{ask_gemini_text(user_prompt)}"
 
+# 6. ለፎቶ፣ ድምፅ፣ ፒዲኤፍ እና ቪዲዮ (Gemini Multimodal)
 def ask_gemini_media(file_bytes, mime_type, caption_text=""):
     b64_data = base64.b64encode(file_bytes).decode('utf-8')
     parts = [
@@ -82,22 +129,34 @@ def ask_gemini_media(file_bytes, mime_type, caption_text=""):
             }
         }
     ]
-    return call_gemini_api(parts)
+    models = ["models/gemini-flash-latest", "models/gemini-flash-lite-latest"]
+    headers = {"Content-Type": "application/json"}
+    payload = {"contents": [{"parts": parts}]}
+    for model in models:
+        url = f"https://generativelanguage.googleapis.com/v1beta/{model}:generateContent?key={GEMINI_API_KEY}"
+        try:
+            response = requests.post(url, headers=headers, json=payload, timeout=40)
+            if response.status_code == 200:
+                return response.json()["candidates"][0]["content"]["parts"][0]["text"]
+        except Exception:
+            continue
+    return "ይቅርታ ሄኖክ፣ ፋይሉን መተንተን አልተቻለም፤ እባክህ በድጋሚ ሞክር።"
 
 @bot.message_handler(commands=['start', 'help'])
 def send_welcome(message):
     welcome_text = (
-        "👋 ሰላም ሄኖክ! እኔ ያንተ የግል AI ረዳት ነኝ።\n\n"
-        "አሁን በሚከተሉት መንገዶች በሙሉ ማዘዝ ትችላለህ፦\n"
-        "• **በጽሑፍ ወይም በድምፅ (Voice)** ጥያቄዎችህን መጠየቅ\n"
-        "• **ፎቶ ወይም ምስል** በመላክ ማብራሪያና የፖስት ረቂቅ ማዘጋጀት\n"
-        "• **ፒዲኤፍ (PDF)** በመላክ ትንታኔና ማጠቃለያ ማውጣት\n"
-        "• **አጫጭር ቪዲዮ** በመላክ የክሊፒንግ (Whop/TikTok) ሃሳቦችን መለየት\n\n"
+        "👋 ሰላም ሄኖክ! እኔ ያንተ ራሱን የቻለ ራስ-ገዝ AI ረዳት (Autonomous AI Agent) ነኝ።\n\n"
+        "🧠 **አሰራሬ፦**\n"
+        "አንተ ምንም አይነት ሞዴል መምረጥ አይጠበቅብህም! የላክክልኝን ስራ እኔ ራሴ መርምሬ፦\n"
+        "• ለፈጠራ ጽሑፍና ለቪዲዮ ስክሪፕቶች → **Claude 3.5 Sonnet**\n"
+        "• ለኮዲንግ እና ለጥልቅ ስሌት → **DeepSeek V3 / R1**\n"
+        "• ለቪዲዮ፣ ለድምፅ፣ ለፎቶ እና ለፒዲኤፍ → **Gemini Flash**\n"
+        "በራሴ መርጬና አወዳድሬ ምርጡን ውጤት አቀርብልሃለሁ!\n\n"
         "ስራውን አዘጋጅቼ ሁልጊዜ ያንተን ፍቃድ (Approve/Reject) እጠይቃለሁ!"
     )
     bot.reply_to(message, welcome_text)
 
-# የድምፅ መልዕክት (Voice Note)
+# የድምፅ መልዕክት
 @bot.message_handler(content_types=['voice', 'audio'])
 def handle_voice(message):
     bot.send_chat_action(message.chat.id, 'record_voice')
@@ -107,7 +166,7 @@ def handle_voice(message):
         ai_resp = ask_gemini_media(downloaded, "audio/ogg", "የድምፅ መልዕክት")
         send_with_buttons(message, f"🎙️ **ሄኖክ፣ ድምፅህን አዳምጬ የሚከተለውን አዘጋጅቻለሁ፦**\n\n{ai_resp}")
     except Exception as e:
-        bot.reply_to(message, f"ይቅርታ ሄኖክ፣ ድምፅህን በማንበብ ላይ ስህተት ተፈጥሯል: {str(e)}")
+        bot.reply_to(message, f"ይቅርታ ሄኖክ፣ ድምፅህን ማንበብ አልቻልኩም: {str(e)}")
 
 # ፎቶ እና ምስል
 @bot.message_handler(content_types=['photo'])
@@ -123,7 +182,7 @@ def handle_photo(message):
     except Exception as e:
         bot.reply_to(message, f"ይቅርታ ሄኖክ፣ ምስሉን መመልከት አልቻልኩም: {str(e)}")
 
-# ፒዲኤፍ እና ሌሎች ሰነዶች (Documents / PDFs)
+# ፒዲኤፍ እና ሌሎች ሰነዶች
 @bot.message_handler(content_types=['document'])
 def handle_document(message):
     bot.send_chat_action(message.chat.id, 'upload_document')
@@ -137,7 +196,7 @@ def handle_document(message):
     except Exception as e:
         bot.reply_to(message, f"ይቅርታ ሄኖክ፣ ሰነዱን ማንበብ አልቻልኩም: {str(e)}")
 
-# ቪዲዮ (Video for Clipping / Analysis)
+# ቪዲዮ (ለክሊፒንግ ትንታኔ)
 @bot.message_handler(content_types=['video'])
 def handle_video(message):
     bot.send_chat_action(message.chat.id, 'upload_video')
@@ -150,11 +209,11 @@ def handle_video(message):
     except Exception as e:
         bot.reply_to(message, f"ይቅርታ ሄኖክ፣ ቪዲዮውን መመልከት አልቻልኩም: {str(e)}")
 
-# መደበኛ የጽሑፍ መልዕክት
+# መደበኛ የጽሑፍ መልዕክት (ራሱ በብልሃት መርጦ የሚያዘጋጅ)
 @bot.message_handler(func=lambda message: True)
 def handle_text(message):
     bot.send_chat_action(message.chat.id, 'typing')
-    ai_resp = ask_gemini_text(message.text)
+    ai_resp = autonomous_smart_router(message.text)
     send_with_buttons(message, ai_resp)
 
 def send_with_buttons(message, content):
@@ -203,5 +262,5 @@ def callback_inline(call):
         )
         bot.answer_callback_query(call.id, "ተሰርዟል ❌")
 
-print("🤖 Henok Super-Agent is running 24/7 on Cloud...")
+print("🤖 Henok Autonomous AI Router is running 24/7 on Cloud...")
 bot.infinity_polling()
