@@ -20,6 +20,8 @@ import requests
 import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
+from video_producer import produce_henok_ai_video
+
 
 # ============================================================
 # Configuration
@@ -44,6 +46,7 @@ MAX_AUDIO_BYTES = 14 * 1024 * 1024
 TELEGRAM_TEXT_LIMIT = 3900
 HISTORY_LIMIT = 20
 HTTP_TIMEOUT = (10, 55)
+VIDEO_LOCK = threading.Lock()
 
 if not TELEGRAM_BOT_TOKEN:
     raise RuntimeError(
@@ -627,6 +630,76 @@ def cmd_reset(message):
         HISTORY.pop(message.chat.id, None)
         SESSIONS.pop(message.chat.id, None)
     bot.reply_to(message, "የዚህ ውይይት ታሪክ ተጸድቷል።")
+
+
+
+@bot.message_handler(commands=["video"])
+def cmd_video(message):
+    """Start the owner-only 30-second Amharic motion-video job."""
+    chat_id = message.chat.id
+    if not is_owner(message.from_user.id):
+        safe_send(
+            chat_id,
+            "🔒 የVideo generation ፈቃድ የለህም። "
+            "በRender Environment ውስጥ OWNER_ID ከ/ id ትእዛዝ የሚያሳየውን Telegram User ID ጋር አዛምድ።"
+        )
+        return
+
+    if not GEMINI_API_KEY:
+        safe_send(chat_id, "GEMINI_API_KEY በRender Environment ውስጥ አልተዘጋጀም።")
+        return
+
+    if not VIDEO_LOCK.acquire(blocking=False):
+        safe_send(chat_id, "⏳ ሌላ ቪዲዮ እየተዘጋጀ ነው። እባክህ እስኪጠናቀቅ ጠብቅ።")
+        return
+
+    safe_send(
+        chat_id,
+        "🎬 HENOK AI ቪዲዮን ማዘጋጀት ጀምሯል። "
+        "የአማርኛ Voice-over እና Motion Graphics ይፈጠራሉ፤ ሲጠናቀቅ MP4 እልክልሃለሁ።"
+    )
+
+    def worker():
+        output_path = None
+        try:
+            import tempfile
+            output_path = os.path.join(
+                tempfile.gettempdir(),
+                f"henok_ai_{int(time.time())}_{chat_id}.mp4",
+            )
+            bot.send_chat_action(chat_id, "record_video")
+            output_path = produce_henok_ai_video(GEMINI_API_KEY, output_path)
+            size_mb = os.path.getsize(output_path) / (1024 * 1024)
+            if size_mb > 49:
+                raise RuntimeError(
+                    f"Generated MP4 is {size_mb:.1f} MB; Telegram upload limit safety threshold is 49 MB."
+                )
+            with open(output_path, "rb") as video_file:
+                bot.send_video(
+                    chat_id,
+                    video_file,
+                    caption="✅ HENOK AI — 30s Motion Graphics | 9:16 | Amharic Voice-over",
+                    supports_streaming=True,
+                    timeout=180,
+                )
+            logger.info("Video sent to chat %s (%.1f MB)", chat_id, size_mb)
+        except Exception as exc:
+            logger.exception("HENOK AI video job failed")
+            safe_send(
+                chat_id,
+                "❌ ቪዲዮውን ማዘጋጀት አልተሳካም። "
+                f"ስህተቱ: {type(exc).__name__}: {str(exc)[:300]} "
+                "Render Logs ውስጥ ዝርዝሩን ተመልከት።"
+            )
+        finally:
+            if output_path and os.path.exists(output_path):
+                try:
+                    os.remove(output_path)
+                except OSError:
+                    logger.warning("Could not remove temporary video file")
+            VIDEO_LOCK.release()
+
+    threading.Thread(target=worker, daemon=True, name="henok-video-job").start()
 
 
 @bot.message_handler(commands=["post"])
