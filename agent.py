@@ -1,5 +1,9 @@
 import os
+import io
+import re
+import json
 import base64
+import itertools
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
@@ -7,435 +11,395 @@ import requests
 import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
-# ───────────────────────── Config ─────────────────────────
+# ═════════════════════════ Config ═════════════════════════
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
-OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "anthropic/claude-3.5-sonnet")
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-flash-latest")
+OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "google/gemini-2.0-flash-exp:free")
 TARGET_CHANNEL_ID = os.environ.get("TARGET_CHANNEL_ID", "-1003098019114")
-OWNER_ID = os.environ.get("OWNER_ID")  # Henok's Telegram user id (send /id to the bot to get it)
+OWNER_ID = os.environ.get("OWNER_ID")
 
-MAX_MEDIA_BYTES = 19 * 1024 * 1024  # Telegram Bot API download limit is 20MB
+MAX_BYTES = 19 * 1024 * 1024  # Telegram limit ~20MB
+TEXT_EXT = (".txt", ".md", ".csv", ".json", ".srt", ".vtt", ".html", ".xml", ".py", ".js", ".log")
+YT_RE = re.compile(r"https?://(?:www\.|m\.)?(?:youtube\.com/watch\?v=|youtu\.be/)[\w\-]+\S*")
 
 bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN, parse_mode=None)
-SESSIONS = {}  # chat_id -> dict (in-memory; resets on Render restart)
+SESSIONS = {}
+HISTORY = {}
+PKG_IDS = itertools.count(1)
 
-
-# ───────────────────── Keep-alive server ─────────────────────
+# ═════════════════════ Keep-alive server ═════════════════════
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
         self.wfile.write(b"Henok Interactive AI Router is LIVE 24/7!")
-
     def log_message(self, format, *args):
         return
-
 
 def start_health_server():
     port = int(os.environ.get("PORT", 10000))
     HTTPServer(("0.0.0.0", port), HealthCheckHandler).serve_forever()
 
-
 threading.Thread(target=start_health_server, daemon=True).start()
 
-# ───────────────────────── Prompts ─────────────────────────
+# ═════════════════════════ Prompts ═════════════════════════
 SYSTEM_PROMPT = """
-You are the Executive AI Producer and strategic partner of ሄኖክ (Henok Habtamu), a video producer,
-digital marketer and creative strategist in Addis Ababa.
+You are the Executive AI Strategic Partner and Lead Producer to ሄኖክ (Henok Habtamu), based in Addis Ababa, Ethiopia.
+Henok's world:
+- YouTube: "TechTrek Timeline" (AI & Emerging Tech) and "Henok Travel" (Cinematic Ethiopian Travel)
+- Communities: "Henok Graphics" (Video Editors, Motion Designers, Freelancers)
+- Business: Sekela Marketing, Amazon KDP, Whop Viral Clipping, Ye-buna
+
 Rules:
-- Always reply in natural, fluent, modern Amharic as spoken by digital creatives in Addis Ababa.
-  Never produce stiff, word-for-word translated Amharic. Keep common tech terms
-  (Premiere, CapCut, Canva, hook, CTA, Reels) in English when that is how creators actually say them.
-- Address him warmly as 'ሄኖክ'.
-- Be concise, practical and energetic. No long preambles.
+1. Language: Always reply in natural, modern, engaging Amharic as spoken by digital creatives in Addis Ababa. Tech terms (Premiere, CapCut, Canva, Hook, CTA, Reel) stay in English.
+2. Direct Answers: When asked a question, answer directly with practical advice. DO NOT show multiple choice menus unless explicitly asked to create a post.
+3. Tone: Respectful, warm, strategic, energetic. Address him as 'ሄኖክ'.
 """
 
 TOPICS = {
-    "edit": "የቪዲዮ ኤዲቲንግ ፈጣን Tips (Premiere/CapCut)",
-    "free": "የፍሪላንሲንግ እና የደንበኛ አያያዝ ሚስጥሮች",
-    "motion": "After Effects እና የሞሽን ግራፊክስ ዘዴዎች",
-    "color": "የቀለም ቅንብር (Color Grading) እና የዲዛይን ህጎች",
-    "ai": "አዳዲስ AI መሳሪያዎች ለቪዲዮ ፈጣሪዎች",
-    "pick": "AUTO",
-}
-TOPIC_LABELS = {
-    "edit": "🎬 ቪዲዮ ኤዲቲንግ Tips",
-    "free": "💼 ፍሪላንሲንግ እና ደንበኛ",
-    "motion": "⚡ After Effects / Motion",
-    "color": "🎨 Color Grading እና ዲዛይን",
-    "ai": "🤖 አዳዲስ AI Tools",
-    "pick": "🎲 አንተ ምረጥልኝ",
+    "edit": ("🎬 ቪዲዮ ኤዲቲንግ Tips", "የቪዲዮ ኤዲቲንግ ፈጣን Tips (Premiere/CapCut)"),
+    "free": ("💼 ፍሪላንሲንግ እና ደንበኛ", "የፍሪላንሲንግ እና የደንበኛ አያያዝ ሚስጥሮች"),
+    "motion": ("⚡ After Effects / Motion", "After Effects እና የሞሽን ግራፊክስ ዘዴዎች"),
+    "color": ("🎨 Color Grading እና ዲዛይን", "የቀለም ቅንብር (Color Grading) እና የዲዛይን ህጎች"),
+    "ai": ("🤖 አዳዲስ AI Tools", "አዳዲስ AI መሳሪያዎች ለቪዲዮ ፈጣሪዎች"),
+    "pick": ("🎲 አንተ ምረጥልኝ", "AUTO"),
 }
 STYLES = {
     "dark": ("🖤 Dark + Neon", "Dark Theme ከ Neon ሰማያዊና ወይንጠጅ ቀለማት ጋር"),
-    "clean": ("⚪ Minimalist", "Clean Minimalist ከነጭና ጥቁር የጸዳ አቀማመጥ ጋር"),
+    "clean": ("⚪ Minimalist Clean", "Clean Minimalist ከነጭና ጥቁር የጸዳ አቀማመጥ ጋር"),
     "bold": ("🔥 Bold Contrast", "Bold High Contrast ከደማቅ ቢጫና ጥቁር ቀለማት ጋር"),
 }
 PLATFORMS = {
     "tg": ("📢 Telegram", "Telegram channel post: medium length, emojis, clear CTA"),
-    "tt": ("🎵 TikTok", "TikTok: caption under 150 chars, a 15-30s spoken script, trending-style hashtags"),
-    "ig": ("📸 Instagram", "Instagram Reels/Post: punchy caption, line breaks, 8-12 hashtags"),
-    "yt": ("▶️ YT Shorts", "YouTube Shorts: a title under 70 chars, a 30-45s script, short description"),
+    "tt": ("🎵 TikTok", "TikTok: caption under 150 chars, 15-30s spoken script, hashtags"),
+    "ig": ("📸 Instagram", "Instagram Reels/Post: punchy caption, line breaks, hashtags"),
+    "yt": ("▶️ YT Shorts", "YouTube Shorts: title under 70 chars, 30-45s script, description"),
 }
 
-
-# ───────────────────────── AI layer ─────────────────────────
-def call_openrouter(prompt):
+# ═════════════════════════ AI layer (Multi-Model Resilience) ═════════════════════════
+def call_openrouter(messages):
     if not OPENROUTER_API_KEY:
         return None
-    try:
-        r = requests.post(
-            "https://openrouter.ai/api/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-                "Content-Type": "application/json",
-                "HTTP-Referer": "https://henok-agent.onrender.com",
-                "X-Title": "Henok Executive Agent",
-            },
-            json={
-                "model": OPENROUTER_MODEL,
-                "messages": [
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": prompt},
-                ],
-            },
-            timeout=60,
-        )
-        if r.status_code == 200:
-            return r.json()["choices"][0]["message"]["content"]
-        print("OpenRouter error:", r.status_code, r.text[:200])
-    except Exception as e:
-        print("OpenRouter exception:", e)
+    # 100% ነፃ የሆኑ ሞዴሎች ቅድሚያ ይሰጣቸዋል
+    models_to_try = [
+        "google/gemini-2.0-flash-exp:free",
+        "meta-llama/llama-3.3-70b-instruct:free",
+        "deepseek/deepseek-chat",
+        "anthropic/claude-3.5-sonnet"
+    ]
+    for m in models_to_try:
+        try:
+            r = requests.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                    "Content-Type": "application/json",
+                    "HTTP-Referer": "https://henok-agent.onrender.com",
+                    "X-Title": "Henok Executive Agent",
+                },
+                json={"model": m, "messages": messages},
+                timeout=30,
+            )
+            if r.status_code == 200:
+                content = r.json()["choices"][0]["message"]["content"]
+                if content:
+                    return content
+        except Exception:
+            continue
     return None
 
-
-def call_gemini(parts, timeout=90):
-    """parts: list of {"text": ...} or {"inline_data": {"mime_type":..., "data": b64}}"""
+def call_gemini(contents, timeout=40):
     if not GEMINI_API_KEY:
         return None
-    url = (
-        f"https://generativelanguage.googleapis.com/v1beta/models/"
-        f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
-    )
-    body = {
-        "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
-        "contents": [{"parts": parts}],
-    }
-    try:
-        r = requests.post(url, json=body, timeout=timeout)
-        if r.status_code == 200:
-            return r.json()["candidates"][0]["content"]["parts"][0]["text"]
-        print("Gemini error:", r.status_code, r.text[:200])
-    except Exception as e:
-        print("Gemini exception:", e)
+    models = ["models/gemini-flash-latest", "models/gemini-pro-latest"]
+    body = {"contents": contents}
+    for m in models:
+        try:
+            url = f"https://generativelanguage.googleapis.com/v1beta/{m}:generateContent?key={GEMINI_API_KEY}"
+            r = requests.post(url, headers={"Content-Type": "application/json"}, json=body, timeout=timeout)
+            if r.status_code == 200:
+                j = r.json()
+                cands = j.get("candidates") or []
+                if cands:
+                    return "".join(p.get("text", "") for p in cands[0].get("content", {}).get("parts", []))
+        except Exception:
+            continue
     return None
 
+def reply_with_ai(chat_id, user_text, extra_parts=None):
+    hist = HISTORY.get(chat_id, [])[-10:]
+    if not extra_parts:
+        msgs = [{"role": "system", "content": SYSTEM_PROMPT}]
+        msgs += [{"role": h["role"], "content": h["text"]} for h in hist]
+        msgs.append({"role": "user", "content": user_text})
+        out = call_openrouter(msgs)
+        if out:
+            return out
 
-def generate_text(prompt):
-    ans = call_openrouter(prompt) or call_gemini([{"text": prompt}])
-    return ans or "ይቅርታ ሄኖክ፣ አሁን ምላሽ ማዘጋጀት አልቻልኩም። እባክህ በድጋሚ ሞክር።"
-
-
-def download_telegram_file(file_id, size=None):
-    if size and size > MAX_MEDIA_BYTES:
-        return None
-    info = bot.get_file(file_id)
-    return bot.download_file(info.file_path)
-
-
-# ───────────────────────── Helpers ─────────────────────────
-def is_owner(user_id):
-    return (not OWNER_ID) or str(user_id) == str(OWNER_ID)
-
+    # Gemini Fallback / Media Handler
+    contents = []
+    for h in hist:
+        contents.append({"role": "user" if h["role"] == "user" else "model", "parts": [{"text": h["text"]}]})
+    
+    current_parts = (extra_parts or []) + [{"text": f"{SYSTEM_PROMPT}\n\n{user_text}"}]
+    contents.append({"role": "user", "parts": current_parts})
+    out = call_gemini(contents)
+    return out
 
 def safe_send(chat_id, text, markup=None):
-    """Telegram limit is 4096 chars; split and attach buttons to the last chunk."""
     chunks = [text[i:i + 3900] for i in range(0, len(text), 3900)] or [""]
-    for i, chunk in enumerate(chunks):
-        bot.send_message(chat_id, chunk, reply_markup=markup if i == len(chunks) - 1 else None)
+    for i, c in enumerate(chunks):
+        bot.send_message(chat_id, c, reply_markup=markup if i == len(chunks) - 1 else None)
 
+def add_history(chat_id, role, text):
+    h = HISTORY.setdefault(chat_id, [])
+    h.append({"role": role, "text": text})
+    del h[:-30]
 
-def main_menu():
-    m = InlineKeyboardMarkup(row_width=1)
-    m.add(
-        InlineKeyboardButton("📝 አዲስ ፖስት ፍጠር", callback_data="new"),
-        InlineKeyboardButton("🎙 የድምፅ መልዕክት / 🎞 ቪዲዮ ላክልኝ", callback_data="hint_media"),
-    )
-    return m
-
-
+# ═════════════════════════ Menus & Workflows ═════════════════════════
 def topic_menu():
     m = InlineKeyboardMarkup(row_width=1)
-    m.add(*[InlineKeyboardButton(TOPIC_LABELS[k], callback_data=f"t:{k}") for k in TOPICS])
+    m.add(*[InlineKeyboardButton(v[0], callback_data=f"t:{k}") for k, v in TOPICS.items()])
     return m
-
 
 def style_menu():
     m = InlineKeyboardMarkup(row_width=1)
     m.add(*[InlineKeyboardButton(v[0], callback_data=f"s:{k}") for k, v in STYLES.items()])
     return m
 
-
 def platform_menu():
     m = InlineKeyboardMarkup(row_width=2)
     m.add(*[InlineKeyboardButton(v[0], callback_data=f"p:{k}") for k, v in PLATFORMS.items()])
+    m.add(InlineKeyboardButton("🌐 ለሁሉም", callback_data="p:all"))
     return m
 
-
-def approve_menu(platform):
-    label = "✅ አጽድቅና ግሩፕ ላይ ለጥፍ" if platform == "tg" else "✅ አጽድቅ — ለኮፒ አዘጋጅልኝ"
+def package_menu(pid, platform):
+    label = "✅ አጽድቅና ቴሌግራም ላይ ለጥፍ" if platform == "tg" else "✅ አጽድቅ"
     m = InlineKeyboardMarkup(row_width=2)
     m.add(
-        InlineKeyboardButton(label, callback_data="pub"),
-        InlineKeyboardButton("🔄 ሌላ ስሪት", callback_data="regen"),
-        InlineKeyboardButton("❌ ሰርዝ", callback_data="cancel"),
+        InlineKeyboardButton(label, callback_data=f"pub:{pid}"),
+        InlineKeyboardButton("🔄 ሌላ ስሪት", callback_data=f"regen:{pid}"),
+        InlineKeyboardButton("❌ ሰርዝ", callback_data=f"cancel:{pid}"),
     )
     return m
 
+def lock_answer(call, label):
+    try:
+        bot.edit_message_text(
+            text=f"{call.message.text}\n\n✅ **ምርጫህ:** {label}",
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+        )
+    except Exception:
+        pass
 
-def build_post_prompt(topic, style, platform_key):
-    topic_line = (
-        "ርዕሱን አንተ ምረጥ — ለቪዲዮ ኤዲተሮችና ዲዛይነሮች አሁን የሚጠቅም አዲስ ሃሳብ"
-        if topic == "AUTO" else topic
-    )
-    return f"""
-ለ Henok Graphics ማህበረሰብ (የቪዲዮ ኤዲተሮች፣ ሞሽን ግራፊክስ ባለሙያዎች፣ ዲዛይነሮች) ይዘት አዘጋጅ።
-ርዕስ: {topic_line}
+def make_package(chat_id, topic, style, platform_key):
+    bot.send_chat_action(chat_id, "typing")
+    prompt = f"""
+ለ Henok Graphics ማህበረሰብ ይዘት አዘጋጅ።
+ርዕስ: {topic}
 ፕላትፎርም: {PLATFORMS[platform_key][1]}
 የዲዛይን ስታይል: {style}
 
-ምላሽህን በትክክል በዚህ ቅርጸት ስጥ (ምልክቶቹን አትቀይር):
-
+በዚህ ቅደም ተከተል አቅርብ:
 ===POST===
-(የመጨረሻው ለመለጠፍ ዝግጁ የሆነ ጽሑፍ: ማራኪ Hook፣ አጫጭር ተግባራዊ ነጥቦች፣ CTA፣ Hashtags)
+(የሚለጠፈው ሳቢ ጽሑፍ ከነ Hook፣ Bullet points፣ CTA እና Hashtags)
 
 ===CANVA===
 🎨 Color Palette: (3-4 ቀለማት ከ HEX ኮድ ጋር)
-🔤 Overlay Hook: (በምስሉ ላይ የሚጻፍ ከ6 ቃላት ያልበለጠ ኃይለኛ ጽሑፍ)
-🖼 Composition: (የምስሉ አቀማመጥ፣ የፊደል መጠን ቅደም ተከተል፣ ምን ከየት ይቀመጣል)
+🔤 Overlay Hook: (በምስሉ ላይ የሚጻፍ አጭር ኃይለኛ ጽሑፍ)
+🖼 Composition: (የምስሉ አቀማመጥ መመሪያ)
 """
+    full = reply_with_ai(chat_id, prompt)
+    if not full:
+        bot.send_message(chat_id, "ይቅርታ ሄኖክ፣ ፖስቱን ማመንጨት አልተቻለም፤ እባክህ በድጋሚ ሞክር።")
+        return
 
-
-def split_post(full):
     post, canva = full, ""
     if "===POST===" in full:
-        full = full.split("===POST===", 1)[1]
-        post = full
+        post = full.split("===POST===", 1)[1]
     if "===CANVA===" in full:
-        post, canva = full.split("===CANVA===", 1)
-    return post.strip(), canva.strip()
+        parts = post.split("===CANVA===", 1)
+        post, canva = parts[0], parts[1]
 
+    pid = next(PKG_IDS)
+    SESSIONS.setdefault(chat_id, {"pkgs": {}})["pkgs"][pid] = {
+        "topic": topic, "style": style, "platform": platform_key, "post": post.strip(), "canva": canva.strip(),
+    }
+    body = f"📢 **ፖስት ({PLATFORMS[platform_key][0]}):**\n\n{post.strip()}\n\n━━━━━━━━━━━━━━━\n🎨 **Canva Blueprint:**\n\n{canva.strip()}"
+    safe_send(chat_id, body, package_menu(pid, platform_key))
 
-# ───────────────────────── Commands ─────────────────────────
+def advance(chat_id):
+    s = SESSIONS.setdefault(chat_id, {"pending": {}})
+    p = s["pending"]
+    if not p.get("topic"):
+        bot.send_message(chat_id, "❓ ስለ ምን ርዕስ ልፍጠር?\n(ከታች ምረጥ ወይም በድምፅ/ጽሑፍ ንገረኝ)፦", reply_markup=topic_menu())
+        return
+    if not p.get("style"):
+        bot.send_message(chat_id, "❓ የ Canva ዲዛይን ስታይል ምረጥ፦", reply_markup=style_menu())
+        return
+    if not p.get("platforms"):
+        bot.send_message(chat_id, "❓ ለየትኛው ፕላትፎርም ላዘጋጅ?፦", reply_markup=platform_menu())
+        return
+
+    for pk in p.get("platforms"):
+        make_package(chat_id, p["topic"], p["style"], pk)
+    s["pending"] = {}
+
+# ═════════════════════════ Handlers ═════════════════════════
 @bot.message_handler(commands=["id"])
 def cmd_id(message):
-    bot.reply_to(message, f"Your Telegram user id: {message.from_user.id}")
-
+    bot.reply_to(message, f"የአንተ Telegram ID: {message.from_user.id}")
 
 @bot.message_handler(commands=["start", "menu"])
 def cmd_start(message):
-    if not is_owner(message.from_user.id):
-        return
     bot.send_message(
         message.chat.id,
-        "ሰላም ሄኖክ! 👋 ዛሬ ምን እንስራ? ከታች ምረጥ — መጻፍ አያስፈልግም።",
-        reply_markup=main_menu(),
+        "ሰላም ሄኖክ! 👋\n"
+        "• መደበኛ ጥያቄዎችን በጽሑፍ ወይም በድምፅ መጠየቅ ትችላለህ (በቀጥታ እመልሳለሁ)።\n"
+        "• ደረጃ በደረጃ ፖስት ለመስራት ከፈለግህ **'ፖስት'** ብለህ ጻፍልኝ!"
     )
 
-
-# ───────────────────── Voice / audio notes ─────────────────────
-@bot.message_handler(content_types=["voice", "audio"])
+@bot.message_handler(content_types=["voice"])
 def handle_voice(message):
-    if not is_owner(message.from_user.id):
+    chat_id = message.chat.id
+    v = message.voice
+    if v.file_size and v.file_size > MAX_BYTES:
+        bot.send_message(chat_id, "ይህ የድምፅ ፋይል ከ 20MB በላይ ስለሆነ Telegram አያወርደውም፤ እባክህ አሳጥረው።")
         return
-    media = message.voice or message.audio
-    bot.send_chat_action(message.chat.id, "typing")
-    data = download_telegram_file(media.file_id, getattr(media, "file_size", None))
-    if not data:
-        bot.reply_to(message, "ሄኖክ፣ ይህ ፋይል ከ20MB በላይ ነው። አጠር አድርገህ ላክልኝ።")
+    bot.send_chat_action(chat_id, "typing")
+    try:
+        data = bot.download_file(bot.get_file(v.file_id).file_path)
+    except Exception as e:
+        bot.send_message(chat_id, f"ድምፁን ማውረድ አልተቻለም: {type(e).__name__}")
         return
-    mime = getattr(media, "mime_type", None) or "audio/ogg"
-    prompt = (
-        "ይህን የድምፅ መልዕክት አድምጥ እና እንዲህ አቅርብ:\n"
-        "1. 📝 ሙሉ ጽሑፍ (transcript) — በተነገረው ቋንቋ\n"
-        "2. ✅ የተግባር ዝርዝር (Action Items) — አጫጭር ነጥቦች\n"
-        "3. 💡 አንድ የይዘት ሃሳብ ከዚህ ሊወጣ ይችላል"
-    )
-    result = call_gemini(
-        [{"text": prompt}, {"inline_data": {"mime_type": mime, "data": base64.b64encode(data).decode()}}]
-    )
-    if not result:
-        bot.reply_to(message, "ይቅርታ ሄኖክ፣ የድምፅ መልዕክቱን መተርጎም አልተቻለም። እባክህ በድጋሚ ላክ።")
-        return
-    SESSIONS[message.chat.id] = {"voice_summary": result[:1500]}
-    m = InlineKeyboardMarkup(row_width=1)
-    m.add(
-        InlineKeyboardButton("📝 ከዚህ ሃሳብ ፖስት ፍጠር", callback_data="fromvoice"),
-        InlineKeyboardButton("👍 ይበቃል", callback_data="cancel"),
-    )
-    safe_send(message.chat.id, result, m)
 
-
-# ───────────────────── Photo / video analysis ─────────────────────
-@bot.message_handler(content_types=["photo", "video", "video_note", "document"])
-def handle_media(message):
-    if not is_owner(message.from_user.id):
-        return
-    is_video = False
-    if message.photo:
-        item = message.photo[-1]
-        mime = "image/jpeg"
-    elif message.video or message.video_note:
-        item = message.video or message.video_note
-        mime = getattr(item, "mime_type", None) or "video/mp4"
-        is_video = True
+    parts = [
+        {"text": "ይህን የድምፅ መልዕክት በጥሞና አዳምጠህ በደንብ የተብራራ ማጠቃለያ እና የተግባር ዝርዝር (Action Items) አቅርብ።"},
+        {"inline_data": {"mime_type": v.mime_type or "audio/ogg", "data": base64.b64encode(data).decode()}}
+    ]
+    out = call_gemini([{"role": "user", "parts": parts}])
+    if out:
+        add_history(chat_id, "user", "[የድምፅ መልዕክት]")
+        add_history(chat_id, "assistant", out)
+        safe_send(chat_id, f"🎙 **የድምፅህ ማጠቃለያና Action Items:**\n\n{out}")
     else:
-        item = message.document
-        mime = item.mime_type or ""
-        if not (mime.startswith("image/") or mime.startswith("video/")):
-            bot.reply_to(message, "ሄኖክ፣ ፎቶ ወይም ቪዲዮ ብቻ ነው መተንተን የምችለው።")
-            return
-        is_video = mime.startswith("video/")
+        bot.send_message(chat_id, "ድምፁን መረዳት አልተቻለም፤ እባክህ ትንሽ ቀረብ ብለህ በድጋሚ ላክ።")
 
-    bot.send_chat_action(message.chat.id, "typing")
-    data = download_telegram_file(item.file_id, getattr(item, "file_size", None))
-    if not data:
-        bot.reply_to(
-            message,
-            "ሄኖክ፣ ፋይሉ ከ20MB በላይ ነው (የ Telegram Bot ገደብ)። አጭር ክፍል ቆርጠህ ላክልኝ።",
-        )
+@bot.message_handler(content_types=["video", "video_note"])
+def handle_video(message):
+    chat_id = message.chat.id
+    item = message.video or message.video_note
+    if item.file_size and item.file_size > MAX_BYTES:
+        bot.send_message(chat_id, "ቪዲዮው ከ 20MB በላይ ነው (የቴሌግራም ገደብ)፤ የ YouTube ሊንኩን ላክልኝ ወይም አሳጥረው።")
         return
+    bot.send_chat_action(chat_id, "upload_video")
+    try:
+        data = bot.download_file(bot.get_file(item.file_id).file_path)
+        parts = [
+            {"text": "ይህን ቪዲዮ (ምስሉንም ድምጹንም) ሙሉ በሙሉ ተመልከት።\n1. ዋና ጭብጡ\n2. ለ Whop/TikTok የሚሆኑ 3 ምርጥ የ 30 ሰከንድ ቫይራል ክሊፖች (Start-End ጊዜና Hook)\n3. የማሻሻያ ምክር"},
+            {"inline_data": {"mime_type": getattr(item, "mime_type", None) or "video/mp4", "data": base64.b64encode(data).decode()}}
+        ]
+        out = call_gemini([{"role": "user", "parts": parts}])
+        if out:
+            safe_send(chat_id, out)
+        else:
+            bot.send_message(chat_id, "ቪዲዮውን መተንተን አልተቻለም።")
+    except Exception as e:
+        bot.send_message(chat_id, f"ስህተት ተፈጠረ: {str(e)}")
 
-    if is_video:
-        prompt = (
-            "ይህን ቪዲዮ ተመልከት። ለ Whop clipping፣ TikTok እና Reels የሚሆኑ ቫይራል የመሆን እድል ያላቸውን "
-            "ከ30 ሰከንድ ያልበለጡ 3 ክፍሎች ምረጥ። ለእያንዳንዱ:\n"
-            "⏱ Start–End (mm:ss)\n🪝 ለምን ቫይራል ይሆናል (አንድ መስመር)\n"
-            "📝 የሚመከር Caption/Hook\n🎯 የሚመጥን ፕላትፎርም\n"
-            "በመጨረሻ ለ Opening Hook የሚሆን ምክር ጨምር።"
-        )
-    else:
-        prompt = (
-            "ይህን ምስል ተመልከት እና ለማህበራዊ ሚዲያ ፖስት እንዴት መጠቀም እንደሚቻል ተንትን: "
-            "ጠንካራ ጎኖች፣ ማሻሻያዎች፣ የሚመጥን Hook ጽሑፍ፣ እና Canva ላይ እንዴት ማስዋብ እንደሚቻል።"
-        )
-    result = call_gemini(
-        [{"text": prompt}, {"inline_data": {"mime_type": mime, "data": base64.b64encode(data).decode()}}],
-        timeout=120,
-    )
-    safe_send(message.chat.id, result or "ይቅርታ ሄኖክ፣ ፋይሉን መተንተን አልተቻለም።")
+@bot.message_handler(content_types=["photo"])
+def handle_photo(message):
+    chat_id = message.chat.id
+    item = message.photo[-1]
+    bot.send_chat_action(chat_id, "typing")
+    try:
+        data = bot.download_file(bot.get_file(item.file_id).file_path)
+        parts = [
+            {"text": "ይህን ምስል በጥንቃቄ መርምር፦ በውስጡ ያሉ ጽሑፎች፣ ጥራቱ፣ እና ለ Canva ዲዛይን ማሻሻያ የሚሆኑ ነጥቦች።"},
+            {"inline_data": {"mime_type": "image/jpeg", "data": base64.b64encode(data).decode()}}
+        ]
+        out = call_gemini([{"role": "user", "parts": parts}])
+        if out:
+            safe_send(chat_id, out)
+        else:
+            bot.send_message(chat_id, "ምስሉን መመልከት አልተቻለም።")
+    except Exception as e:
+        bot.send_message(chat_id, f"ስህተት: {str(e)}")
 
-
-# ───────────────────────── Text ─────────────────────────
 @bot.message_handler(content_types=["text"])
 def handle_text(message):
-    if not is_owner(message.from_user.id):
+    chat_id = message.chat.id
+    text = message.text.strip()
+    text_lower = text.lower()
+
+    # ፖስት ማዘጋጀት ሲፈልግ ብቻ በበተን ይጀምራል
+    if any(w in text_lower for w in ["ፖስት", "post", "ይዘት አዘጋጅ", "ፖስት አድርግ"]):
+        SESSIONS[chat_id] = {"pending": {"topic": "", "style": "", "platforms": []}}
+        advance(chat_id)
         return
-    t = message.text.lower()
-    if any(w in t for w in ["ፖስት", "post", "ለጥፍ", "graphics", "ግሩፕ", "menu"]):
-        bot.send_message(message.chat.id, "ሄኖክ፣ ምን እንስራ?", reply_markup=main_menu())
-        return
-    bot.send_chat_action(message.chat.id, "typing")
-    safe_send(message.chat.id, generate_text(message.text))
 
+    # መደበኛ ጥያቄ ከሆነ በቀጥታ ያለምንም በተን ይመልሳል
+    bot.send_chat_action(chat_id, "typing")
+    resp = reply_with_ai(chat_id, text)
+    if resp:
+        add_history(chat_id, "user", text)
+        add_history(chat_id, "assistant", resp)
+        safe_send(chat_id, resp)
+    else:
+        bot.send_message(chat_id, "ይቅርታ ሄኖክ፣ ምላሽ ለመስጠት አልተቻለም፤ እባክህ ትንሽ ቆይተህ እንደገና ሞክር።")
 
-# ───────────────────────── Callbacks ─────────────────────────
-def edit(call, text, markup=None):
-    try:
-        bot.edit_message_text(
-            chat_id=call.message.chat.id, message_id=call.message.message_id,
-            text=text, reply_markup=markup,
-        )
-    except Exception:
-        bot.send_message(call.message.chat.id, text, reply_markup=markup)
-
-
-def run_generation(call, chat_id):
-    s = SESSIONS.get(chat_id, {})
-    if not all(k in s for k in ("topic", "style", "platform")):
-        edit(call, "ሄኖክ፣ ክፍለ ጊዜው ተቋርጧል። እባክህ /menu ን ተጫን።")
-        return
-    edit(call, "⏳ ሄኖክ፣ ፖስቱንና የ Canva መመሪያውን እያዘጋጀሁ ነው...")
-    full = generate_text(build_post_prompt(s["topic"], s["style"], s["platform"]))
-    post, canva = split_post(full)
-    s["post"], s["canva"] = post, canva
-    preview = f"📢 ፖስት:\n\n{post}\n\n━━━━━━━━━━━━━━━\n🎨 Canva Blueprint:\n\n{canva}"
-    safe_send(chat_id, preview, approve_menu(s["platform"]))
-
-
+# ═════════════════════════ Callbacks ═════════════════════════
 @bot.callback_query_handler(func=lambda call: True)
 def handle_callbacks(call):
-    if not is_owner(call.from_user.id):
-        bot.answer_callback_query(call.id, "ፈቃድ የለህም")
-        return
     chat_id = call.message.chat.id
     data = call.data
-    s = SESSIONS.setdefault(chat_id, {})
+    s = SESSIONS.setdefault(chat_id, {"pending": {}, "pkgs": {}})
+    bot.answer_callback_query(call.id)
 
-    if data == "new":
-        edit(call, "ለዛሬው ፖስት የትኛው ርዕስ ይሻላል?", topic_menu())
-
-    elif data == "hint_media":
-        edit(call, "🎙 የድምፅ መልዕክት፣ 🖼 ፎቶ ወይም 🎞 ቪዲዮ (እስከ 20MB) በቀጥታ እዚህ ላክልኝ — እኔ እተነትንልሃለሁ።", main_menu())
-
-    elif data == "fromvoice":
-        s["topic"] = "ከዚህ የድምፅ መልዕክት የወጣ ሃሳብ:\n" + s.get("voice_summary", "")
-        edit(call, "✅ ሃሳቡ ተመርጧል። የዲዛይን ስታይል ምረጥ፦", style_menu())
-
-    elif data.startswith("t:"):
+    if data.startswith("t:"):
         key = data[2:]
-        if key not in TOPICS:
-            return
-        s["topic"] = TOPICS[key]
-        label = TOPIC_LABELS[key]
-        edit(call, f"✅ ርዕስ: {label}\n\nአሁን የዲዛይን ስታይል ምረጥ፦", style_menu())
+        label, topic = TOPICS[key]
+        s["pending"]["topic"] = topic
+        lock_answer(call, label)
+        advance(chat_id)
 
     elif data.startswith("s:"):
         key = data[2:]
-        if key not in STYLES:
-            return
-        s["style"] = STYLES[key][1]
-        edit(call, f"✅ ስታይል: {STYLES[key][0]}\n\nለየትኛው ፕላትፎርም ላዘጋጅ?", platform_menu())
+        label, style = STYLES[key]
+        s["pending"]["style"] = style
+        lock_answer(call, label)
+        advance(chat_id)
 
     elif data.startswith("p:"):
         key = data[2:]
-        if key not in PLATFORMS:
-            return
-        s["platform"] = key
-        bot.answer_callback_query(call.id)
-        run_generation(call, chat_id)
-        return
-
-    elif data == "regen":
-        bot.answer_callback_query(call.id)
-        run_generation(call, chat_id)
-        return
-
-    elif data == "pub":
-        post = s.get("post")
-        if not post:
-            edit(call, "ሄኖክ፣ የሚለጠፍ ይዘት አላገኘሁም። /menu ን ተጫን።")
-        elif s.get("platform") == "tg":
-            try:
-                bot.send_message(TARGET_CHANNEL_ID, post)
-                edit(call, "🎉 በሄኖክ ጸድቋል! ወደ Henok Graphics ተለጥፏል ✅")
-            except Exception as e:
-                edit(call, f"⚠️ ወደ ግሩፕ መለጠፍ አልተቻለም: {e}")
+        if key == "all":
+            s["pending"]["platforms"] = ["tg", "tt", "ig", "yt"]
+            lock_answer(call, "🌐 ለሁሉም")
         else:
-            name = PLATFORMS[s["platform"]][0]
-            edit(call, f"✅ ጸድቋል! {name} ላይ ለመለጠፍ ከታች ያለውን ኮፒ አድርግ (ራስ-ሰር ልጥፍ በቀጣይ ደረጃ ይመጣል):")
-            bot.send_message(chat_id, post)
+            s["pending"]["platforms"] = [key]
+            lock_answer(call, PLATFORMS[key][0])
+        advance(chat_id)
 
-    elif data == "cancel":
-        SESSIONS.pop(chat_id, None)
-        edit(call, "❌ ተሰርዟል። /menu ን ተጫን።")
+    elif data.startswith("pub:"):
+        pid = int(data.split(":")[1])
+        pkg = s.get("pkgs", {}).get(pid)
+        if pkg:
+            try:
+                bot.send_message(TARGET_CHANNEL_ID, pkg["post"])
+                bot.send_message(chat_id, "🎉 **በሄኖክ ጸድቋል!**\nበቀጥታ ወደ **Henok Graphics** ግሩፕህ ተለጥፏል! ✅")
+            except Exception as e:
+                bot.send_message(chat_id, f"⚠️ ወደ ግሩፕ ለመለጠፍ አልተቻለም: {str(e)}")
 
-    bot.answer_callback_query(call.id)
+    elif data.startswith("cancel:"):
+        bot.send_message(chat_id, "❌ ተሰርዟል።")
 
+    elif data.startswith("regen:"):
+        pid = int(data.split(":")[1])
+        pkg = s.get("pkgs", {}).get(pid)
+        if pkg:
+            make_package(chat_id, pkg["topic"], pkg["style"], pkg["platform"])
 
-if __name__ == "__main__":
-    if not OWNER_ID:
-        print("WARNING: OWNER_ID is not set — anyone can use this bot. Send /id to the bot and set OWNER_ID.")
-    bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=30)
+print("🤖 Henok Resilient Autonomous Agent is running 24/7...")
+bot.infinity_polling(skip_pending=True)
