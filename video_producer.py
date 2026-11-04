@@ -43,25 +43,24 @@ def _get_font(size, bold=False):
 
 
 def _tts_to_wav(text, api_key, path):
-    """Gemini Developer API returns 24 kHz mono 16-bit PCM; wrap it as WAV."""
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent"
+    """Generate WAV narration using the Gemini 3.8 Flash TTS Interactions API."""
+    url = "https://generativelanguage.googleapis.com/v1beta/interactions"
     body = {
-        "contents": [{
-            "role": "user",
-            "parts": [{
+        "model": MODEL,
+        "input": [{
+            "type": "user_input",
+            "content": [{
+                "type": "text",
                 "text": text,
-                "speechMetadata": {
+                "annotations": [{
+                    "type": "speech_metadata",
                     "style": "Clear, confident, warm Ethiopian Amharic narration. Medium-fast pace, articulate pronunciation, engaging technology explainer."
-                }
+                }]
             }]
         }],
-        "generationConfig": {
-            "responseModalities": ["AUDIO"],
-            "speechConfig": {
-                "voiceConfig": {
-                    "prebuiltVoiceConfig": {"voiceName": VOICE}
-                }
-            }
+        "response_format": {"type": "audio"},
+        "generation_config": {
+            "speech_config": [{"voice": VOICE}]
         }
     }
     response = requests.post(
@@ -78,16 +77,12 @@ def _tts_to_wav(text, api_key, path):
         raise RuntimeError(f"Gemini TTS HTTP {response.status_code}: {str(detail)[:500]}")
     payload = response.json()
     try:
-        raw = base64.b64decode(payload["candidates"][0]["content"]["parts"][0]["inlineData"]["data"])
-    except (KeyError, IndexError, TypeError, ValueError) as exc:
-        raise RuntimeError("Gemini TTS response contained no audio data") from exc
-    # TTS generateContent returns raw PCM: 24,000 samples/sec, mono, signed 16-bit.
-    with wave.open(str(path), "wb") as wav:
-        wav.setnchannels(1)
-        wav.setsampwidth(2)
-        wav.setframerate(24000)
-        wav.writeframes(raw)
-
+        raw = base64.b64decode(payload["output_audio"]["data"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError("Gemini TTS response contained no output_audio.data") from exc
+    if not raw.startswith(b"RIFF"):
+        raise RuntimeError("Gemini TTS returned unexpected audio format; expected WAV")
+    Path(path).write_bytes(raw)
 
 def _center_text(draw, text, y, font, color, max_width=470, gap=12):
     words, lines, current = text.split(), [], ""
