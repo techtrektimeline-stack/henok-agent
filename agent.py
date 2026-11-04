@@ -610,6 +610,7 @@ def cmd_start(message):
         "• መደበኛ ጥያቄ ጠይቀኝ፤ በቀጥታ እመልሳለሁ።\n"
         "• Voice Note ላክ፤ ጽሑፍ፣ ማጠቃለያና Action Items አዘጋጃለሁ።\n"
         "• ፖስት ለመፍጠር /post ብለህ ጀምር።\n"
+        "• 30 ሰከንድ ቪዲዮ ለማዘጋጀት /video ብለህ ጀምር።\n"
         "• /reset የውይይት ታሪክን ያጸዳል።\n"
         "• /id የTelegram IDህን ያሳያል።"
     )
@@ -641,7 +642,7 @@ def cmd_video(message):
         safe_send(
             chat_id,
             "🔒 የVideo generation ፈቃድ የለህም። "
-            "በRender Environment ውስጥ OWNER_ID ከ/ id ትእዛዝ የሚያሳየውን Telegram User ID ጋር አዛምድ።"
+            "በRender Environment ውስጥ OWNER_ID ከ/id ትእዛዝ የሚያሳየውን Telegram User ID ጋር አዛምድ።"
         )
         return
 
