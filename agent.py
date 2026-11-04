@@ -1,405 +1,939 @@
+# -*- coding: utf-8 -*-
+"""
+HENOK AI Telegram Agent
+- Telegram polling + Render health-check web server
+- Gemini 3.8 Flash primary model; OpenRouter optional fallback
+- Amharic voice-note transcription, summary and action items
+- Content package workflow with approval before publishing
+"""
+
 import os
-import io
 import re
 import json
-import base64
-import itertools
+import time
+import logging
 import threading
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Optional, List, Dict, Any
 
 import requests
 import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
-# ═════════════════════════ Config ═════════════════════════
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
-OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "google/gemini-2.0-flash-exp:free")
-TARGET_CHANNEL_ID = os.environ.get("TARGET_CHANNEL_ID", "-1003098019114")
-OWNER_ID = os.environ.get("OWNER_ID")
 
-MAX_BYTES = 19 * 1024 * 1024  # Telegram limit ~20MB
-TEXT_EXT = (".txt", ".md", ".csv", ".json", ".srt", ".vtt", ".html", ".xml", ".py", ".js", ".log")
-YT_RE = re.compile(r"https?://(?:www\.|m\.)?(?:youtube\.com/watch\?v=|youtu\.be/)[\w\-]+\S*")
+# ============================================================
+# Configuration
+# ============================================================
 
-bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN, parse_mode=None)
-SESSIONS = {}
-HISTORY = {}
-PKG_IDS = itertools.count(1)
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
 
-# ═════════════════════ Keep-alive server ═════════════════════
+# Stable model IDs. You can override these in Render Environment.
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash").strip()
+OPENROUTER_MODEL = os.getenv(
+    "OPENROUTER_MODEL", "google/gemini-2.5-flash"
+).strip()
+
+TARGET_CHANNEL_ID = os.getenv("TARGET_CHANNEL_ID", "-1003098019114").strip()
+OWNER_ID = os.getenv("OWNER_ID", "").strip()
+
+# Telegram Bot API download limit is about 20 MB. Keep the inline
+# Gemini request below 20 MB after Base64 expansion.
+MAX_AUDIO_BYTES = 14 * 1024 * 1024
+TELEGRAM_TEXT_LIMIT = 3900
+HISTORY_LIMIT = 20
+HTTP_TIMEOUT = (10, 55)
+
+if not TELEGRAM_BOT_TOKEN:
+    raise RuntimeError(
+        "TELEGRAM_BOT_TOKEN is missing. Add it in Render Environment Variables."
+    )
+
+# Do not log tokens or API keys.
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+logger = logging.getLogger("henok-ai")
+
+bot = telebot.TeleBot(
+    TELEGRAM_BOT_TOKEN,
+    parse_mode=None,
+    threaded=True,
+    num_threads=4,
+)
+
+HTTP = requests.Session()
+STATE_LOCK = threading.RLock()
+
+# RAM-only state: conversation history and pending packages reset on redeploy/restart.
+HISTORY: Dict[int, List[Dict[str, str]]] = {}
+SESSIONS: Dict[int, Dict[str, Any]] = {}
+PACKAGE_COUNTER = 0
+
+
+# ============================================================
+# Render health-check server
+# ============================================================
+
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
+        body = b"HENOK AI is running"
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_HEAD(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Henok Interactive AI Router is LIVE 24/7!")
-    def log_message(self, format, *args):
+
+    def log_message(self, fmt, *args):
+        # Keep Render logs clean; application errors are logged separately.
         return
 
+
 def start_health_server():
-    port = int(os.environ.get("PORT", 10000))
-    HTTPServer(("0.0.0.0", port), HealthCheckHandler).serve_forever()
+    port = int(os.getenv("PORT", "10000"))
+    try:
+        server = ThreadingHTTPServer(("0.0.0.0", port), HealthCheckHandler)
+        server.daemon_threads = True
+        logger.info("Health-check server listening on port %s", port)
+        server.serve_forever()
+    except Exception:
+        logger.exception("Health-check server could not start")
+
 
 threading.Thread(target=start_health_server, daemon=True).start()
 
-# ═════════════════════════ Prompts ═════════════════════════
-SYSTEM_PROMPT = """
-You are the Executive AI Strategic Partner and Lead Producer to ሄኖክ (Henok Habtamu), based in Addis Ababa, Ethiopia.
-Henok's world:
-- YouTube: "TechTrek Timeline" (AI & Emerging Tech) and "Henok Travel" (Cinematic Ethiopian Travel)
-- Communities: "Henok Graphics" (Video Editors, Motion Designers, Freelancers)
-- Business: Sekela Marketing, Amazon KDP, Whop Viral Clipping, Ye-buna
 
-Rules:
-1. Language: Always reply in natural, modern, engaging Amharic as spoken by digital creatives in Addis Ababa. Tech terms (Premiere, CapCut, Canva, Hook, CTA, Reel) stay in English.
-2. Direct Answers: When asked a question, answer directly with practical advice. DO NOT show multiple choice menus unless explicitly asked to create a post.
-3. Tone: Respectful, warm, strategic, energetic. Address him as 'ሄኖክ'.
+# ============================================================
+# Assistant instructions
+# ============================================================
+
+SYSTEM_PROMPT = """
+You are HENOK AI, a practical executive AI assistant for a digital creator
+and digital-marketing professional based in Addis Ababa, Ethiopia.
+
+LANGUAGE:
+- Reply primarily in natural, clear, modern Amharic.
+- Keep common technical terms in English when that is clearer
+  (AI, YouTube, Canva, Hook, CTA, SEO, Reel, Caption, etc.).
+- If the user writes in English, reply in English unless asked otherwise.
+
+NORMAL CONVERSATION:
+- Answer the actual question directly and helpfully.
+- Be concise by default. Give steps only when useful.
+- Do not automatically create a social-media package when the user asks
+  an ordinary question about marketing, content, or social media.
+- Do not show menus unless the user asks to create a post or chooses /post.
+- Do not claim to have performed an action that you have not performed.
+
+CONTENT CREATION:
+- Only create a full post package when explicitly requested.
+- For a post package, provide platform-appropriate copy, a clear Hook,
+  useful body text, CTA and relevant hashtags.
+- When asked for a design direction, include Canva size, layout,
+  visual hierarchy, color palette with HEX codes and a concise image prompt.
+- Avoid fabricated statistics, sources, prices or claims.
+- If the user has not supplied a topic, ask one clear question.
+
+SAFETY AND APPROVAL:
+- Never reveal API keys, bot tokens, environment variables or private data.
+- Never publish a post, send a message to a third party, buy anything,
+  or perform an external action without the user's explicit approval.
+- If uncertain, say what is uncertain instead of inventing an answer.
 """
 
+
 TOPICS = {
-    "edit": ("🎬 ቪዲዮ ኤዲቲንግ Tips", "የቪዲዮ ኤዲቲንግ ፈጣን Tips (Premiere/CapCut)"),
-    "free": ("💼 ፍሪላንሲንግ እና ደንበኛ", "የፍሪላንሲንግ እና የደንበኛ አያያዝ ሚስጥሮች"),
-    "motion": ("⚡ After Effects / Motion", "After Effects እና የሞሽን ግራፊክስ ዘዴዎች"),
-    "color": ("🎨 Color Grading እና ዲዛይን", "የቀለም ቅንብር (Color Grading) እና የዲዛይን ህጎች"),
-    "ai": ("🤖 አዳዲስ AI Tools", "አዳዲስ AI መሳሪያዎች ለቪዲዮ ፈጣሪዎች"),
-    "pick": ("🎲 አንተ ምረጥልኝ", "AUTO"),
-}
-STYLES = {
-    "dark": ("🖤 Dark + Neon", "Dark Theme ከ Neon ሰማያዊና ወይንጠጅ ቀለማት ጋር"),
-    "clean": ("⚪ Minimalist Clean", "Clean Minimalist ከነጭና ጥቁር የጸዳ አቀማመጥ ጋር"),
-    "bold": ("🔥 Bold Contrast", "Bold High Contrast ከደማቅ ቢጫና ጥቁር ቀለማት ጋር"),
-}
-PLATFORMS = {
-    "tg": ("📢 Telegram", "Telegram channel post: medium length, emojis, clear CTA"),
-    "tt": ("🎵 TikTok", "TikTok: caption under 150 chars, 15-30s spoken script, hashtags"),
-    "ig": ("📸 Instagram", "Instagram Reels/Post: punchy caption, line breaks, hashtags"),
-    "yt": ("▶️ YT Shorts", "YouTube Shorts: title under 70 chars, 30-45s script, description"),
+    "edit": ("🎬 ቪዲዮ ኤዲቲንግ Tips", "የቪዲዮ ኤዲቲንግ ፈጣን Tips (Premiere Pro / CapCut)"),
+    "free": ("💼 Freelancing", "Freelancing እና ደንበኛ አያያዝ"),
+    "motion": ("⚡ Motion Graphics", "After Effects እና Motion Graphics"),
+    "color": ("🎨 Color Grading", "Color Grading እና የዲዛይን መርሆዎች"),
+    "ai": ("🤖 AI Tools", "አዳዲስ AI Tools ለዲጂታል ፈጣሪዎች"),
+    "pick": ("🎲 አንተ ምረጥልኝ", "ተስማሚ የይዘት ርዕስ ራስህ ምረጥ"),
 }
 
-# ═════════════════════════ AI layer (Multi-Model Resilience) ═════════════════════════
-def call_openrouter(messages):
+STYLES = {
+    "dark": ("🖤 Dark + Neon", "Dark Theme with neon blue and purple accents"),
+    "clean": ("⚪ Minimalist Clean", "Clean minimalist white, black and neutral palette"),
+    "bold": ("🔥 Bold Contrast", "Bold high-contrast yellow and black palette"),
+}
+
+PLATFORMS = {
+    "tg": ("📢 Telegram", "Telegram post: useful medium-length copy, emojis and clear CTA"),
+    "tt": ("🎵 TikTok", "TikTok: short caption, 15-30 second spoken script and hashtags"),
+    "ig": ("📸 Instagram", "Instagram: punchy caption, readable line breaks and hashtags"),
+    "yt": ("▶️ YouTube Shorts", "YouTube Shorts: title, 30-45 second script and description"),
+}
+
+
+# ============================================================
+# Small helpers
+# ============================================================
+
+def is_owner(user_id: Optional[int]) -> bool:
+    """Publishing is disabled until OWNER_ID is configured in Render."""
+    return bool(OWNER_ID and user_id is not None and str(user_id) == OWNER_ID)
+
+
+def add_history(chat_id: int, role: str, text: str):
+    with STATE_LOCK:
+        items = HISTORY.setdefault(chat_id, [])
+        items.append({"role": role, "text": text})
+        del items[:-HISTORY_LIMIT]
+
+
+def get_history(chat_id: int) -> List[Dict[str, str]]:
+    with STATE_LOCK:
+        return list(HISTORY.get(chat_id, [])[-HISTORY_LIMIT:])
+
+
+def safe_send(chat_id: int, text: str, markup=None):
+    text = str(text or "").strip()
+    if not text:
+        text = "ምላሽ አልተገኘም። እባክህ በድጋሚ ሞክር።"
+
+    chunks = [
+        text[i:i + TELEGRAM_TEXT_LIMIT]
+        for i in range(0, len(text), TELEGRAM_TEXT_LIMIT)
+    ]
+    for index, chunk in enumerate(chunks):
+        bot.send_message(
+            chat_id,
+            chunk,
+            reply_markup=markup if index == len(chunks) - 1 else None,
+            disable_web_page_preview=True,
+        )
+
+
+def error_text(response: requests.Response) -> str:
+    """Return a short, sanitized API error detail for server logs."""
+    try:
+        payload = response.json()
+        message = (
+            payload.get("error", {}).get("message")
+            or payload.get("message")
+            or str(payload)
+        )
+    except Exception:
+        message = response.text
+    return str(message).replace("\n", " ")[:700]
+
+
+# ============================================================
+# Gemini and OpenRouter API calls
+# ============================================================
+
+def call_gemini(
+    contents: List[Dict[str, Any]],
+    timeout: int = 55,
+) -> Optional[str]:
+    if not GEMINI_API_KEY:
+        logger.warning("GEMINI_API_KEY is not configured")
+        return None
+
+    model = GEMINI_MODEL
+    url = (
+        "https://generativelanguage.googleapis.com/v1beta/"
+        f"models/{model}:generateContent"
+    )
+    payload = {
+        "systemInstruction": {
+            "parts": [{"text": SYSTEM_PROMPT}]
+        },
+        "contents": contents,
+    }
+    headers = {
+        "Content-Type": "application/json",
+        "x-goog-api-key": GEMINI_API_KEY,
+    }
+
+    for attempt in range(2):
+        try:
+            response = HTTP.post(
+                url,
+                headers=headers,
+                json=payload,
+                timeout=(10, timeout),
+            )
+
+            if response.status_code == 200:
+                data = response.json()
+                candidates = data.get("candidates") or []
+                if not candidates:
+                    logger.warning("Gemini returned no candidates: %s", data)
+                    return None
+
+                parts = (
+                    candidates[0]
+                    .get("content", {})
+                    .get("parts", [])
+                )
+                answer = "\n".join(
+                    part.get("text", "")
+                    for part in parts
+                    if part.get("text")
+                ).strip()
+
+                if answer:
+                    return answer
+
+                logger.warning(
+                    "Gemini returned an empty answer; finishReason=%s",
+                    candidates[0].get("finishReason"),
+                )
+                return None
+
+            detail = error_text(response)
+            logger.error(
+                "Gemini HTTP %s for model %s: %s",
+                response.status_code, model, detail
+            )
+
+            if response.status_code not in (429, 500, 502, 503, 504):
+                return None
+
+        except requests.RequestException as exc:
+            logger.error("Gemini request failed: %s", type(exc).__name__)
+        except (ValueError, KeyError, TypeError):
+            logger.exception("Could not parse Gemini response")
+
+        if attempt == 0:
+            time.sleep(1.5)
+
+    return None
+
+
+def call_openrouter(messages: List[Dict[str, str]]) -> Optional[str]:
     if not OPENROUTER_API_KEY:
         return None
-    # 100% ነፃ የሆኑ ሞዴሎች ቅድሚያ ይሰጣቸዋል
-    models_to_try = [
-        "google/gemini-2.0-flash-exp:free",
-        "meta-llama/llama-3.3-70b-instruct:free",
-        "deepseek/deepseek-chat",
-        "anthropic/claude-3.5-sonnet"
-    ]
-    for m in models_to_try:
-        try:
-            r = requests.post(
-                "https://openrouter.ai/api/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-                    "Content-Type": "application/json",
-                    "HTTP-Referer": "https://henok-agent.onrender.com",
-                    "X-Title": "Henok Executive Agent",
-                },
-                json={"model": m, "messages": messages},
-                timeout=30,
+
+    url = "https://openrouter.ai/api/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://henok-agent.onrender.com",
+        "X-Title": "HENOK AI Telegram Agent",
+    }
+    payload = {
+        "model": OPENROUTER_MODEL,
+        "messages": messages,
+    }
+
+    try:
+        response = HTTP.post(
+            url,
+            headers=headers,
+            json=payload,
+            timeout=HTTP_TIMEOUT,
+        )
+
+        if response.status_code != 200:
+            logger.error(
+                "OpenRouter HTTP %s for model %s: %s",
+                response.status_code,
+                OPENROUTER_MODEL,
+                error_text(response),
             )
-            if r.status_code == 200:
-                content = r.json()["choices"][0]["message"]["content"]
-                if content:
-                    return content
-        except Exception:
-            continue
+            return None
+
+        data = response.json()
+        choices = data.get("choices") or []
+        if not choices:
+            logger.warning("OpenRouter returned no choices")
+            return None
+
+        content = choices[0].get("message", {}).get("content", "")
+        if isinstance(content, list):
+            content = "\n".join(
+                item.get("text", "")
+                for item in content
+                if isinstance(item, dict) and item.get("text")
+            )
+
+        return str(content).strip() or None
+
+    except requests.RequestException as exc:
+        logger.error("OpenRouter request failed: %s", type(exc).__name__)
+    except (ValueError, KeyError, TypeError):
+        logger.exception("Could not parse OpenRouter response")
+
     return None
 
-def call_gemini(contents, timeout=40):
-    if not GEMINI_API_KEY:
+
+def reply_with_ai(
+    chat_id: int,
+    user_text: str,
+    extra_parts: Optional[List[Dict[str, Any]]] = None,
+) -> Optional[str]:
+    history = get_history(chat_id)
+
+    # Gemini is the primary provider because it can process audio as well as text.
+    gemini_contents = []
+    for item in history:
+        gemini_contents.append({
+            "role": "user" if item["role"] == "user" else "model",
+            "parts": [{"text": item["text"]}],
+        })
+
+    current_parts = list(extra_parts or [])
+    if user_text:
+        current_parts.append({"text": user_text})
+
+    gemini_contents.append({
+        "role": "user",
+        "parts": current_parts,
+    })
+
+    answer = call_gemini(gemini_contents)
+    if answer:
+        return answer
+
+    # OpenRouter is a text fallback. Audio is sent only to Gemini.
+    if extra_parts:
+        logger.warning("Gemini audio request failed; OpenRouter cannot be used as audio fallback")
         return None
-    models = ["models/gemini-flash-latest", "models/gemini-pro-latest"]
-    body = {"contents": contents}
-    for m in models:
-        try:
-            url = f"https://generativelanguage.googleapis.com/v1beta/{m}:generateContent?key={GEMINI_API_KEY}"
-            r = requests.post(url, headers={"Content-Type": "application/json"}, json=body, timeout=timeout)
-            if r.status_code == 200:
-                j = r.json()
-                cands = j.get("candidates") or []
-                if cands:
-                    return "".join(p.get("text", "") for p in cands[0].get("content", {}).get("parts", []))
-        except Exception:
-            continue
-    return None
 
-def reply_with_ai(chat_id, user_text, extra_parts=None):
-    hist = HISTORY.get(chat_id, [])[-10:]
-    if not extra_parts:
-        msgs = [{"role": "system", "content": SYSTEM_PROMPT}]
-        msgs += [{"role": h["role"], "content": h["text"]} for h in hist]
-        msgs.append({"role": "user", "content": user_text})
-        out = call_openrouter(msgs)
-        if out:
-            return out
+    openrouter_messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    openrouter_messages.extend(history)
+    openrouter_messages.append({"role": "user", "content": user_text})
+    return call_openrouter(openrouter_messages)
 
-    # Gemini Fallback / Media Handler
-    contents = []
-    for h in hist:
-        contents.append({"role": "user" if h["role"] == "user" else "model", "parts": [{"text": h["text"]}]})
-    
-    current_parts = (extra_parts or []) + [{"text": f"{SYSTEM_PROMPT}\n\n{user_text}"}]
-    contents.append({"role": "user", "parts": current_parts})
-    out = call_gemini(contents)
-    return out
 
-def safe_send(chat_id, text, markup=None):
-    chunks = [text[i:i + 3900] for i in range(0, len(text), 3900)] or [""]
-    for i, c in enumerate(chunks):
-        bot.send_message(chat_id, c, reply_markup=markup if i == len(chunks) - 1 else None)
+# ============================================================
+# Menus and post package workflow
+# ============================================================
 
-def add_history(chat_id, role, text):
-    h = HISTORY.setdefault(chat_id, [])
-    h.append({"role": role, "text": text})
-    del h[:-30]
-
-# ═════════════════════════ Menus & Workflows ═════════════════════════
 def topic_menu():
-    m = InlineKeyboardMarkup(row_width=1)
-    m.add(*[InlineKeyboardButton(v[0], callback_data=f"t:{k}") for k, v in TOPICS.items()])
-    return m
+    keyboard = InlineKeyboardMarkup(row_width=1)
+    keyboard.add(*[
+        InlineKeyboardButton(label, callback_data=f"topic:{key}")
+        for key, (label, _) in TOPICS.items()
+    ])
+    return keyboard
+
 
 def style_menu():
-    m = InlineKeyboardMarkup(row_width=1)
-    m.add(*[InlineKeyboardButton(v[0], callback_data=f"s:{k}") for k, v in STYLES.items()])
-    return m
+    keyboard = InlineKeyboardMarkup(row_width=1)
+    keyboard.add(*[
+        InlineKeyboardButton(label, callback_data=f"style:{key}")
+        for key, (label, _) in STYLES.items()
+    ])
+    return keyboard
+
 
 def platform_menu():
-    m = InlineKeyboardMarkup(row_width=2)
-    m.add(*[InlineKeyboardButton(v[0], callback_data=f"p:{k}") for k, v in PLATFORMS.items()])
-    m.add(InlineKeyboardButton("🌐 ለሁሉም", callback_data="p:all"))
-    return m
-
-def package_menu(pid, platform):
-    label = "✅ አጽድቅና ቴሌግራም ላይ ለጥፍ" if platform == "tg" else "✅ አጽድቅ"
-    m = InlineKeyboardMarkup(row_width=2)
-    m.add(
-        InlineKeyboardButton(label, callback_data=f"pub:{pid}"),
-        InlineKeyboardButton("🔄 ሌላ ስሪት", callback_data=f"regen:{pid}"),
-        InlineKeyboardButton("❌ ሰርዝ", callback_data=f"cancel:{pid}"),
+    keyboard = InlineKeyboardMarkup(row_width=2)
+    keyboard.add(*[
+        InlineKeyboardButton(label, callback_data=f"platform:{key}")
+        for key, (label, _) in PLATFORMS.items()
+    ])
+    keyboard.add(
+        InlineKeyboardButton("🌐 ለሁሉም", callback_data="platform:all")
     )
-    return m
+    return keyboard
 
-def lock_answer(call, label):
+
+def package_menu(package_id: int, platform_key: str):
+    label = (
+        "✅ አጽድቅና በHenok Graphics ላይ ለጥፍ"
+        if platform_key == "tg"
+        else "✅ አጽድቅ"
+    )
+    keyboard = InlineKeyboardMarkup(row_width=2)
+    keyboard.add(
+        InlineKeyboardButton(label, callback_data=f"publish:{package_id}"),
+        InlineKeyboardButton("🔄 ሌላ ስሪት", callback_data=f"regenerate:{package_id}"),
+        InlineKeyboardButton("❌ ሰርዝ", callback_data=f"cancel:{package_id}"),
+    )
+    return keyboard
+
+
+def lock_answer(call, label: str):
     try:
+        original = call.message.text or ""
         bot.edit_message_text(
-            text=f"{call.message.text}\n\n✅ **ምርጫህ:** {label}",
+            f"{original}\n\n✅ የተመረጠው: {label}",
             chat_id=call.message.chat.id,
             message_id=call.message.message_id,
         )
     except Exception:
-        pass
+        logger.debug("Could not edit menu message", exc_info=True)
 
-def make_package(chat_id, topic, style, platform_key):
+
+def make_package(chat_id: int, topic: str, style: str, platform_key: str):
+    global PACKAGE_COUNTER
+
+    if platform_key not in PLATFORMS:
+        safe_send(chat_id, "የተመረጠው Platform አይታወቅም።")
+        return
+
     bot.send_chat_action(chat_id, "typing")
-    prompt = f"""
-ለ Henok Graphics ማህበረሰብ ይዘት አዘጋጅ።
-ርዕስ: {topic}
-ፕላትፎርም: {PLATFORMS[platform_key][1]}
-የዲዛይን ስታይል: {style}
+    platform_description = PLATFORMS[platform_key][1]
 
-በዚህ ቅደም ተከተል አቅርብ:
+    prompt = f"""
+ለHenok Graphics ማህበረሰብ ጥራት ያለው የSocial Media Content Package አዘጋጅ።
+
+TOPIC: {topic}
+PLATFORM: {platform_description}
+DESIGN STYLE: {style}
+
+በትክክል በዚህ ቅደም ተከተል መልስ፦
+
 ===POST===
-(የሚለጠፈው ሳቢ ጽሑፍ ከነ Hook፣ Bullet points፣ CTA እና Hashtags)
+የሚለጠፈውን ጽሑፍ አዘጋጅ። ጠንካራ Hook፣ ጠቃሚ ዋና ይዘት፣ CTA እና ተዛማጅ Hashtags ይኑሩት።
+የተመረጠውን Platform የጽሑፍ ርዝመትና ቅርጽ ተከተል።
 
 ===CANVA===
-🎨 Color Palette: (3-4 ቀለማት ከ HEX ኮድ ጋር)
-🔤 Overlay Hook: (በምስሉ ላይ የሚጻፍ አጭር ኃይለኛ ጽሑፍ)
-🖼 Composition: (የምስሉ አቀማመጥ መመሪያ)
+🎨 Color Palette: 3-4 HEX colors.
+🔤 Overlay Hook: በDesign ላይ የሚታይ አጭር ጽሑፍ።
+🖼 Composition: የLayout፣ hierarchy፣ focal point እና visual elements መመሪያ።
+📐 Canvas Size: ለተመረጠው Platform ተስማሚ መጠን።
+🪄 Canva Search Terms: ለElements እና Templates የሚረዱ ቃላት።
+
+እውነት ያልሆኑ ቁጥሮችን ወይም ምንጭ የሌላቸውን ስታቲስቲክስ አትፍጠር።
 """
+
     full = reply_with_ai(chat_id, prompt)
     if not full:
-        bot.send_message(chat_id, "ይቅርታ ሄኖክ፣ ፖስቱን ማመንጨት አልተቻለም፤ እባክህ በድጋሚ ሞክር።")
+        safe_send(
+            chat_id,
+            "ይቅርታ፣ የContent Package ማዘጋጀት አልተሳካም። "
+            "Render Logs ውስጥ የAPI ስህተቱን መመልከት ያስፈልጋል።"
+        )
         return
 
-    post, canva = full, ""
+    post = full
+    canva = ""
+
     if "===POST===" in full:
         post = full.split("===POST===", 1)[1]
-    if "===CANVA===" in full:
-        parts = post.split("===CANVA===", 1)
-        post, canva = parts[0], parts[1]
 
-    pid = next(PKG_IDS)
-    SESSIONS.setdefault(chat_id, {"pkgs": {}})["pkgs"][pid] = {
-        "topic": topic, "style": style, "platform": platform_key, "post": post.strip(), "canva": canva.strip(),
-    }
-    body = f"📢 **ፖስት ({PLATFORMS[platform_key][0]}):**\n\n{post.strip()}\n\n━━━━━━━━━━━━━━━\n🎨 **Canva Blueprint:**\n\n{canva.strip()}"
-    safe_send(chat_id, body, package_menu(pid, platform_key))
+    if "===CANVA===" in post:
+        post, canva = post.split("===CANVA===", 1)
+    elif "===CANVA===" in full:
+        # Handles responses where the POST marker was omitted.
+        before, canva = full.split("===CANVA===", 1)
+        post = before.replace("===POST===", "", 1)
 
-def advance(chat_id):
-    s = SESSIONS.setdefault(chat_id, {"pending": {}})
-    p = s["pending"]
-    if not p.get("topic"):
-        bot.send_message(chat_id, "❓ ስለ ምን ርዕስ ልፍጠር?\n(ከታች ምረጥ ወይም በድምፅ/ጽሑፍ ንገረኝ)፦", reply_markup=topic_menu())
+    post = post.strip()
+    canva = canva.strip()
+
+    with STATE_LOCK:
+        PACKAGE_COUNTER += 1
+        package_id = PACKAGE_COUNTER
+        session = SESSIONS.setdefault(chat_id, {"pending": {}, "pkgs": {}})
+        session.setdefault("pkgs", {})[package_id] = {
+            "topic": topic,
+            "style": style,
+            "platform": platform_key,
+            "post": post,
+            "canva": canva,
+        }
+
+    body = (
+        f"📢 POST — {PLATFORMS[platform_key][0]}\n\n{post}\n\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"🎨 CANVA BLUEPRINT\n\n{canva or 'Canva Blueprint አልተመለሰም።'}"
+    )
+    safe_send(chat_id, body, package_menu(package_id, platform_key))
+
+
+def advance_package_workflow(chat_id: int):
+    with STATE_LOCK:
+        session = SESSIONS.setdefault(chat_id, {"pending": {}, "pkgs": {}})
+        pending = session.setdefault("pending", {})
+
+        topic = pending.get("topic")
+        style = pending.get("style")
+        platforms = pending.get("platforms")
+
+    if not topic:
+        safe_send(
+            chat_id,
+            "❓ ስለ ምን ርዕስ ፖስት ላዘጋጅ?\n"
+            "ከታች ምረጥ ወይም ርዕሱን በጽሑፍ ጻፍ።",
+            topic_menu(),
+        )
         return
-    if not p.get("style"):
-        bot.send_message(chat_id, "❓ የ Canva ዲዛይን ስታይል ምረጥ፦", reply_markup=style_menu())
-        return
-    if not p.get("platforms"):
-        bot.send_message(chat_id, "❓ ለየትኛው ፕላትፎርም ላዘጋጅ?፦", reply_markup=platform_menu())
+
+    if not style:
+        safe_send(chat_id, "❓ የCanva Design Style ምረጥ፦", style_menu())
         return
 
-    for pk in p.get("platforms"):
-        make_package(chat_id, p["topic"], p["style"], pk)
-    s["pending"] = {}
+    if not platforms:
+        safe_send(chat_id, "❓ ለየትኛው Platform ላዘጋጅ?", platform_menu())
+        return
 
-# ═════════════════════════ Handlers ═════════════════════════
-@bot.message_handler(commands=["id"])
-def cmd_id(message):
-    bot.reply_to(message, f"የአንተ Telegram ID: {message.from_user.id}")
+    for platform_key in platforms:
+        make_package(chat_id, topic, style, platform_key)
+
+    with STATE_LOCK:
+        SESSIONS.setdefault(chat_id, {"pending": {}, "pkgs": {}})["pending"] = {}
+
+
+def is_post_request(text: str) -> bool:
+    normalized = (text or "").strip().lower()
+    if normalized in ("/post", "post", "ፖስት"):
+        return True
+
+    phrases = (
+        "ፖስት አዘጋጅ",
+        "ፖስት ፍጠር",
+        "ፖስት አድርግ",
+        "ይዘት አዘጋጅ",
+        "create a post",
+        "write a post",
+        "make a post",
+        "create content",
+        "write content",
+    )
+    return any(phrase in normalized for phrase in phrases)
+
+
+# ============================================================
+# Telegram commands
+# ============================================================
 
 @bot.message_handler(commands=["start", "menu"])
 def cmd_start(message):
     bot.send_message(
         message.chat.id,
-        "ሰላም ሄኖክ! 👋\n"
-        "• መደበኛ ጥያቄዎችን በጽሑፍ ወይም በድምፅ መጠየቅ ትችላለህ (በቀጥታ እመልሳለሁ)።\n"
-        "• ደረጃ በደረጃ ፖስት ለመስራት ከፈለግህ **'ፖስት'** ብለህ ጻፍልኝ!"
+        "ሰላም! 👋 እኔ HENOK AI ነኝ።\n\n"
+        "• መደበኛ ጥያቄ ጠይቀኝ፤ በቀጥታ እመልሳለሁ።\n"
+        "• Voice Note ላክ፤ ጽሑፍ፣ ማጠቃለያና Action Items አዘጋጃለሁ።\n"
+        "• ፖስት ለመፍጠር /post ብለህ ጀምር።\n"
+        "• /reset የውይይት ታሪክን ያጸዳል።\n"
+        "• /id የTelegram IDህን ያሳያል።"
     )
+
+
+@bot.message_handler(commands=["id"])
+def cmd_id(message):
+    bot.reply_to(
+        message,
+        f"Telegram User ID: {message.from_user.id}\n"
+        f"Chat ID: {message.chat.id}"
+    )
+
+
+@bot.message_handler(commands=["reset"])
+def cmd_reset(message):
+    with STATE_LOCK:
+        HISTORY.pop(message.chat.id, None)
+        SESSIONS.pop(message.chat.id, None)
+    bot.reply_to(message, "የዚህ ውይይት ታሪክ ተጸድቷል።")
+
+
+@bot.message_handler(commands=["post"])
+def cmd_post(message):
+    with STATE_LOCK:
+        SESSIONS[message.chat.id] = {
+            "pending": {"topic": "", "style": "", "platforms": []},
+            "pkgs": {},
+        }
+    advance_package_workflow(message.chat.id)
+
+
+# ============================================================
+# Voice and audio handlers
+# ============================================================
+
+def process_audio_message(message, audio_object, default_mime: str):
+    chat_id = message.chat.id
+    file_size = getattr(audio_object, "file_size", None)
+
+    if file_size and file_size > MAX_AUDIO_BYTES:
+        safe_send(
+            chat_id,
+            "የድምፅ ፋይሉ በጣም ትልቅ ነው። "
+            "እባክህ ከ14 MB በታች አድርገህ እንደገና ላክ።"
+        )
+        return
+
+    bot.send_chat_action(chat_id, "typing")
+
+    try:
+        file_info = bot.get_file(audio_object.file_id)
+        audio_bytes = bot.download_file(file_info.file_path)
+    except Exception as exc:
+        logger.exception("Telegram audio download failed")
+        safe_send(
+            chat_id,
+            f"የድምፅ ፋይሉን ማውረድ አልተቻለም ({type(exc).__name__})።"
+        )
+        return
+
+    if not audio_bytes:
+        safe_send(chat_id, "የድምፅ ፋይሉ ባዶ ነው። እባክህ እንደገና ላክ።")
+        return
+
+    if len(audio_bytes) > MAX_AUDIO_BYTES:
+        safe_send(chat_id, "የድምፅ ፋይሉ ከሚፈቀደው መጠን በላይ ነው።")
+        return
+
+    mime_type = (
+        getattr(audio_object, "mime_type", None)
+        or default_mime
+        or "audio/ogg"
+    ).split(";")[0].strip().lower()
+
+    # Telegram voice notes are normally OGG/Opus. Gemini accepts audio/ogg.
+    if not mime_type.startswith("audio/"):
+        mime_type = default_mime
+
+    prompt = """
+ይህን የድምፅ መልዕክት በጥሞና አዳምጥ።
+ተናጋሪው በአማርኛ ከተናገረ በአማርኛ ጻፍ፤ በሌላ ቋንቋ ከሆነ ዋናውን ቋንቋ ጠብቅ።
+ተጠቃሚው ትርጉም ካልጠየቀ በስተቀር ቋንቋውን አትቀይር።
+ያልተሰማ ቃል አትፍጠር፤ ካልተረጋገጠ [ያልተሰማ] ብለህ ምልክት አድርግ።
+
+በዚህ ቅደም ተከተል መልስ፦
+1. TRANSCRIPT: የተነገረውን በተቻለ መጠን ቃል በቃል ጻፍ።
+2. SUMMARY: ዋናውን ሀሳብ በጥቂት ነጥቦች አጠቃልል።
+3. ACTION ITEMS: ከድምፁ የሚወጡ ተግባራትን ዘርዝር።
+ከድምፁ ውስጥ ተግባር ካልተገኘ "የተለየ Action Item የለም" በል።
+"""
+
+    extra_parts = [
+        {"text": prompt},
+        {
+            "inlineData": {
+                "mimeType": mime_type,
+                "data": __import__("base64").b64encode(audio_bytes).decode("ascii"),
+            }
+        },
+    ]
+
+    try:
+        answer = call_gemini(
+            [{"role": "user", "parts": extra_parts}],
+            timeout=80,
+        )
+    except Exception:
+        logger.exception("Unexpected audio processing error")
+        answer = None
+
+    if answer:
+        add_history(chat_id, "user", "[Voice message]")
+        add_history(chat_id, "assistant", answer)
+        safe_send(chat_id, f"🎙️ የድምፅ መልዕክት ውጤት\n\n{answer}")
+    else:
+        safe_send(
+            chat_id,
+            "የድምፅ መልዕክቱን ማቀናበር አልተሳካም። "
+            "GEMINI_API_KEY፣ GEMINI_MODEL እና Render Logs መፈተሽ ያስፈልጋል።"
+        )
+
 
 @bot.message_handler(content_types=["voice"])
 def handle_voice(message):
-    chat_id = message.chat.id
-    v = message.voice
-    if v.file_size and v.file_size > MAX_BYTES:
-        bot.send_message(chat_id, "ይህ የድምፅ ፋይል ከ 20MB በላይ ስለሆነ Telegram አያወርደውም፤ እባክህ አሳጥረው።")
-        return
-    bot.send_chat_action(chat_id, "typing")
-    try:
-        data = bot.download_file(bot.get_file(v.file_id).file_path)
-    except Exception as e:
-        bot.send_message(chat_id, f"ድምፁን ማውረድ አልተቻለም: {type(e).__name__}")
-        return
+    process_audio_message(message, message.voice, "audio/ogg")
 
-    parts = [
-        {"text": "ይህን የድምፅ መልዕክት በጥሞና አዳምጠህ በደንብ የተብራራ ማጠቃለያ እና የተግባር ዝርዝር (Action Items) አቅርብ።"},
-        {"inline_data": {"mime_type": v.mime_type or "audio/ogg", "data": base64.b64encode(data).decode()}}
-    ]
-    out = call_gemini([{"role": "user", "parts": parts}])
-    if out:
-        add_history(chat_id, "user", "[የድምፅ መልዕክት]")
-        add_history(chat_id, "assistant", out)
-        safe_send(chat_id, f"🎙 **የድምፅህ ማጠቃለያና Action Items:**\n\n{out}")
-    else:
-        bot.send_message(chat_id, "ድምፁን መረዳት አልተቻለም፤ እባክህ ትንሽ ቀረብ ብለህ በድጋሚ ላክ።")
 
-@bot.message_handler(content_types=["video", "video_note"])
-def handle_video(message):
-    chat_id = message.chat.id
-    item = message.video or message.video_note
-    if item.file_size and item.file_size > MAX_BYTES:
-        bot.send_message(chat_id, "ቪዲዮው ከ 20MB በላይ ነው (የቴሌግራም ገደብ)፤ የ YouTube ሊንኩን ላክልኝ ወይም አሳጥረው።")
-        return
-    bot.send_chat_action(chat_id, "upload_video")
-    try:
-        data = bot.download_file(bot.get_file(item.file_id).file_path)
-        parts = [
-            {"text": "ይህን ቪዲዮ (ምስሉንም ድምጹንም) ሙሉ በሙሉ ተመልከት።\n1. ዋና ጭብጡ\n2. ለ Whop/TikTok የሚሆኑ 3 ምርጥ የ 30 ሰከንድ ቫይራል ክሊፖች (Start-End ጊዜና Hook)\n3. የማሻሻያ ምክር"},
-            {"inline_data": {"mime_type": getattr(item, "mime_type", None) or "video/mp4", "data": base64.b64encode(data).decode()}}
-        ]
-        out = call_gemini([{"role": "user", "parts": parts}])
-        if out:
-            safe_send(chat_id, out)
-        else:
-            bot.send_message(chat_id, "ቪዲዮውን መተንተን አልተቻለም።")
-    except Exception as e:
-        bot.send_message(chat_id, f"ስህተት ተፈጠረ: {str(e)}")
+@bot.message_handler(content_types=["audio"])
+def handle_audio(message):
+    process_audio_message(message, message.audio, "audio/mpeg")
 
-@bot.message_handler(content_types=["photo"])
-def handle_photo(message):
-    chat_id = message.chat.id
-    item = message.photo[-1]
-    bot.send_chat_action(chat_id, "typing")
-    try:
-        data = bot.download_file(bot.get_file(item.file_id).file_path)
-        parts = [
-            {"text": "ይህን ምስል በጥንቃቄ መርምር፦ በውስጡ ያሉ ጽሑፎች፣ ጥራቱ፣ እና ለ Canva ዲዛይን ማሻሻያ የሚሆኑ ነጥቦች።"},
-            {"inline_data": {"mime_type": "image/jpeg", "data": base64.b64encode(data).decode()}}
-        ]
-        out = call_gemini([{"role": "user", "parts": parts}])
-        if out:
-            safe_send(chat_id, out)
-        else:
-            bot.send_message(chat_id, "ምስሉን መመልከት አልተቻለም።")
-    except Exception as e:
-        bot.send_message(chat_id, f"ስህተት: {str(e)}")
+
+# ============================================================
+# Text handler
+# ============================================================
 
 @bot.message_handler(content_types=["text"])
 def handle_text(message):
     chat_id = message.chat.id
-    text = message.text.strip()
-    text_lower = text.lower()
+    user_text = (message.text or "").strip()
 
-    # ፖስት ማዘጋጀት ሲፈልግ ብቻ በበተን ይጀምራል
-    if any(w in text_lower for w in ["ፖስት", "post", "ይዘት አዘጋጅ", "ፖስት አድርግ"]):
-        SESSIONS[chat_id] = {"pending": {"topic": "", "style": "", "platforms": []}}
-        advance(chat_id)
+    if not user_text:
         return
 
-    # መደበኛ ጥያቄ ከሆነ በቀጥታ ያለምንም በተን ይመልሳል
-    bot.send_chat_action(chat_id, "typing")
-    resp = reply_with_ai(chat_id, text)
-    if resp:
-        add_history(chat_id, "user", text)
-        add_history(chat_id, "assistant", resp)
-        safe_send(chat_id, resp)
-    else:
-        bot.send_message(chat_id, "ይቅርታ ሄኖክ፣ ምላሽ ለመስጠት አልተቻለም፤ እባክህ ትንሽ ቆይተህ እንደገና ሞክር።")
+    # If the user is in the middle of the post wizard, treat free text as topic.
+    with STATE_LOCK:
+        session = SESSIONS.get(chat_id)
+        pending = session.get("pending", {}) if session else {}
+        waiting_for_topic = bool(session and not pending.get("topic"))
 
-# ═════════════════════════ Callbacks ═════════════════════════
+    if waiting_for_topic and not user_text.startswith("/"):
+        with STATE_LOCK:
+            SESSIONS[chat_id]["pending"]["topic"] = user_text
+        advance_package_workflow(chat_id)
+        return
+
+    if is_post_request(user_text):
+        with STATE_LOCK:
+            SESSIONS[chat_id] = {
+                "pending": {"topic": "", "style": "", "platforms": []},
+                "pkgs": {},
+            }
+        advance_package_workflow(chat_id)
+        return
+
+    bot.send_chat_action(chat_id, "typing")
+    response = reply_with_ai(chat_id, user_text)
+
+    if response:
+        add_history(chat_id, "user", user_text)
+        add_history(chat_id, "assistant", response)
+        safe_send(chat_id, response)
+    else:
+        safe_send(
+            chat_id,
+            "አሁን ምላሽ ማዘጋጀት አልቻልኩም። "
+            "Render Logs ውስጥ Gemini/OpenRouter የAPI ስህተት መፈተሽ ያስፈልጋል።"
+        )
+
+
+# ============================================================
+# Inline button callbacks
+# ============================================================
+
 @bot.callback_query_handler(func=lambda call: True)
 def handle_callbacks(call):
+    try:
+        bot.answer_callback_query(call.id)
+    except Exception:
+        pass
+
     chat_id = call.message.chat.id
-    data = call.data
-    s = SESSIONS.setdefault(chat_id, {"pending": {}, "pkgs": {}})
-    bot.answer_callback_query(call.id)
+    data = call.data or ""
 
-    if data.startswith("t:"):
-        key = data[2:]
+    with STATE_LOCK:
+        session = SESSIONS.setdefault(
+            chat_id, {"pending": {}, "pkgs": {}}
+        )
+        session.setdefault("pending", {})
+        session.setdefault("pkgs", {})
+
+    if data.startswith("topic:"):
+        key = data.split(":", 1)[1]
+        if key not in TOPICS:
+            return
         label, topic = TOPICS[key]
-        s["pending"]["topic"] = topic
+        with STATE_LOCK:
+            SESSIONS[chat_id]["pending"]["topic"] = topic
         lock_answer(call, label)
-        advance(chat_id)
+        advance_package_workflow(chat_id)
+        return
 
-    elif data.startswith("s:"):
-        key = data[2:]
+    if data.startswith("style:"):
+        key = data.split(":", 1)[1]
+        if key not in STYLES:
+            return
         label, style = STYLES[key]
-        s["pending"]["style"] = style
+        with STATE_LOCK:
+            SESSIONS[chat_id]["pending"]["style"] = style
         lock_answer(call, label)
-        advance(chat_id)
+        advance_package_workflow(chat_id)
+        return
 
-    elif data.startswith("p:"):
-        key = data[2:]
+    if data.startswith("platform:"):
+        key = data.split(":", 1)[1]
         if key == "all":
-            s["pending"]["platforms"] = ["tg", "tt", "ig", "yt"]
-            lock_answer(call, "🌐 ለሁሉም")
+            selected = ["tg", "tt", "ig", "yt"]
+            label = "ለሁሉም Platform"
+        elif key in PLATFORMS:
+            selected = [key]
+            label = PLATFORMS[key][0]
         else:
-            s["pending"]["platforms"] = [key]
-            lock_answer(call, PLATFORMS[key][0])
-        advance(chat_id)
+            return
 
-    elif data.startswith("pub:"):
-        pid = int(data.split(":")[1])
-        pkg = s.get("pkgs", {}).get(pid)
-        if pkg:
-            try:
-                bot.send_message(TARGET_CHANNEL_ID, pkg["post"])
-                bot.send_message(chat_id, "🎉 **በሄኖክ ጸድቋል!**\nበቀጥታ ወደ **Henok Graphics** ግሩፕህ ተለጥፏል! ✅")
-            except Exception as e:
-                bot.send_message(chat_id, f"⚠️ ወደ ግሩፕ ለመለጠፍ አልተቻለም: {str(e)}")
+        with STATE_LOCK:
+            SESSIONS[chat_id]["pending"]["platforms"] = selected
+        lock_answer(call, label)
+        advance_package_workflow(chat_id)
+        return
 
-    elif data.startswith("cancel:"):
-        bot.send_message(chat_id, "❌ ተሰርዟል።")
+    if data.startswith("publish:"):
+        package_id = int(data.split(":", 1)[1])
 
-    elif data.startswith("regen:"):
-        pid = int(data.split(":")[1])
-        pkg = s.get("pkgs", {}).get(pid)
-        if pkg:
-            make_package(chat_id, pkg["topic"], pkg["style"], pkg["platform"])
+        if not is_owner(call.from_user.id):
+            safe_send(
+                chat_id,
+                "🔒 የPublishing ፈቃድ የለህም። "
+                "በRender Environment ውስጥ OWNER_ID በትክክል መዘጋጀቱን አረጋግጥ።"
+            )
+            return
 
-print("🤖 Henok Resilient Autonomous Agent is running 24/7...")
-bot.infinity_polling(skip_pending=True)
+        with STATE_LOCK:
+            package = SESSIONS.get(chat_id, {}).get("pkgs", {}).get(package_id)
+
+        if not package:
+            safe_send(chat_id, "ይህ Post Package አልተገኘም። /post ብለህ እንደገና ጀምር።")
+            return
+
+        if package["platform"] != "tg":
+            safe_send(
+                chat_id,
+                "ይህ ይዘት ለTelegram አልተዘጋጀም። "
+                "በTelegram ላይ ለመለጠፍ Telegram Platform ምረጥ።"
+            )
+            return
+
+        try:
+            bot.send_message(
+                TARGET_CHANNEL_ID,
+                package["post"],
+                disable_web_page_preview=True,
+            )
+            safe_send(chat_id, "✅ ፖስቱ ወደ Henok Graphics በተሳካ ሁኔታ ተልኳል።")
+        except Exception as exc:
+            logger.exception("Telegram publishing failed")
+            safe_send(
+                chat_id,
+                f"⚠️ ፖስቱን መላክ አልተቻለም ({type(exc).__name__})። "
+                "Bot በግሩፑ ውስጥ የመለጠፍ ፈቃድ እንዳለው አረጋግጥ።"
+            )
+        return
+
+    if data.startswith("cancel:"):
+        package_id = int(data.split(":", 1)[1])
+        with STATE_LOCK:
+            SESSIONS.get(chat_id, {}).get("pkgs", {}).pop(package_id, None)
+        safe_send(chat_id, "❌ የPost Package ሂደቱ ተሰርዟል።")
+        return
+
+    if data.startswith("regenerate:"):
+        package_id = int(data.split(":", 1)[1])
+        with STATE_LOCK:
+            package = SESSIONS.get(chat_id, {}).get("pkgs", {}).get(package_id)
+
+        if package:
+            make_package(
+                chat_id,
+                package["topic"],
+                package["style"],
+                package["platform"],
+            )
+        else:
+            safe_send(chat_id, "የቀድሞው Package አልተገኘም።")
+        return
+
+
+# ============================================================
+# Start polling
+# ============================================================
+
+if __name__ == "__main__":
+    logger.info("HENOK AI Telegram Agent is starting")
+    logger.info("Gemini model configured: %s", GEMINI_MODEL)
+    logger.info(
+        "OpenRouter fallback: %s",
+        "enabled" if OPENROUTER_API_KEY else "disabled",
+    )
+
+    try:
+        bot.infinity_polling(
+            timeout=30,
+            long_polling_timeout=30,
+            skip_pending=True,
+        )
+    except KeyboardInterrupt:
+        logger.info("HENOK AI stopped by keyboard interrupt")
+    except Exception:
+        logger.exception("Telegram polling stopped unexpectedly")
+        raise
