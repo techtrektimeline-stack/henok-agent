@@ -7,7 +7,7 @@ import os
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-# 1. Render ሰርቨር 24/7 Live ሆኖ እንዲቆይ የሚረዳ አነስተኛ ዌብ ሰርቨር
+# 1. Render ሰርቨር 24/7 Live ሆኖ እንዲቆይ የሚረዳ አነስተኛ ዌብ ሰርቨር (Port 10000)
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -23,28 +23,43 @@ def start_health_server():
 
 threading.Thread(target=start_health_server, daemon=True).start()
 
-# 2. ቁልፎች (Environment Variables)
+# 2. ቁልፎች እና መለያዎች
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
 
+# የ Henok Graphics ግሩፕ መለያ
+TARGET_CHANNEL_ID = os.environ.get("TARGET_CHANNEL_ID", "-1003098019114")
+
 bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
-pending_actions = {}
 
+# 3. የቦቱ የላቀ የአስተሳሰብ መመሪያ (Claude-Style Intelligence & System Persona)
 SYSTEM_PROMPT = """
-You are the personal AI executive assistant, video editor strategist, and digital marketing expert to Henok.
-Always address the user as 'ሄኖክ' (Henok).
-Henok manages multiple brands and channels:
-- YouTube Channels: TechTrek Timeline (Technology & AI), Henok Travel (Ethiopian Travel & Heritage), and others.
-- E-commerce & Monetization: Amazon KDP, Ye-buna (የቡና), Whop Viral Clipping Campaigns.
-- Marketing & Ads: Sekela Marketing (የሰከላ ማርኬቲንግ), Meta/Facebook Ads.
+You are the personal AI executive director, creative strategist, and digital marketing partner to ሄኖክ (Henok Habtamu).
+Always address him warmly and professionally as 'ሄኖክ'.
 
-Your Mission:
-Deliver the highest quality, practical, and polished output. Be creative, persuasive, and structured.
-Always respond in Amharic (or English when requested), calling him 'ሄኖክ'.
+ስለ ሄኖክ ማወቅ ያለብህ ቁልፍ መረጃዎች:
+- YouTube Channels: TechTrek Timeline (ቴክኖሎጂ፣ AI፣ ፈጠራ) እና Henok Travel (የኢትዮጵያ ጉዞና ቅርሶች)
+- Telegram Community: Henok Graphics (የቪዲዮ ኤዲቲንግ፣ ግራፊክስ፣ ሞሽን፣ ፍሪላንሲንግ ማህበረሰብ)
+- E-commerce & Digital Ventures: Amazon KDP፣ Ye-buna (የቡና)፣ Whop Viral Clipping Campaigns
+- Digital Marketing Agency: Sekela Marketing (የሰከላ ማርኬቲንግ)
+
+የአሰራርህ ወርቃማ ህጎች (Golden Operating Rules):
+1. ብልህ ጥያቄዎችን መጠየቅ (Claude-Style Clarification):
+   - ሄኖክ ያልተብራራ ወይም አጠቃላይ የሆነ ጥያቄ/ትዕዛዝ ሲሰጥህ (ለምሳሌ: "ግሩፑ ላይ የሆነ ነገር ፖስት አድርግ" ወይም "ስለ ኤዲቲንግ ጻፍ")፣ ዝም ብለህ አጠቃላይ የሆነ ባዶ ጽሑፍ አትደርድር!
+   - ልክ እንደ ክላውድ (Claude) ጥልቅ የሆነ ጥያቄ በመጠየቅ ጀምር፦ የታለመው ታዳሚ ማን እንደሆነ፣ ዛሬ ትኩረት የተደረገበት ርዕስ (ለምሳሌ Premiere Pro፣ After Effects ወይስ CapCut?)፣ የሚፈለገው ድምጸ-ተውኔት ምን እንደሆነ 1 ወይም 2 ጥርት ያሉ ጥያቄዎችን ጠይቀው።
+
+2. ከካንቫ እና ከዲዛይን ጋር የተጣመረ ይዘት (Post + Visual Idea):
+   - ይዘት ወይም ፖስት ሲዘጋጅ ጽሑፍ ብቻ መሆን የለበትም። ሁልጊዜ አብሮ የሚሰራ የካንቫ (Canva) ወይም የግራፊክስ ዲዛይን ሃሳብ (የምስሉ ቀለም፣ በምስሉ ላይ የሚጻፈው አጭር Hook ጽሑፍ፣ እና የዲዛይን አቀማመጥ መመሪያ) አካትት።
+
+3. የፈቃድ መጠየቅ ህግ (Human-in-the-Loop):
+   - ፈቃድ (Approve Button) የሚጠየቀው ወደ ግሩፕ ወይም ቻናል በቀጥታ የሚለጠፍ የተጠናቀቀ ፖስት ሲዘጋጅ ብቻ ነው።
+   - ለመደበኛ ውይይት፣ ለጥያቄዎች ወይም ሃሳብ ስትለዋወጡ ፈጽሞ የፈቃድ በተን (Approve Button) አታምጣ።
+
+4. ቋንቋ:
+   - ሁልጊዜ በተፈጥሯዊ፣ ግልጽ እና ማራኪ አማርኛ (ወይም በእንግሊዝኛ ሲጠይቅህ በእንግሊዝኛ) ምላሽ ስጥ።
 """
 
-# 3. የ OpenRouter ሞዴሎችን የመጥሪያ ፈንክሽን
 def call_openrouter(user_prompt, model_name):
     if not OPENROUTER_API_KEY:
         return None
@@ -63,14 +78,13 @@ def call_openrouter(user_prompt, model_name):
         ]
     }
     try:
-        r = requests.post(url, headers=headers, json=payload, timeout=35)
+        r = requests.post(url, headers=headers, json=payload, timeout=40)
         if r.status_code == 200:
             return r.json()["choices"][0]["message"]["content"]
     except Exception:
         pass
     return None
 
-# 4. የ Gemini ጽሑፍ መጥሪያ ፈንክሽን (Fallback)
 def ask_gemini_text(user_prompt):
     models = ["models/gemini-flash-latest", "models/gemini-flash-lite-latest", "models/gemini-pro-latest"]
     headers = {"Content-Type": "application/json"}
@@ -85,43 +99,33 @@ def ask_gemini_text(user_prompt):
             continue
     return "ይቅርታ ሄኖክ፣ ምላሽ ለመስጠት አልተቻለም፤ እባክህ ትንሽ ቆይተህ እንደገና ሞክር።"
 
-# 5. ራሱን ችሎ የተሻለውን AI የሚመርጠው ብልህ ሞተር (Autonomous Smart Router)
+# 4. የማሰብና ሞዴሎችን የመምረጥ ብልህ ማዕከል (Claude 3.5 Sonnet First)
 def autonomous_smart_router(user_prompt):
     text_lower = user_prompt.lower()
     
-    # ሀ. ለኮዲንግ፣ ለቴክኒክ፣ ለስሌት ወይም አመክንዮ -> DeepSeek R1 / V3 ይመረጣል
+    # ኮዲንግና ቴክኒካል ስራዎች ከሆነ DeepSeek ይመረጣል
     coding_words = ["code", "python", "html", "css", "js", "api", "bug", "algorithm", "ኮድ", "ስሌት", "ሂሳብ", "ፕሮግራም"]
     if any(w in text_lower for w in coding_words):
         resp = call_openrouter(user_prompt, "deepseek/deepseek-chat")
         if not resp:
             resp = call_openrouter(user_prompt, "deepseek/deepseek-r1:free")
         if resp:
-            return f"🤖 **[በ DeepSeek የተዘጋጀ]**\n\n{resp}"
-            
-    # ለ. ለፈጠራ ጽሑፍ፣ ለቪዲዮ ስክሪፕት፣ ለማርኬቲንግ እና ለስቶሪቴሊንግ -> Claude 3.5 Sonnet ይመረጣል
-    creative_words = ["script", "hook", "story", "tiktok", "reels", "youtube", "proposal", "caption", "ስክሪፕት", "ርዕስ", "ማስታወቂያ", "ፕሮፖዛል", "ይዘት", "ታሪክ", "ካፕሽን"]
-    if any(w in text_lower for w in creative_words):
-        resp = call_openrouter(user_prompt, "anthropic/claude-3.5-sonnet")
-        if not resp:
-            resp = call_openrouter(user_prompt, "deepseek/deepseek-chat")
-        if resp:
-            return f"✨ **[በ Claude 3.5 የተዘጋጀ]**\n\n{resp}"
-            
-    # ሐ. ለአጠቃላይ ጥያቄዎች እና ስትራቴጂ -> መጀመሪያ Claude/DeepSeek ከዚያ Gemini
+            return resp
+
+    # ለስልት፣ ለጽሑፍ፣ ለማርኬቲንግ እና ለጥያቄ አፈታት በዋነኝነት Claude 3.5 Sonnet ይመረጣል
     resp = call_openrouter(user_prompt, "anthropic/claude-3.5-sonnet")
     if not resp:
         resp = call_openrouter(user_prompt, "deepseek/deepseek-chat")
     if resp:
-        return f"💡 **[በ AI ኤጀንት የተዘጋጀ]**\n\n{resp}"
+        return resp
         
-    # መ. ሁልጊዜ ክፍት የሆነው Gemini Flash ያዘጋጃል
-    return f"⚡ **[በ Gemini የተዘጋጀ]**\n\n{ask_gemini_text(user_prompt)}"
+    return ask_gemini_text(user_prompt)
 
-# 6. ለፎቶ፣ ድምፅ፣ ፒዲኤፍ እና ቪዲዮ (Gemini Multimodal)
+# 5. ሚዲያ (ድምፅ፣ ቪዲዮ፣ ፎቶ፣ ሰነድ) በ Gemini Flash
 def ask_gemini_media(file_bytes, mime_type, caption_text=""):
     b64_data = base64.b64encode(file_bytes).decode('utf-8')
     parts = [
-        {"text": f"{SYSTEM_PROMPT}\n\nሄኖክ የላከልህ የሚዲያ/የሰነድ ፋይል ነው። ተጨማሪ ማስታወሻ: {caption_text}\nፋይሉን በጥሞና ተመልክተህ ተንትነህ የሚፈለገውን ስራ አቅርብ፦"},
+        {"text": f"{SYSTEM_PROMPT}\n\nሄኖክ የላከልህ የሚዲያ/የሰነድ ፋይል ነው። ተጨማሪ ማስታወሻ: {caption_text}\nፋይሉን በጥሞና ተመልክተህ ተንትነህ የሚፈለገውን ሙያዊ ስራ አቅርብ፦"},
         {
             "inlineData": {
                 "mimeType": mime_type,
@@ -145,18 +149,16 @@ def ask_gemini_media(file_bytes, mime_type, caption_text=""):
 @bot.message_handler(commands=['start', 'help'])
 def send_welcome(message):
     welcome_text = (
-        "👋 ሰላም ሄኖክ! እኔ ያንተ ራሱን የቻለ ራስ-ገዝ AI ረዳት (Autonomous AI Agent) ነኝ።\n\n"
-        "🧠 **አሰራሬ፦**\n"
-        "አንተ ምንም አይነት ሞዴል መምረጥ አይጠበቅብህም! የላክክልኝን ስራ እኔ ራሴ መርምሬ፦\n"
-        "• ለፈጠራ ጽሑፍና ለቪዲዮ ስክሪፕቶች → **Claude 3.5 Sonnet**\n"
-        "• ለኮዲንግ እና ለጥልቅ ስሌት → **DeepSeek V3 / R1**\n"
-        "• ለቪዲዮ፣ ለድምፅ፣ ለፎቶ እና ለፒዲኤፍ → **Gemini Flash**\n"
-        "በራሴ መርጬና አወዳድሬ ምርጡን ውጤት አቀርብልሃለሁ!\n\n"
-        "ስራውን አዘጋጅቼ ሁልጊዜ ያንተን ፍቃድ (Approve/Reject) እጠይቃለሁ!"
+        "👋 ሰላም ሄኖክ! እኔ ያንተ የግል AI ረዳትና የይዘት ስትራቴጂስት ነኝ።\n\n"
+        "✨ **ምን ማድረግ እችላለሁ?**\n"
+        "• በማንኛውም ርዕስ ላይ በድምፅ ወይም በጽሑፍ መወያየትና ማቀድ\n"
+        "• ለ Henok Graphics፣ TechTrek እና ማህበራዊ ሚዲያዎችህ የሚሆኑ ምርጥ ጽሑፎችን ከዲዛይን ሃሳብ ጋር ማዘጋጀት\n"
+        "• ወደ ግሩፕ ወይም ቻናል በቀጥታ እንዲለጠፍ ስታዝዘኝ ብቻ ፈቃድህን ጠይቄ መለጠፍ\n\n"
+        "በምን እንጀምር?"
     )
     bot.reply_to(message, welcome_text)
 
-# የድምፅ መልዕክት
+# የድምፅ መልዕክት (Voice Note)
 @bot.message_handler(content_types=['voice', 'audio'])
 def handle_voice(message):
     bot.send_chat_action(message.chat.id, 'record_voice')
@@ -164,7 +166,7 @@ def handle_voice(message):
         file_info = bot.get_file(message.voice.file_id)
         downloaded = bot.download_file(file_info.file_path)
         ai_resp = ask_gemini_media(downloaded, "audio/ogg", "የድምፅ መልዕክት")
-        send_with_buttons(message, f"🎙️ **ሄኖክ፣ ድምፅህን አዳምጬ የሚከተለውን አዘጋጅቻለሁ፦**\n\n{ai_resp}")
+        process_response(message, ai_resp)
     except Exception as e:
         bot.reply_to(message, f"ይቅርታ ሄኖክ፣ ድምፅህን ማንበብ አልቻልኩም: {str(e)}")
 
@@ -176,9 +178,9 @@ def handle_photo(message):
         file_id = message.photo[-1].file_id
         file_info = bot.get_file(file_id)
         downloaded = bot.download_file(file_info.file_path)
-        caption = message.caption or "ምስሉን ተንትነህ ለማህበራዊ ሚዲያ የሚሆን ይዘት አዘጋጅ"
+        caption = message.caption or "ምስሉን ተንትነህ ሙያዊ ማብራሪያ ስጥ"
         ai_resp = ask_gemini_media(downloaded, "image/jpeg", caption)
-        send_with_buttons(message, f"🖼️ **ሄኖክ፣ ምስሉን ተመልክቼ የሚከተለውን አዘጋጅቻለሁ፦**\n\n{ai_resp}")
+        process_response(message, ai_resp)
     except Exception as e:
         bot.reply_to(message, f"ይቅርታ ሄኖክ፣ ምስሉን መመልከት አልቻልኩም: {str(e)}")
 
@@ -190,77 +192,84 @@ def handle_document(message):
         file_info = bot.get_file(message.document.file_id)
         downloaded = bot.download_file(file_info.file_path)
         mime_type = message.document.mime_type or "application/pdf"
-        caption = message.caption or "ሰነዱን አንብበህ ዋና ዋና ነጥቦችንና የይዘት ሃሳቦችን አውጣ"
+        caption = message.caption or "ሰነዱን አንብበህ ተንትን"
         ai_resp = ask_gemini_media(downloaded, mime_type, caption)
-        send_with_buttons(message, f"📄 **ሄኖክ፣ ሰነዱን አንብቤ የሚከተለውን አዘጋጅቻለሁ፦**\n\n{ai_resp}")
+        process_response(message, ai_resp)
     except Exception as e:
         bot.reply_to(message, f"ይቅርታ ሄኖክ፣ ሰነዱን ማንበብ አልቻልኩም: {str(e)}")
 
-# ቪዲዮ (ለክሊፒንግ ትንታኔ)
+# ቪዲዮ
 @bot.message_handler(content_types=['video'])
 def handle_video(message):
     bot.send_chat_action(message.chat.id, 'upload_video')
     try:
         file_info = bot.get_file(message.video.file_id)
         downloaded = bot.download_file(file_info.file_path)
-        caption = message.caption or "ይህን ቪዲዮ አይተህ ለክሊፒንግ የሚሆኑ ምርጥ 30 ሰከንድ ክፍሎችን (Timestamps) እና ማራኪ Hooks ለይተህ አውጣልኝ"
+        caption = message.caption or "ይህን ቪዲዮ አይተህ ለክሊፒንግ የሚሆኑ ምርጥ 30 ሰከንድ ክፍሎችን ለይ"
         ai_resp = ask_gemini_media(downloaded, "video/mp4", caption)
-        send_with_buttons(message, f"🎬 **ሄኖክ፣ ቪዲዮውን ተመልክቼ የሚከተሉትን የክሊፒንግ ሃሳቦች አውጥቻለሁ፦**\n\n{ai_resp}")
+        process_response(message, ai_resp)
     except Exception as e:
         bot.reply_to(message, f"ይቅርታ ሄኖክ፣ ቪዲዮውን መመልከት አልቻልኩም: {str(e)}")
 
-# መደበኛ የጽሑፍ መልዕክት (ራሱ በብልሃት መርጦ የሚያዘጋጅ)
+# መደበኛ የጽሑፍ መልዕክት
 @bot.message_handler(func=lambda message: True)
 def handle_text(message):
     bot.send_chat_action(message.chat.id, 'typing')
     ai_resp = autonomous_smart_router(message.text)
-    send_with_buttons(message, ai_resp)
+    process_response(message, ai_resp)
 
-def send_with_buttons(message, content):
-    action_id = f"act_{message.message_id}"
-    pending_actions[action_id] = {
-        "content": content,
-        "chat_id": message.chat.id
-    }
+# መልዕክቶችን የመለየትና ፖስት ሲሆን ብቻ ፈቃድ የመጠየቅ ብልህ አሰራር
+def process_response(message, ai_resp):
+    user_prompt = message.text or message.caption or ""
+    prompt_lower = user_prompt.lower()
+    
+    # ሄኖክ ይዘት እንዲለጠፍ ወይም እንዲዘጋጅ ሲያዝዝ ብቻ የሚነቁ ቃላት
+    posting_keywords = ["ፖስት አድርግ", "ለጥፍልኝ", "ግሩፑ ላይ ለጥፍ", "ቻናሉ ላይ ለጥፍ", "publish", "post to group", "post this"]
+    is_posting_intent = any(w in prompt_lower for w in posting_keywords)
+    
+    # ቦቱ ጥያቄ እየጠየቀ ከሆነ (Clarification mode) ፈቃድ መጠየቅ አያስፈልግም
+    is_asking_question = "?" in ai_resp or "ጥያቄ" in ai_resp or "ከመለጠፋችን በፊት" in ai_resp
+    
+    # ተራ ውይይት ወይም ቦቱ ገና ጥያቄ እየጠየቀ ከሆነ ያለምንም በተን በቀጥታ ይመልሳል
+    if not is_posting_intent or is_asking_question:
+        bot.reply_to(message, ai_resp)
+        return
+        
+    # የተጠናቀቀ ፖስት ሲሆን ብቻ የፈቃድ መጠየቂያ በተን ያመጣል
     markup = InlineKeyboardMarkup()
-    markup.row_width = 3
+    markup.row_width = 2
     markup.add(
-        InlineKeyboardButton("✅ አጽድቅ (Approve)", callback_data=f"approve_{action_id}"),
-        InlineKeyboardButton("✍️ አሻሽለው (Revise)", callback_data=f"revise_{action_id}"),
-        InlineKeyboardButton("❌ ሰርዝ (Reject)", callback_data=f"reject_{action_id}")
+        InlineKeyboardButton("📢 አጽድቅና ግሩፕ ላይ ፖስት አድርግ", callback_data="publish_to_group"),
+        InlineKeyboardButton("❌ ሰርዝ (አትለጥፈው)", callback_data="cancel_publish")
     )
-    bot.reply_to(message, f"{content}\n\n━━━━━━━━━━━━━━━\nይህ ስራ ይፈቀድልኝ?", reply_markup=markup)
+    bot.reply_to(message, f"{ai_resp}\n\n━━━━━━━━━━━━━━━\nይህ ይዘት Henok Graphics ላይ ፖስት እንዲሆን ፈቅደሃል?", reply_markup=markup)
 
 @bot.callback_query_handler(func=lambda call: True)
 def callback_inline(call):
-    data = call.data
     chat_id = call.message.chat.id
     message_id = call.message.message_id
+    current_text = call.message.text or ""
+    base_text = current_text.split("━━━━━━━━━━━━━━━")[0].strip()
     
-    if data.startswith("approve_"):
-        action_id = data.replace("approve_", "")
-        action = pending_actions.get(action_id)
-        if action:
-            bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=message_id,
-                text=f"{action['content']}\n\n━━━━━━━━━━━━━━━\n✅ **በሄኖክ ጸድቋል!**\n(ስራው በተሳካ ሁኔታ ጸድቋል)",
-                parse_mode="Markdown"
-            )
-            bot.answer_callback_query(call.id, "ስራው ጸድቋል! ✅")
+    if call.data == "publish_to_group":
+        channel_target = TARGET_CHANNEL_ID or "-1003098019114"
+        try:
+            bot.send_message(channel_target, base_text)
+            success_text = f"{base_text}\n\n━━━━━━━━━━━━━━━\n✅ **በሄኖክ ጸድቋል!**\n🎉 በቀጥታ ወደ **Henok Graphics** ግሩፕህ ተለጥፏል!"
+            bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=success_text)
+            bot.answer_callback_query(call.id, "በቀጥታ ግሩፕህ ላይ ተለጥፏል! 🎉")
+        except Exception as e:
+            error_text = f"{base_text}\n\n━━━━━━━━━━━━━━━\n⚠️ ወደ ግሩፕ ለመለጠፍ አልተቻለም: {str(e)}"
+            bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=error_text)
+            bot.answer_callback_query(call.id, "ስህተት ተፈጥሯል")
             
-    elif data.startswith("revise_"):
-        bot.answer_callback_query(call.id, "አስተያየትህን ጻፍልኝ")
-        bot.send_message(chat_id, "ሄኖክ፣ ምን እንዲስተካከል ትፈልጋለህ? በጽሑፍ ወይም በድምፅ ላክልኝና አሻሽለዋለሁ።")
-        
-    elif data.startswith("reject_"):
-        bot.edit_message_text(
-            chat_id=chat_id,
-            message_id=message_id,
-            text="❌ **ስራው ተሰርዟል!**\nምንም እርምጃ አልተወሰደም።",
-            parse_mode="Markdown"
-        )
+    elif call.data == "cancel_publish":
+        cancel_text = f"{base_text}\n\n━━━━━━━━━━━━━━━\n❌ **በሄኖክ ተሰርዟል!**\n(ወደ ግሩፑ አልተለጠፈም)"
+        try:
+            bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=cancel_text)
+        except Exception:
+            pass
         bot.answer_callback_query(call.id, "ተሰርዟል ❌")
 
-print("🤖 Henok Autonomous AI Router is running 24/7 on Cloud...")
+print("🤖 Henok Autonomous Agent with Claude Strategy & Smart Intent Detection is running...")
 bot.infinity_polling()
