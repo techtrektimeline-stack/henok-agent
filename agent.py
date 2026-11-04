@@ -3,8 +3,26 @@ from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 import requests
 import json
 import base64
-
 import os
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
+# Render ሰርቨር 24/7 "Live" ብሎ እንዲያቆየው የሚረዳ አነስተኛ የጀርባ ዌብ ሰርቨር
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Henok Agent is running 24/7!")
+    def log_message(self, format, *args):
+        return
+
+def start_health_server():
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
+    server.serve_forever()
+
+threading.Thread(target=start_health_server, daemon=True).start()
+
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
@@ -79,6 +97,7 @@ def send_welcome(message):
     )
     bot.reply_to(message, welcome_text)
 
+# የድምፅ መልዕክት (Voice Note)
 @bot.message_handler(content_types=['voice', 'audio'])
 def handle_voice(message):
     bot.send_chat_action(message.chat.id, 'record_voice')
@@ -90,6 +109,7 @@ def handle_voice(message):
     except Exception as e:
         bot.reply_to(message, f"ይቅርታ ሄኖክ፣ ድምፅህን በማንበብ ላይ ስህተት ተፈጥሯል: {str(e)}")
 
+# ፎቶ እና ምስል
 @bot.message_handler(content_types=['photo'])
 def handle_photo(message):
     bot.send_chat_action(message.chat.id, 'upload_photo')
@@ -103,6 +123,7 @@ def handle_photo(message):
     except Exception as e:
         bot.reply_to(message, f"ይቅርታ ሄኖክ፣ ምስሉን መመልከት አልቻልኩም: {str(e)}")
 
+# ፒዲኤፍ እና ሌሎች ሰነዶች (Documents / PDFs)
 @bot.message_handler(content_types=['document'])
 def handle_document(message):
     bot.send_chat_action(message.chat.id, 'upload_document')
@@ -116,6 +137,7 @@ def handle_document(message):
     except Exception as e:
         bot.reply_to(message, f"ይቅርታ ሄኖክ፣ ሰነዱን ማንበብ አልቻልኩም: {str(e)}")
 
+# ቪዲዮ (Video for Clipping / Analysis)
 @bot.message_handler(content_types=['video'])
 def handle_video(message):
     bot.send_chat_action(message.chat.id, 'upload_video')
@@ -128,6 +150,7 @@ def handle_video(message):
     except Exception as e:
         bot.reply_to(message, f"ይቅርታ ሄኖክ፣ ቪዲዮውን መመልከት አልቻልኩም: {str(e)}")
 
+# መደበኛ የጽሑፍ መልዕክት
 @bot.message_handler(func=lambda message: True)
 def handle_text(message):
     bot.send_chat_action(message.chat.id, 'typing')
@@ -180,5 +203,5 @@ def callback_inline(call):
         )
         bot.answer_callback_query(call.id, "ተሰርዟል ❌")
 
-print("🤖 Henok Super-Agent is running...")
+print("🤖 Henok Super-Agent is running 24/7 on Cloud...")
 bot.infinity_polling()
