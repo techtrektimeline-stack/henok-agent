@@ -1,24 +1,32 @@
 {
-  "version": 1,
-  "accounts": [
+  "version": 2,
+  "accounts": [],
+  "known_projects": [
     {
       "id": "henok-travel",
       "name": "Henok Travel",
       "platform": "youtube",
-      "ownership": "owner_confirmed",
-      "status": "registered",
-      "capabilities": [
-        "content_planning",
-        "script_drafting",
-        "research",
-        "analytics_when_connected"
+      "relationship": "user_identified_personal_channel",
+      "integration_status": "not_connected",
+      "authorization_status": "not_granted",
+      "access_scope": [],
+      "allowed_operations": [
+        "draft_content_only_from_user_provided_material"
       ],
-      "publishing_requires_owner_approval": true
+      "prohibited_operations": [
+        "read_private_analytics",
+        "read_account_data",
+        "publish",
+        "edit_channel_settings",
+        "manage_comments",
+        "schedule_uploads"
+      ]
     }
   ],
   "policy": {
-    "only_listed_accounts_are_owner_confirmed": true,
-    "unlisted_accounts_must_not_be_assumed_owned": true,
-    "external_actions_require_explicit_owner_approval": true
+    "only_explicitly_connected_and_authorized_accounts_may_be_accessed": true,
+    "no_account_may_be_connected_or_used_without_explicit_owner_consent": true,
+    "external_actions_require_explicit_owner_approval": true,
+    "public_research_does_not_grant_account_access": true
   }
 }
