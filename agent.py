@@ -76,54 +76,89 @@ def send_text(chat_id, text, reply_markup=None, reply_to=None):
         ))
     return sent_messages
 
-def gemini_generate(parts, timeout=45):
+def gemini_generate(parts, timeout=45, use_web_search=False, system_instruction=None):
     if not GEMINI_API_KEY:
-        log.error("Gemini request blocked: GEMINI_API_KEY is not configured")
+        log.error('Gemini request blocked: GEMINI_API_KEY is not configured')
         return None
-
-    models = list(dict.fromkeys([GEMINI_MODEL, "gemini-3.7-flash", "gemini-3.5-flash-lite"]))
-    payload = {
-        "systemInstruction": {"parts": [{"text": SYSTEM_PROMPT}]},
-        "contents": [{"role": "user", "parts": parts}],
-    }
-
+    models = list(dict.fromkeys([GEMINI_MODEL, 'gemini-3.7-flash', 'gemini-3.5-flash-lite']))
+    payload = {'systemInstruction': {'parts': [{'text': system_instruction or SYSTEM_PROMPT}]},
+               'contents': [{'role': 'user', 'parts': parts}]}
+    if use_web_search:
+        payload['tools'] = [{'google_search': {}}]
     for model in models:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+        url = f'https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent'
         try:
-            response = HTTP.post(
-                url,
-                headers={
-                    "Content-Type": "application/json",
-                    "x-goog-api-key": GEMINI_API_KEY,
-                },
-                json=payload,
-                timeout=(10, timeout),
-            )
+            response = HTTP.post(url, headers={'Content-Type': 'application/json', 'x-goog-api-key': GEMINI_API_KEY},
+                                 json=payload, timeout=(10, timeout))
             if response.ok:
                 data = response.json()
-                candidates = data.get("candidates") or []
+                candidates = data.get('candidates') or []
                 if candidates:
-                    out = candidates[0].get("content", {}).get("parts", [])
-                    answer = "\n".join(p.get("text", "") for p in out if p.get("text")).strip()
+                    candidate = candidates[0]
+                    parts_out = candidate.get('content', {}).get('parts', [])
+                    answer = '\n'.join(p.get('text', '') for p in parts_out if p.get('text')).strip()
                     if answer:
-                        log.info("Gemini succeeded: model=%s", model)
+                        log.info('Gemini succeeded: model=%s web_search=%s', model, use_web_search)
+                        if use_web_search:
+                            meta = candidate.get('groundingMetadata') or {}
+                            chunks = meta.get('groundingChunks') or []
+                            sources, seen = [], set()
+                            for chunk in chunks:
+                                web = chunk.get('web') or {}
+                                uri = web.get('uri')
+                                title = web.get('title') or uri
+                                if uri and uri not in seen:
+                                    seen.add(uri)
+                                    sources.append(f'- {title}: {uri}')
+                            if sources:
+                                answer += '\n\nSources:\n' + '\n'.join(sources[:6])
+                            else:
+                                answer += '\n\nNote: Search returned no source links for this response; verify time-sensitive claims.'
                         return answer
-                log.error("Gemini returned no text: model=%s response=%s", model, str(data)[:500])
+                log.error('Gemini returned no text: model=%s response=%s', model, str(data)[:500])
                 continue
-
             try:
-                detail = response.json().get("error", {}).get("message", response.text)
+                detail = response.json().get('error', {}).get('message', response.text)
             except Exception:
                 detail = response.text
-            log.error("Gemini HTTP %s model=%s: %s", response.status_code, model, str(detail)[:500])
+            log.error('Gemini HTTP %s model=%s web_search=%s: %s', response.status_code, model, use_web_search, str(detail)[:500])
+            if response.status_code == 400 and use_web_search:
+                log.warning('Search-grounded request rejected; retrying without Search tool')
+                payload.pop('tools', None)
+                use_web_search = False
+                continue
             if response.status_code in (400, 401, 403):
                 break
         except requests.RequestException:
-            log.exception("Gemini network error: model=%s", model)
+            log.exception('Gemini network error: model=%s', model)
         except Exception:
-            log.exception("Unexpected Gemini error: model=%s", model)
+            log.exception('Unexpected Gemini error: model=%s', model)
     return None
 
+def needs_live_search(text):
+    import re
+    patterns = [
+        r'(?i)\b(today|latest|current|right now|this week|trending|breaking|recent|news|update)\b',
+        r'(ዛሬ|አሁን|በዚህ ሳምንት|ወቅታዊ|አዲስ ዜና|የዛሬ ዜና|ትሬንድ|ትሬንዲንግ|አሁናዊ|በቅርቡ የወጣ)',
+        r'(ፈልግ|በኢንተርኔት ፈልግ|ምንጭ አምጣ|ማስረጃ አምጣ)'
+    ]
+    return any(re.search(pattern, text or '') for pattern in patterns)
+
+def build_script_instruction(channel, topic):
+    channel = (channel or '').strip().lower()
+    if channel in ('travel', 'henok travel', 'henoktravel'):
+        channel_name = 'Henok Travel'
+        focus = 'cinematic travel documentary: destination context, history, culture, landscapes, sensory details, practical travel tips and responsible tourism'
+    else:
+        channel_name = 'TechTrek Timeline'
+        focus = 'technology and AI documentary: verified research, clear explanations, real-world examples, benefits, limitations and future implications'
+    return (
+        f'Create a research-led long-form YouTube video package for {channel_name}. Topic: {topic}. Focus: {focus}. '
+        'Use Google Search grounding where available. Do not invent facts, statistics or sources. '
+        'Include 3 title options, thumbnail concept, powerful 15-second hook, full narration with chapter headings and smooth transitions, '
+        'scene-by-scene B-roll/visual directions separated from narration, on-screen graphic suggestions, natural CTA, source URLs and a fact-check note. '
+        'Aim for an 8–12 minute script. Write in natural engaging Amharic unless English is requested. Never publish automatically.'
+    )
 def is_owner(message):
     return str(message.from_user.id) == OWNER_ID
 
@@ -141,10 +176,26 @@ def start_command(message):
     send_text(
         message.chat.id,
         "ሰላም ሄኖክ! 👋 HENOK AI ዝግጁ ነው።\n"
-        "ጽሑፍ፣ Voice Note፣ ፎቶ ወይም ቪዲዮ ላክልኝ።\n\n"
+        "ጽሑፍ፣ Voice Note፣ ፎቶ ወይም ቪዲዮ ላክልኝ።\n/script tech | የቴክኖሎጂ ርዕስ\n/script travel | የጉዞ ርዕስ\n\n"
         "ወደ Henok Graphics የሚላክ ይዘት ለማጽደቅ /publish ተጠቀም።"
     )
 
+@bot.message_handler(commands=["script"])
+def script_command(message):
+    if not is_owner(message):
+        return
+    raw = (message.text or '').partition(' ')[2].strip()
+    if '|' not in raw:
+        send_text(message.chat.id, 'አጠቃቀም፦ /script tech | የቴክኖሎጂ ርዕስ ወይም /script travel | የጉዞ ርዕስ')
+        return
+    channel, topic = [part.strip() for part in raw.split('|', 1)]
+    if not topic:
+        send_text(message.chat.id, 'እባክህ የቪዲዮውን ርዕስ ጨምር።')
+        return
+    bot.send_chat_action(message.chat.id, "typing")
+    instruction = build_script_instruction(channel, topic)
+    answer = gemini_generate([{"text": "Prepare the complete long-form video package."}], timeout=120, use_web_search=True, system_instruction=instruction)
+    send_text(message.chat.id, answer or "ስክሪፕቱን ማዘጋጀት አልተቻለም። Render Logs አረጋግጥ።", reply_to=message.message_id)
 @bot.message_handler(commands=["id"])
 def id_command(message):
     send_text(message.chat.id, f"Telegram ID: {message.from_user.id}")
@@ -198,7 +249,7 @@ def text_handler(message):
     if not text or text.startswith("/"):
         return
     bot.send_chat_action(message.chat.id, "typing")
-    answer = gemini_generate([{"text": text}], timeout=35)
+    answer = gemini_generate([{"text": text}], timeout=50, use_web_search=needs_live_search(text))
     if answer:
         send_text(message.chat.id, answer, reply_to=message.message_id)
     else:
