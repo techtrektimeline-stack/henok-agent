@@ -3,7 +3,8 @@
 import os, io, re, json, time, base64, html, zipfile, mimetypes, datetime, pathlib
 import requests
 
-ROOT = pathlib.Path(__file__).parent.parent
+_here = pathlib.Path(__file__).resolve().parent
+ROOT = _here.parent if _here.name == "agent" else _here
 STATE_F = ROOT / "state.json"
 VOICE_F = ROOT / "voice.md"
 TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
@@ -23,7 +24,7 @@ class UserError(Exception):
 
 # ---------- state ----------
 def load():
-    s = json.loads(STATE_F.read_text(encoding="utf-8"))
+    s = json.loads(STATE_F.read_text(encoding="utf-8")) if STATE_F.exists() else {}
     for k, v in (("offset", 0), ("pending", {}), ("history", []), ("last_daily", ""), ("chat", [])):
         s.setdefault(k, v)
     return s
