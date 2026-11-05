@@ -216,7 +216,7 @@ def ai_status_command(message):
     if not is_owner(message):
         return
     if not GEMINI_API_KEY:
-        send_text(message.chat.id, "AI STATUS: FAILED\\nGEMINI_API_KEY is missing from the Render environment variables.")
+        send_text(message.chat.id, "AI STATUS: FAILED\nGEMINI_API_KEY is missing from the Render environment variables.")
         return
     bot.send_chat_action(message.chat.id, "typing")
     url = f'https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent'
@@ -229,22 +229,22 @@ def ai_status_command(message):
             data = response.json()
             candidates = data.get("candidates") or []
             if candidates:
-                send_text(message.chat.id, f"AI STATUS: OK\\nModel: {GEMINI_MODEL}\\nGemini API authentication and text generation succeeded.")
+                send_text(message.chat.id, f"AI STATUS: OK\nModel: {GEMINI_MODEL}\nGemini API authentication and text generation succeeded.")
             else:
-                send_text(message.chat.id, f"AI STATUS: WARNING\\nHTTP {response.status_code}: API responded but returned no candidate. Check Render Logs.")
+                send_text(message.chat.id, f"AI STATUS: WARNING\nHTTP {response.status_code}: API responded but returned no candidate. Check Render Logs.")
             return
         try:
             detail = response.json().get("error", {}).get("message", response.text)
         except Exception:
             detail = response.text
         # Google API error messages are safe to show; the API key is never included.
-        send_text(message.chat.id, f"AI STATUS: FAILED\\nModel: {GEMINI_MODEL}\\nHTTP {response.status_code}\\n{str(detail)[:900]}")
+        send_text(message.chat.id, f"AI STATUS: FAILED\nModel: {GEMINI_MODEL}\nHTTP {response.status_code}\n{str(detail)[:900]}")
     except requests.RequestException as exc:
         log.exception("AI status diagnostic network error")
-        send_text(message.chat.id, f"AI STATUS: NETWORK ERROR\\n{type(exc).__name__}: {str(exc)[:300]}")
+        send_text(message.chat.id, f"AI STATUS: NETWORK ERROR\n{type(exc).__name__}: {str(exc)[:300]}")
     except Exception as exc:
         log.exception("AI status diagnostic failed")
-        send_text(message.chat.id, f"AI STATUS: ERROR\\n{type(exc).__name__}: {str(exc)[:300]}")
+        send_text(message.chat.id, f"AI STATUS: ERROR\n{type(exc).__name__}: {str(exc)[:300]}")
 
 @bot.message_handler(commands=["id"])
 def id_command(message):
