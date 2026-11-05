@@ -156,7 +156,7 @@ def call_gemini(contents, timeout=45):
 
     # Use one authentication method only. AI Studio AQ auth keys are sent
     # through x-goog-api-key; do not also append ?key= to the URL.
-    models = list(dict.fromkeys([GEMINI_MODEL, "gemini-3.5-flash-lite", "gemini-2.5-flash"]))
+    models = list(dict.fromkeys([GEMINI_MODEL, "gemini-2.5-flash", "gemini-2.0-flash"]))
     for model in models:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
         payload = {
