@@ -35,22 +35,52 @@ HISTORY: Dict[int, List[Dict[str, str]]] = {}
 SESSIONS: Dict[int, Dict[str, Any]] = {}
 PACKAGE_COUNTER = 0
 
-# Render እንዳይዘጋ የሚረዳ ሰርቨር
+# Telegram Webhook + health endpoint. Webhook avoids competing getUpdates pollers.
+import hashlib
+
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+WEBHOOK_PATH = "/telegram"
+WEBHOOK_SECRET = hashlib.sha256(TELEGRAM_BOT_TOKEN.encode("utf-8")).hexdigest()[:48]
+RENDER_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
+
 class HealthCheckHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
+    def log_message(self, fmt, *args):
+        logging.info("HTTP %s - %s", self.address_string(), fmt % args)
+
+    def _reply(self, status, body):
+        data = body.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
         self.end_headers()
-        self.wfile.write(b"HENOK AI is running 24/7")
+        self.wfile.write(data)
 
-def start_health_server():
-    port = int(os.getenv("PORT", "10000"))
-    try:
-        server = ThreadingHTTPServer(("0.0.0.0", port), HealthCheckHandler)
-        server.serve_forever()
-    except Exception:
-        pass
+    def do_GET(self):
+        if self.path in ("/", "/health", "/healthz"):
+            return self._reply(200, "HENOK AI webhook service is healthy")
+        return self._reply(404, "Not found")
 
-threading.Thread(target=start_health_server, daemon=True).start()
+    def do_POST(self):
+        if self.path != WEBHOOK_PATH:
+            return self._reply(404, "Not found")
+        supplied = self.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+        if supplied != WEBHOOK_SECRET:
+            logging.warning("Rejected webhook request: invalid secret")
+            return self._reply(403, "Forbidden")
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            if length <= 0 or length > 2_000_000:
+                return self._reply(400, "Invalid payload size")
+            payload = self.rfile.read(length).decode("utf-8")
+            update = telebot.types.Update.de_json(payload)
+            bot.process_new_updates([update])
+            return self._reply(200, "OK")
+        except Exception:
+            logging.exception("Failed to process Telegram webhook update")
+            return self._reply(500, "Update processing failed")
 
 SYSTEM_PROMPT = """
 You are HENOK AI, personal executive AI partner to ሄኖክ (Henok Habtamu) in Addis Ababa, Ethiopia.
@@ -314,11 +344,28 @@ def handle_callbacks(call):
         safe_send(chat_id, "❌ ተሰርዟል።")
 
 if __name__ == "__main__":
-    while True:
+    if not TELEGRAM_BOT_TOKEN:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN is missing")
+    if not RENDER_URL:
+        raise RuntimeError("RENDER_EXTERNAL_URL is missing; set it in Render environment")
+    port = int(os.getenv("PORT", "10000"))
+    server = ThreadingHTTPServer(("0.0.0.0", port), HealthCheckHandler)
+    webhook_url = RENDER_URL + WEBHOOK_PATH
+    try:
+        # Remove any old webhook/pending updates before registering the single endpoint.
+        bot.remove_webhook()
+        time.sleep(1)
+        ok = bot.set_webhook(url=webhook_url, secret_token=WEBHOOK_SECRET, drop_pending_updates=False)
+        if not ok:
+            raise RuntimeError("Telegram rejected setWebhook")
+        logging.info("HENOK AI webhook registered: %s", webhook_url)
+        server.serve_forever()
+    except Exception:
+        logging.exception("HENOK AI webhook server failed to start")
+        raise
+    finally:
         try:
-            bot.infinity_polling(timeout=30, long_polling_timeout=30, skip_pending=True)
-        except Exception as e:
-            if "409" in str(e):
-                time.sleep(5)
-            else:
-                time.sleep(3)
+            bot.remove_webhook()
+        except Exception:
+            logging.exception("Could not remove webhook during shutdown")
+        server.server_close()
