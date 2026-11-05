@@ -14,8 +14,8 @@ GKEY = os.environ["GEMINI_API_KEY"]
 MODEL = os.environ.get("GEMINI_MODEL", "gemini-1.5-flash")
 GAPI = "https://generativelanguage.googleapis.com"
 GH = {"x-goog-api-key": GKEY}
-INLINE_MAX = 12 * 1024 * 1024   # ከዚህ በላይ በGemini Files API ይጫናል
-TG_MAX = 20 * 1024 * 1024       # ቴሌግራም ለbotሎች የሚፈቅደው ከፍተኛ መጠን
+INLINE_MAX = 12 * 1024 * 1024
+TG_MAX = 20 * 1024 * 1024
 
 
 class UserError(Exception):
@@ -277,7 +277,7 @@ def handle_update(state, u):
             handle_callback(state, cb)
         return
     msg = u.get("message")
-    if msg and str(msg["chat"]["id"]) == CHAT:   # ከሄኖክ ውጭ ማንም አይታዘዝም
+    if msg and str(msg["chat"]["id"]) == CHAT:
         handle_message(state, msg)
 
 
