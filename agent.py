@@ -152,7 +152,7 @@ def needs_live_search(text):
     patterns = [
         r'(?i)\b(today|latest|current|right now|this week|trending|breaking|recent|news|update)\b',
         r'(ዛሬ|አሁን|በዚህ ሳምንት|ወቅታዊ|አዲስ ዜና|የዛሬ ዜና|ትሬንድ|ትሬንዲንግ|አሁናዊ|በቅርቡ የወጣ)',
-        r'(ፈልግ|በኢንተርኔት ፈልግ|ምንጭ አምጣ|ማስረጃ አምጣ)'
+        r'(ፈልግ|በኢንተርኔት ፈልግ|ምንጭ አምጣ|ማስረጃ አምጣ|የኢትዮጵያ ዜና|ኢትዮጵያዊያን ዜና|የዛሬው ዜና|ዜናዎች|ዜና)'
     ]
     return any(re.search(pattern, text or '') for pattern in patterns)
 
@@ -181,14 +181,52 @@ def download_telegram_file(file_id):
         raise ValueError("ፋይሉ ከ18MB በላይ ነው።")
     return data
 
+def main_menu_keyboard():
+    keyboard = InlineKeyboardMarkup(row_width=2)
+    keyboard.add(
+        InlineKeyboardButton("📰 ወቅታዊ ዜና", callback_data="menu:news"),
+        InlineKeyboardButton("📈 YouTube ምክር", callback_data="menu:youtube"),
+        InlineKeyboardButton("✍️ ይዘት / ስክሪፕት", callback_data="menu:content"),
+        InlineKeyboardButton("🔎 ጥናት / ጥያቄ", callback_data="menu:research"),
+        InlineKeyboardButton("🖼️ ፎቶ / ቪዲዮ", callback_data="menu:media"),
+        InlineKeyboardButton("❔ እገዛ", callback_data="menu:help"),
+    )
+    return keyboard
+
+def followup_keyboard():
+    keyboard = InlineKeyboardMarkup(row_width=2)
+    keyboard.add(
+        InlineKeyboardButton("📚 የበለጠ ዝርዝር", callback_data="follow:expand"),
+        InlineKeyboardButton("🔗 ምንጮች", callback_data="follow:sources"),
+        InlineKeyboardButton("📝 አጭር አድርግ", callback_data="follow:short"),
+        InlineKeyboardButton("💬 ቀጣይ ጥያቄ", callback_data="follow:new"),
+    )
+    return keyboard
+
+LAST_CONTEXT = {}
+
 @bot.message_handler(commands=["start", "menu"])
 def start_command(message):
     send_text(
         message.chat.id,
-        "ሰላም ሄኖክ! 👋 HENOK AI ዝግጁ ነው።\n"
-        "ጽሑፍ፣ Voice Note፣ ፎቶ ወይም ቪዲዮ ላክልኝ።\n/script tech | የቴክኖሎጂ ርዕስ\n/script travel | የጉዞ ርዕስ\n\n"
-        "ወደ Henok Graphics የሚላክ ይዘት ለማጽደቅ /publish ተጠቀም።"
+        "✨ HENOK AI\n\n"
+        "ሰላም! ምን ልርዳህ? ከታች አንዱን ምረጥ ወይም ጥያቄህን በቀጥታ ጻፍ።\n\n"
+        "🎙️ Voice Note • 🖼️ ፎቶ • 🎬 ቪዲዮ • 🌐 የቀጥታ የድር ጥናት",
+        reply_markup=main_menu_keyboard()
     )
+
+@bot.callback_query_handler(func=lambda call: (call.data or "").startswith("menu:"))
+def menu_callback(call):
+    bot.answer_callback_query(call.id)
+    prompts = {
+        "menu:news": "📰 ወቅታዊ ዜና\nየዛሬን ዜና ከየትኛው አካባቢ ትፈልጋለህ? ርዕሱን ጻፍ (ለምሳሌ፦ የዛሬ የኢትዮጵያ ዜናዎች)። ምንጮችን አካትታለሁ።",
+        "menu:youtube": "📈 YouTube ምክር\nምን እንመርምር? የቪዲዮ ሀሳብ፣ SEO፣ CTR፣ የቻናል እድገት ወይስ የቪዲዮ አፈጻጸም? ጥያቄህን ጻፍ።",
+        "menu:content": "✍️ ይዘት / ስክሪፕት\nየምትፈልገውን ይዘት፣ ቋንቋ፣ የቪዲዮ ርዝመት እና ርዕስ ጻፍ።",
+        "menu:research": "🔎 ጥናት / ጥያቄ\nርዕስህን ጻፍ። አስፈላጊ ከሆነ በድር ላይ እፈልጋለሁ፣ እውነታዎችንና ምንጮችንም እለያለሁ።",
+        "menu:media": "🖼️ ፎቶ / ቪዲዮ\nፎቶ ወይም ከ18MB በታች ቪዲዮ ላክ፤ ምን እንድመረምር በcaption ጻፍ።",
+        "menu:help": "💡 ጽሑፍ ጻፍ፣ Voice Note ላክ፣ ፎቶ/ቪዲዮ አያይዝ ወይም ከላይ ያሉትን ምርጫዎች ተጠቀም። የወቅታዊ ጥያቄዎች ላይ ምንጭ እጨምራለሁ።"
+    }
+    send_text(call.message.chat.id, prompts.get(call.data, "ጥያቄህን ጻፍ።"))
 
 @bot.message_handler(commands=["script"])
 def script_command(message):
@@ -257,17 +295,66 @@ def approval_callback(call):
         log.exception("Could not publish approved content")
         bot.answer_callback_query(call.id, "መላክ አልተቻለም።", show_alert=True)
 
+def run_text_request(chat_id, user_text, reply_to=None, context_prompt=None):
+    status = None
+    try:
+        status = bot.send_message(chat_id, "⏳ ጥያቄህን እያዘጋጀሁ ነው…")
+        bot.send_chat_action(chat_id, "typing")
+        prompt = context_prompt or user_text
+        use_search = needs_live_search(user_text) or needs_live_search(prompt)
+        answer = gemini_generate([{"text": prompt}], timeout=65, use_web_search=use_search)
+        if answer:
+            LAST_CONTEXT[chat_id] = {"question": user_text, "answer": answer}
+            if status:
+                try:
+                    bot.delete_message(chat_id, status.message_id)
+                except Exception:
+                    pass
+            send_text(chat_id, answer, reply_markup=followup_keyboard(), reply_to=reply_to)
+        else:
+            if status:
+                bot.edit_message_text("⚠️ አሁን የAI ምላሽ አልተገኘም። ጥያቄህን እንደገና ላክ፤ ችግሩንም በሎግ እመዘግባለሁ።", chat_id, status.message_id)
+            else:
+                send_text(chat_id, "⚠️ አሁን የAI ምላሽ አልተገኘም።", reply_to=reply_to)
+    except Exception:
+        log.exception("Text request failed")
+        if status:
+            try:
+                bot.edit_message_text("⚠️ ጥያቄውን ማስኬድ አልተቻለም። እባክህ እንደገና ሞክር።", chat_id, status.message_id)
+            except Exception:
+                pass
+        else:
+            send_text(chat_id, "⚠️ ጥያቄውን ማስኬድ አልተቻለም።", reply_to=reply_to)
+
+@bot.callback_query_handler(func=lambda call: (call.data or "").startswith("follow:"))
+def followup_callback(call):
+    bot.answer_callback_query(call.id)
+    context = LAST_CONTEXT.get(call.message.chat.id)
+    if not context:
+        send_text(call.message.chat.id, "ቀደም ያለው ውይይት አልተገኘም። እባክህ ጥያቄህን እንደገና ጻፍ።")
+        return
+    actions = {
+        "follow:expand": "ቀደም ያለውን መልስ በበለጠ ዝርዝር፣ በምሳሌዎች አብራራ።",
+        "follow:sources": "ለቀደም ያለው መልስ የተጠቀምካቸውን ምንጮች እና ማጣቀሻዎች ብቻ አሳይ። ያልተጠቀምካቸውን ምንጮች አትፍጠር።",
+        "follow:short": "ቀደም ያለውን መልስ ዋና ነጥቦቹን ብቻ በአጭሩ አቅርብ።",
+        "follow:new": "ሌላ ጥያቄ እንዲጽፍ ጠይቀው።"
+    }
+    if call.data == "follow:new":
+        send_text(call.message.chat.id, "💬 ቀጣይ ጥያቄህን ጻፍ።", reply_markup=main_menu_keyboard())
+        return
+    prompt = (
+        "የቀደመው ጥያቄ: " + context["question"] + "\\n"
+        "የቀደመው መልስ: " + context["answer"] + "\\n\\n"
+        + actions.get(call.data, "")
+    )
+    run_text_request(call.message.chat.id, context["question"], context_prompt=prompt)
+
 @bot.message_handler(content_types=["text"])
 def text_handler(message):
-    text = (message.text or "").strip()
-    if not text or text.startswith("/"):
+    user_text = (message.text or "").strip()
+    if not user_text or user_text.startswith("/"):
         return
-    bot.send_chat_action(message.chat.id, "typing")
-    answer = gemini_generate([{"text": text}], timeout=50, use_web_search=needs_live_search(text))
-    if answer:
-        send_text(message.chat.id, answer, reply_to=message.message_id)
-    else:
-        send_text(message.chat.id, "የAI አገልግሎቱ አሁን ምላሽ አልሰጠም። እባክህ ትንሽ ቆይተህ ድገም።", reply_to=message.message_id)
+    run_text_request(message.chat.id, user_text, reply_to=message.message_id)
 
 @bot.message_handler(content_types=["voice", "audio"])
 def voice_handler(message):
