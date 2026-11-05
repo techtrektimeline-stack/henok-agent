@@ -1,12 +1,6 @@
 # -*- coding: utf-8 -*-
-"""
-HENOK AI — Instant Real-Time Telegram Assistant
-Powered by Henok's Upgraded Gemini Engine
-"""
+"""HENOK AI — Render-hosted Telegram assistant (single long-polling worker)."""
 import os
-import io
-import re
-import json
 import time
 import base64
 import logging
@@ -17,141 +11,274 @@ import requests
 import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+log = logging.getLogger("henok-agent")
+
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-
-# ያንተ የ Upgraded Gemini ሞዴል
-GEMINI_MODEL = "gemini-1.5-flash"
-
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash").strip()
 TARGET_CHANNEL_ID = os.getenv("TARGET_CHANNEL_ID", "-1003098019114").strip()
 OWNER_ID = os.getenv("OWNER_ID", "511440586").strip()
-
 MAX_BYTES = 18 * 1024 * 1024
-TELEGRAM_TEXT_LIMIT = 3900
-
-bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN, parse_mode=None)
+TEXT_LIMIT = 3900
 HTTP = requests.Session()
 
-# 24/7 ሰርቨሩ ነቅቶ እንዲቆይ የሚረዳ
-class HealthCheckHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"HENOK AI is LIVE 24/7")
+if not TELEGRAM_BOT_TOKEN:
+    raise RuntimeError("TELEGRAM_BOT_TOKEN is missing")
+if not GEMINI_API_KEY:
+    log.warning("GEMINI_API_KEY is missing; bot will start but AI replies will fail")
 
-def start_health_server():
-    port = int(os.getenv("PORT", 10000))
-    try:
-        server = ThreadingHTTPServer(("0.0.0.0", port), HealthCheckHandler)
-        server.serve_forever()
-    except Exception:
-        pass
-
-threading.Thread(target=start_health_server, daemon=True).start()
+bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN, parse_mode=None, threaded=True)
 
 SYSTEM_PROMPT = """
-You are HENOK AI, personal executive AI partner to ሄኖክ (Henok Habtamu) in Addis Ababa, Ethiopia.
-- YouTube: TechTrek Timeline & Henok Travel
-- Telegram Community: Henok Graphics
-- Business: Sekela Marketing, Amazon KDP, Whop Viral Clipping, Ye-buna
-
-Rules:
-1. Always reply in clear, modern, natural Amharic as spoken by digital creators in Addis Ababa.
-2. Answer direct questions directly, instantly, and concisely.
-3. For voice/audio: transcribe, summarize, and list actionable items.
-4. For video: identify 3 viral 30-second clips with timestamps.
-5. Address him warmly as 'ሄኖክ'.
+You are HENOK AI, the personal AI assistant of Henok in Addis Ababa, Ethiopia.
+Reply naturally and clearly in Amharic unless the user writes in another language.
+Be direct, accurate, useful, and transparent about uncertainty. Never invent facts.
+For audio, transcribe and then answer the speaker's request.
+For video, describe the key events and give timestamps for useful moments when possible.
+Do not publish anything to a group or channel without explicit owner approval.
 """
 
-def safe_send(chat_id, text, markup=None):
-    text = str(text or "").strip() or "ምላሽ አልተገኘም።"
-    chunks = [text[i:i + TELEGRAM_TEXT_LIMIT] for i in range(0, len(text), TELEGRAM_TEXT_LIMIT)]
-    for idx, c in enumerate(chunks):
-        bot.send_message(chat_id, c, reply_markup=markup if idx == len(chunks) - 1 else None)
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        body = b"HENOK AI is running"
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
-def call_gemini(contents, timeout=30):
+    def do_HEAD(self):
+        self.send_response(200)
+        self.end_headers()
+
+    def log_message(self, fmt, *args):
+        log.info("health: " + fmt, *args)
+
+def start_health_server():
+    port = int(os.getenv("PORT", "10000"))
+    server = ThreadingHTTPServer(("0.0.0.0", port), HealthHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    log.info("Health server listening on port %s", port)
+
+def send_text(chat_id, text, reply_markup=None, reply_to=None):
+    text = str(text or "").strip() or "ምላሽ ማመንጨት አልተቻለም።"
+    chunks = [text[i:i + TEXT_LIMIT] for i in range(0, len(text), TEXT_LIMIT)]
+    for i, chunk in enumerate(chunks):
+        bot.send_message(
+            chat_id, chunk,
+            reply_markup=reply_markup if i == len(chunks) - 1 else None,
+            reply_to_message_id=reply_to,
+        )
+
+def gemini_generate(parts, timeout=45):
     if not GEMINI_API_KEY:
+        log.error("Gemini request blocked: GEMINI_API_KEY is not configured")
         return None
-    models = ["gemini-1.5-flash", "gemini-1.5-pro"]
-    for m in models:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent?key={GEMINI_API_KEY}"
-        payload = {
-            "systemInstruction": {"parts": [{"text": SYSTEM_PROMPT}]},
-            "contents": contents,
-        }
+
+    models = list(dict.fromkeys([GEMINI_MODEL, "gemini-3.5-flash-lite"]))
+    payload = {
+        "systemInstruction": {"parts": [{"text": SYSTEM_PROMPT}]},
+        "contents": [{"role": "user", "parts": parts}],
+        "generationConfig": {"temperature": 0.5},
+    }
+
+    for model in models:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
         try:
-            r = HTTP.post(url, headers={"Content-Type": "application/json"}, json=payload, timeout=timeout)
-            if r.status_code == 200:
-                data = r.json()
-                cands = data.get("candidates") or []
-                if cands:
-                    parts = cands[0].get("content", {}).get("parts", [])
-                    txt = "\n".join(p.get("text", "") for p in parts if p.get("text")).strip()
-                    if txt:
-                        return txt
+            response = HTTP.post(
+                url,
+                headers={
+                    "Content-Type": "application/json",
+                    "x-goog-api-key": GEMINI_API_KEY,
+                },
+                json=payload,
+                timeout=(10, timeout),
+            )
+            if response.ok:
+                data = response.json()
+                candidates = data.get("candidates") or []
+                if candidates:
+                    out = candidates[0].get("content", {}).get("parts", [])
+                    answer = "\n".join(p.get("text", "") for p in out if p.get("text")).strip()
+                    if answer:
+                        log.info("Gemini succeeded: model=%s", model)
+                        return answer
+                log.error("Gemini returned no text: model=%s response=%s", model, str(data)[:500])
+                continue
+
+            try:
+                detail = response.json().get("error", {}).get("message", response.text)
+            except Exception:
+                detail = response.text
+            log.error("Gemini HTTP %s model=%s: %s", response.status_code, model, str(detail)[:500])
+            if response.status_code in (400, 401, 403):
+                break
+        except requests.RequestException:
+            log.exception("Gemini network error: model=%s", model)
         except Exception:
-            continue
+            log.exception("Unexpected Gemini error: model=%s", model)
     return None
 
-# ═════════════════════════ Handlers ═════════════════════════
+def is_owner(message):
+    return str(message.from_user.id) == OWNER_ID
+
+def download_telegram_file(file_id):
+    info = bot.get_file(file_id)
+    if getattr(info, "file_size", 0) and info.file_size > MAX_BYTES:
+        raise ValueError("ፋይሉ ከ18MB በላይ ነው። እባክህ አጭር ወይም ትንሽ ፋይል ላክ።")
+    data = bot.download_file(info.file_path)
+    if len(data) > MAX_BYTES:
+        raise ValueError("ፋይሉ ከ18MB በላይ ነው።")
+    return data
 
 @bot.message_handler(commands=["start", "menu"])
-def cmd_start(message):
-    safe_send(message.chat.id, "ሰላም ሄኖክ! 👋 እኔ ያንተ HENOK AI ረዳት ነኝ።\n\nበቀጥታ በድምፅ ወይም በጽሑፍ የፈለከውን ጠይቀኝ፤ በሰከንዶች ውስጥ እመልሳለሁ!")
+def start_command(message):
+    send_text(
+        message.chat.id,
+        "ሰላም ሄኖክ! 👋 HENOK AI ዝግጁ ነው።\n"
+        "ጽሑፍ፣ Voice Note፣ ፎቶ ወይም ቪዲዮ ላክልኝ።\n\n"
+        "ወደ Henok Graphics የሚላክ ይዘት ለማጽደቅ /publish ተጠቀም።"
+    )
 
 @bot.message_handler(commands=["id"])
-def cmd_id(message):
-    bot.reply_to(message, f"Telegram User ID: {message.from_user.id}")
+def id_command(message):
+    send_text(message.chat.id, f"Telegram ID: {message.from_user.id}")
 
-# 🎙️ ድምፅ (Voice Note) በሰከንዶች ውስጥ
+@bot.message_handler(commands=["publish"])
+def publish_command(message):
+    if not is_owner(message):
+        return
+    content = (message.text or "").partition(" ")[2].strip()
+    if not content:
+        send_text(message.chat.id, "አጠቃቀም፦ /publish ከዚያ የሚለጠፈውን ይዘት ጻፍ።")
+        return
+    keyboard = InlineKeyboardMarkup()
+    keyboard.row(
+        InlineKeyboardButton("✅ አጽድቅ", callback_data="publish:yes"),
+        InlineKeyboardButton("❌ ተው", callback_data="publish:no"),
+    )
+    sent = send_text(message.chat.id, "ይህን ወደ Henok Graphics ልላክ?\n\n" + content, reply_markup=keyboard)
+    # Save pending content against the approval message in process memory.
+    if sent:
+        PENDING_POSTS[sent[-1].message_id] = content
+
+PENDING_POSTS = {}
+
+@bot.callback_query_handler(func=lambda call: call.data in ("publish:yes", "publish:no"))
+def approval_callback(call):
+    if str(call.from_user.id) != OWNER_ID:
+        bot.answer_callback_query(call.id, "ይህን ማጽደቅ የሚችለው ባለቤቱ ብቻ ነው።", show_alert=True)
+        return
+    content = PENDING_POSTS.pop(call.message.message_id, None)
+    if not content:
+        bot.answer_callback_query(call.id, "ይህ ይዘት አልቋል ወይም አልተገኘም።", show_alert=True)
+        return
+    if call.data == "publish:no":
+        bot.answer_callback_query(call.id, "ተሰርዟል።")
+        bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
+        send_text(call.message.chat.id, "❌ ይዘቱ ተወ፤ ወደ ግሩፑ አልተላከም።")
+        return
+    try:
+        bot.send_message(TARGET_CHANNEL_ID, content)
+        bot.answer_callback_query(call.id, "ተሳክቷል።")
+        bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
+        send_text(call.message.chat.id, "✅ ይዘቱ ወደ Henok Graphics ተልኳል።")
+    except Exception:
+        log.exception("Could not publish approved content")
+        bot.answer_callback_query(call.id, "መላክ አልተቻለም።", show_alert=True)
+
+@bot.message_handler(content_types=["text"])
+def text_handler(message):
+    text = (message.text or "").strip()
+    if not text or text.startswith("/"):
+        return
+    bot.send_chat_action(message.chat.id, "typing")
+    answer = gemini_generate([{"text": text}], timeout=35)
+    if answer:
+        send_text(message.chat.id, answer, reply_to=message.message_id)
+    else:
+        send_text(message.chat.id, "የAI አገልግሎቱ አሁን ምላሽ አልሰጠም። እባክህ ትንሽ ቆይተህ ድገም።", reply_to=message.message_id)
+
 @bot.message_handler(content_types=["voice", "audio"])
-def handle_voice(message):
+def voice_handler(message):
     chat_id = message.chat.id
-    audio_obj = message.voice or message.audio
+    bot.send_chat_action(chat_id, "typing")
+    audio = message.voice or message.audio
+    try:
+        raw = download_telegram_file(audio.file_id)
+        mime = getattr(audio, "mime_type", None) or ("audio/ogg" if message.voice else "audio/mpeg")
+        prompt = "Listen to this audio. Transcribe it accurately, identify its language, then answer the speaker's actual request. If it is only a statement, summarize it."
+        parts = [
+            {"text": prompt},
+            {"inlineData": {"mimeType": mime, "data": base64.b64encode(raw).decode("ascii")}},
+        ]
+        answer = gemini_generate(parts, timeout=75)
+        if answer:
+            send_text(chat_id, answer, reply_to=message.message_id)
+        else:
+            send_text(chat_id, "ድምፁን ማቀናበር አልተሳካም። Render Logs ውስጥ የGemini ስህተቱን እየመዘገብኩ ነው።", reply_to=message.message_id)
+    except Exception as exc:
+        log.exception("Voice handler failed")
+        send_text(chat_id, str(exc) if isinstance(exc, ValueError) else "የድምፅ ፋይሉን ማውረድ ወይም ማንበብ አልተቻለም።")
+
+@bot.message_handler(content_types=["photo"])
+def photo_handler(message):
+    chat_id = message.chat.id
     bot.send_chat_action(chat_id, "typing")
     try:
-        f_info = bot.get_file(audio_obj.file_id)
-        raw_bytes = bot.download_file(f_info.file_path)
-    except Exception as e:
-        safe_send(chat_id, f"ድምፁን ማውረድ አልተቻለም: {str(e)}")
-        return
+        photo = message.photo[-1]
+        raw = download_telegram_file(photo.file_id)
+        prompt = (message.caption or "Describe this image accurately in Amharic.").strip()
+        parts = [
+            {"text": prompt},
+            {"inlineData": {"mimeType": "image/jpeg", "data": base64.b64encode(raw).decode("ascii")}},
+        ]
+        answer = gemini_generate(parts, timeout=60)
+        send_text(chat_id, answer or "ምስሉን መተንተን አልተቻለም።", reply_to=message.message_id)
+    except Exception:
+        log.exception("Photo handler failed")
+        send_text(chat_id, "ፎቶውን ማቀናበር አልተቻለም።")
 
-    prompt = "ይህን የድምፅ መልዕክት በጥሞና አዳምጥ።\n1. 📝 TRANSCRIPT: ቃል በቃል ጻፍ።\n2. 📌 SUMMARY: ዋናውን ሀሳብ አጠቃል።\n3. ⚡ ACTION ITEMS: ከድምፁ የሚወጡ ተግባራትን ዘርዝር።"
-    extra_parts = [
-        {"text": prompt},
-        {"inlineData": {"mimeType": "audio/ogg", "data": base64.b64encode(raw_bytes).decode("ascii")}}
-    ]
-    ans = call_gemini([{"role": "user", "parts": extra_parts}], timeout=45)
-    if ans:
-        safe_send(chat_id, f"🎙️ **የድምፅ መልዕክት ውጤት፦**\n\n{ans}")
-    else:
-        safe_send(chat_id, "ይቅርታ ሄኖክ፣ ድምፁን ማቀናበር አልተቻለም፤ እባክህ በድጋሚ ሞክር።")
-
-# ✍️ መደበኛ ጽሑፍ (Instant Text Reply)
-@bot.message_handler(content_types=["text"])
-def handle_text(message):
+@bot.message_handler(content_types=["video", "document"])
+def video_handler(message):
     chat_id = message.chat.id
-    t = (message.text or "").strip()
-    if not t:
+    media = message.video or message.document
+    mime = getattr(media, "mime_type", None) or ("video/mp4" if message.video else "")
+    if not mime.startswith("video/"):
         return
-    if t.lower() in ["start", "/start", "menu", "/menu"]:
-        cmd_start(message)
-        return
-
     bot.send_chat_action(chat_id, "typing")
-    ans = call_gemini([{"role": "user", "parts": [{"text": t}]}], timeout=25)
-    if ans:
-        safe_send(chat_id, ans)
-    else:
-        safe_send(chat_id, "ይቅርታ ሄኖክ፣ አሁን ምላሽ ማመንጨት አልተቻለም። እባክህ በድጋሚ ሞክር።")
+    try:
+        raw = download_telegram_file(media.file_id)
+        prompt = (getattr(message, "caption", None) or "Analyze this video. Summarize the events and identify useful moments with approximate timestamps.").strip()
+        parts = [
+            {"text": prompt},
+            {"inlineData": {"mimeType": mime, "data": base64.b64encode(raw).decode("ascii")}},
+        ]
+        answer = gemini_generate(parts, timeout=90)
+        send_text(chat_id, answer or "ቪዲዮውን መተንተን አልተቻለም።", reply_to=message.message_id)
+    except Exception:
+        log.exception("Video handler failed")
+        send_text(chat_id, "ቪዲዮውን ማቀናበር አልተቻለም። ከ18MB በታች የሆነ MP4 ሞክር።")
 
-# ═════════════════════════ Start Bot ═════════════════════════
 if __name__ == "__main__":
-    while True:
-        try:
-            bot.infinity_polling(timeout=30, long_polling_timeout=30, skip_pending=True)
-        except Exception as e:
-            if "409" in str(e):
-                time.sleep(5)
-            else:
-                time.sleep(3)
+    start_health_server()
+    # Polling and webhooks are mutually exclusive. Remove any old webhook
+    # before starting exactly one long-polling process on this Render service.
+    try:
+        bot.remove_webhook()
+        log.info("Removed any existing Telegram webhook before polling")
+    except Exception:
+        log.exception("Could not remove Telegram webhook")
+        raise
+
+    log.info("Starting HENOK AI long polling; model=%s", GEMINI_MODEL)
+    bot.infinity_polling(
+        timeout=30,
+        long_polling_timeout=25,
+        skip_pending=True,
+        allowed_updates=["message", "callback_query"],
+    )
