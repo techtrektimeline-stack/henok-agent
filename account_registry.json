@@ -1,0 +1,24 @@
+{
+  "version": 1,
+  "accounts": [
+    {
+      "id": "henok-travel",
+      "name": "Henok Travel",
+      "platform": "youtube",
+      "ownership": "owner_confirmed",
+      "status": "registered",
+      "capabilities": [
+        "content_planning",
+        "script_drafting",
+        "research",
+        "analytics_when_connected"
+      ],
+      "publishing_requires_owner_approval": true
+    }
+  ],
+  "policy": {
+    "only_listed_accounts_are_owner_confirmed": true,
+    "unlisted_accounts_must_not_be_assumed_owned": true,
+    "external_actions_require_explicit_owner_approval": true
+  }
+}
