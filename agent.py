@@ -67,23 +67,24 @@ def start_health_server():
 def send_text(chat_id, text, reply_markup=None, reply_to=None):
     text = str(text or "").strip() or "ምላሽ ማመንጨት አልተቻለም።"
     chunks = [text[i:i + TEXT_LIMIT] for i in range(0, len(text), TEXT_LIMIT)]
+    sent_messages = []
     for i, chunk in enumerate(chunks):
-        bot.send_message(
+        sent_messages.append(bot.send_message(
             chat_id, chunk,
             reply_markup=reply_markup if i == len(chunks) - 1 else None,
             reply_to_message_id=reply_to,
-        )
+        ))
+    return sent_messages
 
 def gemini_generate(parts, timeout=45):
     if not GEMINI_API_KEY:
         log.error("Gemini request blocked: GEMINI_API_KEY is not configured")
         return None
 
-    models = list(dict.fromkeys([GEMINI_MODEL, "gemini-3.5-flash-lite"]))
+    models = list(dict.fromkeys([GEMINI_MODEL, "gemini-3.7-flash", "gemini-3.5-flash-lite"]))
     payload = {
         "systemInstruction": {"parts": [{"text": SYSTEM_PROMPT}]},
         "contents": [{"role": "user", "parts": parts}],
-        "generationConfig": {"temperature": 0.5},
     }
 
     for model in models:
