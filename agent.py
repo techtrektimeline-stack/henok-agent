@@ -16,7 +16,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
 
-# እውነተኛውና ትክክለኛ የ Google Gemini ሞዴል
+# እውነተኛና አስተማማኝ የሞዴል ስሞች
 GEMINI_MODEL = "gemini-1.5-flash"
 OPENROUTER_MODEL = "google/gemini-2.0-flash-exp:free"
 
@@ -84,9 +84,6 @@ PLATFORMS = {
     "yt": ("▶️ YouTube Shorts", "YouTube Shorts: title, 30-45s script, description"),
 }
 
-def is_owner(user_id):
-    return bool(not OWNER_ID or str(user_id) == OWNER_ID)
-
 def safe_send(chat_id, text, markup=None):
     text = str(text or "").strip() or "ምላሽ አልተገኘም።"
     chunks = [text[i:i + TELEGRAM_TEXT_LIMIT] for i in range(0, len(text), TELEGRAM_TEXT_LIMIT)]
@@ -110,7 +107,7 @@ def call_gemini(contents, timeout=45):
             "contents": contents,
         }
         try:
-            r = HTTP.post(url, headers={"Content-Type": "application/json"}, json=payload, timeout=timeout)
+            r = HTTP.post(url, headers={"Content-Type": "application/json", "x-goog-api-key": GEMINI_API_KEY}, json=payload, timeout=timeout)
             if r.status_code == 200:
                 data = r.json()
                 cands = data.get("candidates") or []
@@ -268,6 +265,10 @@ def handle_text(message):
     chat_id = message.chat.id
     t = (message.text or "").strip()
     if not t:
+        return
+    # ተጠቃሚው 'start' ብሎ ሲጽፍ እንኳን የሰላምታ መልዕክት እንዲሰጠው
+    if t.lower() in ["start", "/start", "menu", "/menu"]:
+        cmd_start(message)
         return
     if any(w in t.lower() for w in ["ፖስት", "post", "ይዘት አዘጋጅ"]):
         SESSIONS[chat_id] = {"pending": {"topic": "", "style": "", "platforms": []}}
