@@ -44,8 +44,9 @@ ACCURACY:
 - Distinguish verified facts, estimates and uncertainty.
 - For current events, trends, prices, policies and recent developments, use web search when available and provide source links.
 CREATOR CONTEXT:
-- TechTrek Timeline focuses on technology, AI, digital tools and explainers.
+- The only owner-confirmed account in the Account Registry is Henok Travel.
 - Henok Travel focuses on cinematic travel storytelling, local history and culture, landscapes and useful visitor context.
+- Do not assume TechTrek Timeline or any other channel, page, profile or group is owned by the user.
 - Long-form scripts should have a strong hook, narrative arc, scene-by-scene narration, visual/B-roll directions, smooth transitions and a natural call to action.
 - Keep narration separate from visual directions. Do not fabricate research.
 PUBLISHING SAFETY:
@@ -157,12 +158,10 @@ def needs_live_search(text):
 
 def build_script_instruction(channel, topic):
     channel = (channel or '').strip().lower()
-    if channel in ('travel', 'henok travel', 'henoktravel'):
-        channel_name = 'Henok Travel'
-        focus = 'cinematic travel documentary: destination context, history, culture, landscapes, sensory details, practical travel tips and responsible tourism'
-    else:
-        channel_name = 'TechTrek Timeline'
-        focus = 'technology and AI documentary: verified research, clear explanations, real-world examples, benefits, limitations and future implications'
+    if channel not in ('travel', 'henok travel', 'henoktravel'):
+        raise ValueError('Only Henok Travel is currently registered as an owner-confirmed account. Other channels are not authorized.')
+    channel_name = 'Henok Travel'
+    focus = 'cinematic travel documentary: destination context, history, culture, landscapes, sensory details, practical travel tips and responsible tourism'
     return (
         f'Create a research-led long-form YouTube video package for {channel_name}. Topic: {topic}. Focus: {focus}. '
         'Use Google Search grounding where available. Do not invent facts, statistics or sources. '
@@ -197,14 +196,18 @@ def script_command(message):
         return
     raw = (message.text or '').partition(' ')[2].strip()
     if '|' not in raw:
-        send_text(message.chat.id, 'አጠቃቀም፦ /script tech | የቴክኖሎጂ ርዕስ ወይም /script travel | የጉዞ ርዕስ')
+        send_text(message.chat.id, 'አጠቃቀም፦ /script travel | የጉዞ ርዕስ (በአሁኑ ጊዜ Henok Travel ብቻ ተመዝግቧል።)')
         return
     channel, topic = [part.strip() for part in raw.split('|', 1)]
     if not topic:
         send_text(message.chat.id, 'እባክህ የቪዲዮውን ርዕስ ጨምር።')
         return
     bot.send_chat_action(message.chat.id, "typing")
-    instruction = build_script_instruction(channel, topic)
+    try:
+        instruction = build_script_instruction(channel, topic)
+    except ValueError as exc:
+        send_text(message.chat.id, str(exc))
+        return
     answer = gemini_generate([{"text": "Prepare the complete long-form video package."}], timeout=120, use_web_search=True, system_instruction=instruction)
     send_text(message.chat.id, answer or "ስክሪፕቱን ማዘጋጀት አልተቻለም። Render Logs አረጋግጥ።", reply_to=message.message_id)
 @bot.message_handler(commands=["id"])
