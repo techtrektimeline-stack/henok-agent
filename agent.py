@@ -221,74 +221,58 @@ def call_openrouter(messages):
     return None
 
 def call_gemini_audio(raw_bytes, mime_type, prompt, timeout=90):
-    """Analyze Telegram audio with retry and fallback Gemini models."""
+    """Analyze Telegram audio using Gemini generateContent with visible diagnostics."""
     if not GEMINI_API_KEY:
         logging.error("Voice analysis unavailable: GEMINI_API_KEY is not configured")
         return None
 
     audio_data = base64.b64encode(raw_bytes).decode("ascii")
-    # Retry temporary overloads, then fall back to stable Flash models.
-    models = [
-        ("gemini-3.8-flash", 2),
-        ("gemini-2.5-flash", 1),
-        ("gemini-2.0-flash", 1),
-    ]
-    for model, attempts in models:
-        for attempt in range(attempts):
-            payload = {
-                "model": model,
-                "system_instruction": SYSTEM_PROMPT,
-                "input": [
-                    {"type": "text", "text": prompt},
-                    {"type": "audio", "data": audio_data, "mime_type": mime_type},
+    # Use the same documented generateContent endpoint as text requests.
+    # Telegram voice notes are OGG/Opus; preserve their actual MIME type.
+    models = list(dict.fromkeys([GEMINI_MODEL, "gemini-2.5-flash", "gemini-2.0-flash"]))
+    for model in models:
+        payload = {
+            "systemInstruction": {"parts": [{"text": SYSTEM_PROMPT}]},
+            "contents": [{
+                "role": "user",
+                "parts": [
+                    {"text": prompt},
+                    {"inlineData": {"mimeType": mime_type, "data": audio_data}},
                 ],
-            }
-            try:
-                response = HTTP.post(
-                    "https://generativelanguage.googleapis.com/v1beta/interactions",
-                    headers={"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"},
-                    json=payload,
-                    timeout=(15, timeout),
-                )
-                if response.ok:
-                    data = response.json()
-                    answer = data.get("output_text")
+            }],
+        }
+        try:
+            response = HTTP.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+                headers={"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"},
+                json=payload,
+                timeout=(15, timeout),
+            )
+            if response.status_code == 200:
+                data = response.json()
+                candidates = data.get("candidates") or []
+                if candidates:
+                    parts = candidates[0].get("content", {}).get("parts", [])
+                    answer = "\\n".join(p.get("text", "") for p in parts if p.get("text")).strip()
                     if answer:
-                        logging.info("Gemini audio analysis succeeded with %s", model)
-                        return str(answer).strip()
-                    collected = []
-                    for step in data.get("steps", []):
-                        if step.get("type") == "model_output":
-                            for block in step.get("content", []):
-                                if block.get("type") == "text" and block.get("text"):
-                                    collected.append(block["text"])
-                    answer = "\\n".join(collected).strip()
-                    if answer:
-                        logging.info("Gemini audio analysis succeeded with %s", model)
+                        logging.info("Gemini audio analysis succeeded with model=%s", model)
                         return answer
-                    logging.error("Gemini audio API returned no text; model=%s status=%s keys=%s",
-                                  model, data.get("status"), list(data.keys()))
-                    break
+                logging.error("Gemini audio response had no candidate text; model=%s keys=%s",
+                              model, list(data.keys()))
+                continue
 
-                try:
-                    detail = response.json().get("error", {}).get("message", response.text)
-                except Exception:
-                    detail = response.text
-                logging.warning("Gemini audio API HTTP %s on %s (attempt %s/%s): %s",
-                                response.status_code, model, attempt + 1, attempts, str(detail)[:500])
-                # Only retry temporary server overloads/errors. Other failures
-                # are unlikely to improve by repeating the same request.
-                if response.status_code not in (429, 500, 502, 503, 504):
-                    break
-                if attempt + 1 < attempts:
-                    time.sleep(2 * (attempt + 1))
-            except requests.RequestException as exc:
-                logging.warning("Gemini audio request failed on %s: %s", model, type(exc).__name__)
-                if attempt + 1 < attempts:
-                    time.sleep(2 * (attempt + 1))
+            try:
+                detail = response.json().get("error", {}).get("message", response.text)
             except Exception:
-                logging.exception("Unexpected Gemini audio processing failure on %s", model)
+                detail = response.text
+            logging.error("Gemini audio API HTTP %s on model=%s: %s",
+                          response.status_code, model, str(detail)[:500])
+            if response.status_code in (400, 401, 403):
                 break
+        except requests.RequestException as exc:
+            logging.exception("Gemini audio network error on model=%s: %s", model, type(exc).__name__)
+        except Exception:
+            logging.exception("Unexpected Gemini audio processing error on model=%s", model)
 
     logging.error("All Gemini audio models failed")
     return None
