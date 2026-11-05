@@ -71,7 +71,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         if self.path in ("/", "/health", "/healthz"):
             self.send_response(200)
             self.send_header("Content-Type", "text/plain; charset=utf-8")
-            self.send_header("Content-Length", "34")
+            self.send_header("Content-Length", str(len(b"HENOK AI webhook service is healthy")))
             self.end_headers()
             return
         self.send_response(404)
@@ -365,7 +365,7 @@ def handle_voice(message):
         safe_send(chat_id, "የድምፅ ፋይሉ በጣም ትልቅ ነው። እባክህ ከ14MB በታች የሆነ አጭር Voice Note ላክ።")
         return
     prompt = "ይህን የድምፅ መልዕክት በጥሞና አዳምጥ። በተናገረበት ቋንቋ ተረዳ፤ ከዚያ በአማርኛ አጭር እና ግልጽ ምላሽ ስጥ። አስፈላጊ ከሆነ ትራንስክሪፕትና የሚቀጥሉ ተግባራትን ጨምር።"
-    mime_type = "audio/ogg" if (message.voice or {}).get("mime_type", "").endswith("ogg") else (getattr(audio_obj, "mime_type", None) or "audio/mpeg")
+    mime_type = getattr(audio_obj, "mime_type", None) or ("audio/ogg" if message.voice else "audio/mpeg")
     extra_parts = [
         {"text": prompt},
         {"inlineData": {"mimeType": mime_type, "data": base64.b64encode(raw_bytes).decode("ascii")}}
