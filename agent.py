@@ -151,26 +151,53 @@ def add_history(chat_id, role, text):
 
 def call_gemini(contents, timeout=45):
     if not GEMINI_API_KEY:
+        logging.error("Gemini text request failed: GEMINI_API_KEY is missing")
         return None
-    models = [GEMINI_MODEL, "gemini-2.5-flash", "gemini-2.0-flash"]
-    for m in models:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent?key={GEMINI_API_KEY}"
+
+    # Use one authentication method only. AI Studio AQ auth keys are sent
+    # through x-goog-api-key; do not also append ?key= to the URL.
+    models = list(dict.fromkeys([GEMINI_MODEL, "gemini-3.5-flash-lite", "gemini-2.5-flash"]))
+    for model in models:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
         payload = {
             "systemInstruction": {"parts": [{"text": SYSTEM_PROMPT}]},
             "contents": contents,
         }
         try:
-            r = HTTP.post(url, headers={"Content-Type": "application/json", "x-goog-api-key": GEMINI_API_KEY}, json=payload, timeout=timeout)
-            if r.status_code == 200:
-                data = r.json()
-                cands = data.get("candidates") or []
-                if cands:
-                    parts = cands[0].get("content", {}).get("parts", [])
-                    txt = "\n".join(p.get("text", "") for p in parts if p.get("text")).strip()
-                    if txt:
-                        return txt
+            response = HTTP.post(
+                url,
+                headers={"Content-Type": "application/json", "x-goog-api-key": GEMINI_API_KEY},
+                json=payload,
+                timeout=timeout,
+            )
+            if response.status_code == 200:
+                data = response.json()
+                candidates = data.get("candidates") or []
+                if candidates:
+                    parts = candidates[0].get("content", {}).get("parts", [])
+                    answer = "\\n".join(p.get("text", "") for p in parts if p.get("text")).strip()
+                    if answer:
+                        logging.info("Gemini text request succeeded with model=%s", model)
+                        return answer
+                logging.error("Gemini text response had no candidate text; model=%s response_keys=%s",
+                              model, list(data.keys()))
+                continue
+
+            try:
+                detail = response.json().get("error", {}).get("message", response.text)
+            except Exception:
+                detail = response.text
+            logging.error("Gemini text API HTTP %s on model=%s: %s",
+                          response.status_code, model, str(detail)[:500])
+
+            # Authentication, permission, and malformed-request errors will
+            # not improve by retrying other models with the same credentials.
+            if response.status_code in (400, 401, 403):
+                break
+        except requests.RequestException as exc:
+            logging.exception("Gemini text request network error on model=%s: %s", model, type(exc).__name__)
         except Exception:
-            continue
+            logging.exception("Unexpected Gemini text error on model=%s", model)
     return None
 
 def call_openrouter(messages):
