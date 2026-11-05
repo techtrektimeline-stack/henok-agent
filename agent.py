@@ -5,11 +5,17 @@ import json
 import time
 import logging
 import threading
+import queue
+import base64
+import subprocess
+import tempfile
+from io import BytesIO
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Optional, List, Dict, Any
 
 import requests
 import telebot
+import imageio_ffmpeg
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
@@ -17,7 +23,7 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
 
 # እውነተኛና አስተማማኝ የሞዴል ስሞች
-GEMINI_MODEL = "gemini-1.5-flash"
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
 OPENROUTER_MODEL = "google/gemini-2.0-flash-exp:free"
 
 TARGET_CHANNEL_ID = os.getenv("TARGET_CHANNEL_ID", "-1003098019114").strip()
@@ -30,6 +36,9 @@ HISTORY_LIMIT = 20
 bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN, parse_mode=None)
 HTTP = requests.Session()
 STATE_LOCK = threading.RLock()
+UPDATE_QUEUE = queue.Queue(maxsize=100)
+GEMINI_TTS_MODEL = os.getenv("GEMINI_TTS_MODEL", "gemini-3.8-flash-tts")
+GEMINI_TTS_VOICE = os.getenv("GEMINI_TTS_VOICE", "Kore")
 
 HISTORY: Dict[int, List[Dict[str, str]]] = {}
 SESSIONS: Dict[int, Dict[str, Any]] = {}
@@ -58,6 +67,16 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def do_HEAD(self):
+        if self.path in ("/", "/health", "/healthz"):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", "34")
+            self.end_headers()
+            return
+        self.send_response(404)
+        self.end_headers()
+
     def do_GET(self):
         if self.path in ("/", "/health", "/healthz"):
             return self._reply(200, "HENOK AI webhook service is healthy")
@@ -76,7 +95,11 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
                 return self._reply(400, "Invalid payload size")
             payload = self.rfile.read(length).decode("utf-8")
             update = telebot.types.Update.de_json(payload)
-            bot.process_new_updates([update])
+            try:
+                UPDATE_QUEUE.put_nowait(update)
+            except queue.Full:
+                logging.error("Webhook update queue is full; Telegram will retry")
+                return self._reply(503, "Busy")
             return self._reply(200, "OK")
         except Exception:
             logging.exception("Failed to process Telegram webhook update")
@@ -129,7 +152,7 @@ def add_history(chat_id, role, text):
 def call_gemini(contents, timeout=45):
     if not GEMINI_API_KEY:
         return None
-    models = ["gemini-1.5-flash", "gemini-2.0-flash", "gemini-1.5-pro"]
+    models = [GEMINI_MODEL, "gemini-2.5-flash", "gemini-2.0-flash"]
     for m in models:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent?key={GEMINI_API_KEY}"
         payload = {
@@ -266,6 +289,67 @@ def cmd_start(message):
 def cmd_id(message):
     bot.reply_to(message, f"Telegram User ID: {message.from_user.id}")
 
+def send_voice_reply(chat_id, text):
+    """Create an OGG/Opus Telegram voice note from a short text reply."""
+    if not GEMINI_API_KEY or not text:
+        return False
+    url = "https://generativelanguage.googleapis.com/v1beta/interactions"
+    body = {
+        "model": GEMINI_TTS_MODEL,
+        "input": [{
+            "type": "user_input",
+            "content": [{
+                "type": "text",
+                "text": text[:3500],
+                "annotations": [{
+                    "type": "speech_metadata",
+                    "style": "Natural, warm, clear Amharic conversation. Friendly, concise, medium pace."
+                }]
+            }]
+        }],
+        "response_format": {"type": "audio"},
+        "generation_config": {"speech_config": [{"voice": GEMINI_TTS_VOICE}]}
+    }
+    try:
+        response = HTTP.post(
+            url,
+            headers={"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"},
+            json=body,
+            timeout=(15, 90),
+        )
+        if not response.ok:
+            logging.warning("Gemini TTS failed with HTTP %s", response.status_code)
+            return False
+        encoded = response.json().get("output_audio", {}).get("data")
+        if not encoded:
+            logging.warning("Gemini TTS response had no audio data")
+            return False
+        wav_bytes = base64.b64decode(encoded)
+        ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+        with tempfile.TemporaryDirectory(prefix="henok-voice-") as folder:
+            wav_path = os.path.join(folder, "reply.wav")
+            ogg_path = os.path.join(folder, "reply.ogg")
+            with open(wav_path, "wb") as audio_file:
+                audio_file.write(wav_bytes)
+            proc = subprocess.run(
+                [ffmpeg, "-y", "-loglevel", "error", "-i", wav_path,
+                 "-c:a", "libopus", "-b:a", "32k", "-vbr", "on",
+                 "-application", "voip", ogg_path],
+                capture_output=True, timeout=60,
+            )
+            if proc.returncode != 0 or not os.path.isfile(ogg_path):
+                logging.warning("FFmpeg voice conversion failed")
+                return False
+            with open(ogg_path, "rb") as audio_file:
+                audio_data = BytesIO(audio_file.read())
+            audio_data.name = "henok_reply.ogg"
+            bot.send_voice(chat_id, audio_data, timeout=60)
+        return True
+    except Exception as exc:
+        logging.warning("Voice reply failed: %s", type(exc).__name__)
+        return False
+
+
 @bot.message_handler(content_types=["voice", "audio"])
 def handle_voice(message):
     chat_id = message.chat.id
@@ -277,16 +361,22 @@ def handle_voice(message):
     except Exception as e:
         safe_send(chat_id, f"ድምፁን ማውረድ አልተቻለም: {str(e)}")
         return
-    prompt = "ይህን የድምፅ መልዕክት በጥሞና አዳምጥ። 1. TRANSCRIPT (ቃል በቃል) 2. SUMMARY (ማጠቃለያ) 3. ACTION ITEMS (ተግባራት) አቅርብ።"
+    if len(raw_bytes) > MAX_AUDIO_BYTES:
+        safe_send(chat_id, "የድምፅ ፋይሉ በጣም ትልቅ ነው። እባክህ ከ14MB በታች የሆነ አጭር Voice Note ላክ።")
+        return
+    prompt = "ይህን የድምፅ መልዕክት በጥሞና አዳምጥ። በተናገረበት ቋንቋ ተረዳ፤ ከዚያ በአማርኛ አጭር እና ግልጽ ምላሽ ስጥ። አስፈላጊ ከሆነ ትራንስክሪፕትና የሚቀጥሉ ተግባራትን ጨምር።"
+    mime_type = "audio/ogg" if (message.voice or {}).get("mime_type", "").endswith("ogg") else (getattr(audio_obj, "mime_type", None) or "audio/mpeg")
     extra_parts = [
         {"text": prompt},
-        {"inlineData": {"mimeType": "audio/ogg", "data": __import__("base64").b64encode(raw_bytes).decode("ascii")}}
+        {"inlineData": {"mimeType": mime_type, "data": base64.b64encode(raw_bytes).decode("ascii")}}
     ]
     ans = reply_with_ai(chat_id, "", extra_parts)
     if ans:
         add_history(chat_id, "user", "[Voice Note]")
         add_history(chat_id, "assistant", ans)
-        safe_send(chat_id, f"🎙️ **የድምፅ መልዕክት ውጤት፦**\n\n{ans}")
+        safe_send(chat_id, f"🎙️ የድምፅ መልዕክት ውጤት፦\n\n{ans}")
+        if not send_voice_reply(chat_id, ans):
+            logging.info("Text reply sent; voice reply unavailable for this update")
     else:
         safe_send(chat_id, "ይቅርታ ሄኖክ፣ ድምፁን መረዳት አልተቻለም። እባክህ በድጋሚ ላክ።")
 
@@ -343,6 +433,17 @@ def handle_callbacks(call):
     elif d.startswith("can:"):
         safe_send(chat_id, "❌ ተሰርዟል።")
 
+def update_worker():
+    while True:
+        update = UPDATE_QUEUE.get()
+        try:
+            bot.process_new_updates([update])
+        except Exception:
+            logging.exception("Telegram update worker failed")
+        finally:
+            UPDATE_QUEUE.task_done()
+
+
 if __name__ == "__main__":
     if not TELEGRAM_BOT_TOKEN:
         raise RuntimeError("TELEGRAM_BOT_TOKEN is missing")
@@ -350,6 +451,7 @@ if __name__ == "__main__":
         raise RuntimeError("RENDER_EXTERNAL_URL is missing; set it in Render environment")
     port = int(os.getenv("PORT", "10000"))
     server = ThreadingHTTPServer(("0.0.0.0", port), HealthCheckHandler)
+    threading.Thread(target=update_worker, name="telegram-update-worker", daemon=True).start()
     webhook_url = RENDER_URL + WEBHOOK_PATH
     try:
         # Remove any old webhook/pending updates before registering the single endpoint.
@@ -364,8 +466,6 @@ if __name__ == "__main__":
         logging.exception("HENOK AI webhook server failed to start")
         raise
     finally:
-        try:
-            bot.remove_webhook()
-        except Exception:
-            logging.exception("Could not remove webhook during shutdown")
+        # Keep the webhook configured during graceful shutdown/redeploy.
+        # The next instance will register the same endpoint on startup.
         server.server_close()
