@@ -7,7 +7,7 @@ Runs 24/7 on Render (Python 3). Single file.
 Required env vars:
   TELEGRAM_BOT_TOKEN, GEMINI_API_KEY, OPENROUTER_API_KEY
 Optional env vars:
-  TARGET_CHANNEL_ID (default -1003098019114), OWNER_ID (default 511440586), PORT (default 10000)
+  TARGET_CHANNEL (default -1003098019114), OWNER_ID (default 511440586), PORT (default 10000)
 
 requirements.txt:
   pyTelegramBotAPI
@@ -20,6 +20,7 @@ import os
 import re
 import sys
 import threading
+import urllib.parse
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -36,18 +37,24 @@ from telebot.apihelper import ApiTelegramException
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "").strip()
-TARGET_CHANNEL_ID = int(os.environ.get("TARGET_CHANNEL_ID", "-1003098019114"))
+TARGET_CHANNEL = os.environ.get("TARGET_CHANNEL", "@HenokGraphics").strip()
 OWNER_ID = int(os.environ.get("OWNER_ID", "511440586"))
 PORT = int(os.environ.get("PORT", "10000"))
 
 GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta"
 GEMINI_UPLOAD = "https://generativelanguage.googleapis.com/upload/v1beta/files"
+# Resilient sequence (primary -> fallbacks). No deprecated aliases.
 GEMINI_MODELS = ["gemini-flash-latest", "gemini-2.5-flash", "gemini-pro-latest"]
 STATUS_MODELS = ["gemini-flash-latest", "gemini-pro-latest", "gemini-2.5-flash", "gemini-2.5-pro"]
-OPENROUTER_MODELS = ["deepseek/deepseek-chat", "meta-llama/llama-3.3-70b-instruct:free"]
+OPENROUTER_MODELS = [
+    "anthropic/claude-3.5-sonnet",
+    "openai/gpt-4o-mini",
+    "deepseek/deepseek-chat",
+    "meta-llama/llama-3.3-70b-instruct:free",
+]
 
-MAX_MEDIA_BYTES = 18 * 1024 * 1024
-INLINE_LIMIT_BYTES = 12 * 1024 * 1024
+MAX_MEDIA_BYTES = 18 * 1024 * 1024      # Henok's limit for video/audio/photo
+INLINE_LIMIT_BYTES = 12 * 1024 * 1024   # above this, use Gemini Files API (inline body cap is ~20MB incl. base64)
 MAX_HISTORY_TURNS = 8
 
 ACK_TEXT = "⏳ እሺ ሄኖክ! መረጃውን እያሰባሰብኩ ነው፤ ጥቂት ሰከንዶች ጠብቀኝ..."
@@ -58,7 +65,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 log = logging.getLogger("henok-agent")
 
 # ----------------------------------------------------------------------------
-# Health server (Render 24/7)
+# Health server (Render free tier needs an open port answering 200 on "/")
 # ----------------------------------------------------------------------------
 class HealthHandler(BaseHTTPRequestHandler):
     def _ok(self, body=True):
@@ -79,17 +86,22 @@ class HealthHandler(BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
 
+
 def start_health_server():
     def _serve():
         try:
             server = ThreadingHTTPServer(("0.0.0.0", PORT), HealthHandler)
             log.info("Health server listening on port %s", PORT)
             server.serve_forever()
-        except Exception as e:
+        except Exception as e:  # never kill the bot because of the health port
             log.error("Health server error: %s", e)
 
     threading.Thread(target=_serve, daemon=True, name="health").start()
 
+
+# ----------------------------------------------------------------------------
+# Bot + in-memory state
+# ----------------------------------------------------------------------------
 start_health_server()
 
 if not TELEGRAM_BOT_TOKEN:
@@ -100,10 +112,10 @@ if not TELEGRAM_BOT_TOKEN:
 bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN, parse_mode=None, threaded=True, num_threads=8)
 
 state_lock = threading.Lock()
-histories = {}
-awaiting_topic = {}
-drafts = {}
-news_cache = {}
+histories = {}        # user_id -> [(role, text)]
+awaiting_topic = {}   # user_id -> mode ("news" | "post")
+drafts = {}           # draft_id -> {"post": str, "ts": float}
+news_cache = {}       # news_id -> {"label": str, "text": str, "ts": float}
 
 CATEGORIES = {
     "ai": ("🤖 AI እና ቴክኖሎጂ", "AI & Technology"),
@@ -119,8 +131,12 @@ REALTIME_WORDS = ["ዛሬ", "አሁን", "ዋጋ", "ምንዛሬ", "ዜና", "�
                   "today", "now", "price", "latest", "news", "trend", "current", "bitcoin", "btc",
                   "usd", "rate", "2026"]
 
+# ----------------------------------------------------------------------------
+# System prompt
+# ----------------------------------------------------------------------------
 def addis_now():
     return datetime.now(timezone.utc) + timedelta(hours=3)
+
 
 def system_prompt():
     t = addis_now().strftime("%A, %d %B %Y, %H:%M")
@@ -143,6 +159,10 @@ def system_prompt():
         "- If you are not sure about a fact, say so instead of inventing it."
     )
 
+
+# ----------------------------------------------------------------------------
+# Helpers
+# ----------------------------------------------------------------------------
 def split_text(text, limit=3900):
     text = (text or "").strip() or "…"
     chunks = []
@@ -157,7 +177,10 @@ def split_text(text, limit=3900):
     chunks.append(text)
     return chunks
 
+
 def deliver(chat_id, ack_id, text, markup=None):
+    """Edit the acknowledgment message with the result (first chunk), send the rest as new messages.
+    The keyboard, if any, is attached to the last chunk."""
     chunks = split_text(text)
     for i, chunk in enumerate(chunks):
         mk = markup if i == len(chunks) - 1 else None
@@ -170,12 +193,14 @@ def deliver(chat_id, ack_id, text, markup=None):
                 log.warning("edit failed, sending new message: %s", e)
         bot.send_message(chat_id, chunk, reply_markup=mk, disable_web_page_preview=True)
 
+
 def send_ack(chat_id):
     try:
         return bot.send_message(chat_id, ACK_TEXT).message_id
     except Exception as e:
         log.error("ack failed: %s", e)
         return None
+
 
 def format_sources(sources, limit=6):
     if not sources:
@@ -185,22 +210,30 @@ def format_sources(sources, limit=6):
         lines.append(f"{i}. {title or 'ምንጭ'}\n{uri}")
     return "\n".join(lines)
 
+
 def prune(store, max_items=60):
     with state_lock:
         if len(store) > max_items:
             for k in sorted(store, key=lambda k: store[k].get("ts", 0))[: len(store) - max_items]:
                 store.pop(k, None)
 
+
 def has_any(text, words):
     low = (text or "").lower()
     return any(w.lower() in low for w in words)
 
+
 def is_owner(user_id):
     return user_id == OWNER_ID
 
+
 def owner_only(func):
     def wrapper(message, *a, **kw):
-        if not is_owner(message.from_user.id):
+        chat = getattr(message, "chat", None)
+        if not chat or chat.type != "private":
+            return  # Complete silence in groups/channels
+        uid = getattr(message, "from_user", None) and message.from_user.id
+        if not is_owner(uid):
             try:
                 bot.reply_to(message, "ይህ የሄኖክ የግል ቦት ነው 🔒")
             except Exception:
@@ -210,11 +243,13 @@ def owner_only(func):
     wrapper.__name__ = func.__name__
     return wrapper
 
+
 # ----------------------------------------------------------------------------
-# Gemini Engine
+# Gemini (Google Generative Language REST API)
 # ----------------------------------------------------------------------------
 class GeminiError(Exception):
     pass
+
 
 def _gemini_call(model, payload):
     url = f"{GEMINI_BASE}/models/{model}:generateContent"
@@ -228,6 +263,7 @@ def _gemini_call(model, payload):
             continue
         raise GeminiError(f"{model} HTTP {r.status_code}: {r.text[:200]}")
     raise GeminiError(f"{model}: exhausted retries")
+
 
 def _extract(data):
     cands = data.get("candidates") or []
@@ -246,6 +282,7 @@ def _extract(data):
             seen.add(uri)
             sources.append((web.get("title") or "", uri))
     return text, sources
+
 
 def gemini_generate(contents, grounding=False, system=None):
     if not GEMINI_API_KEY:
@@ -268,7 +305,9 @@ def gemini_generate(contents, grounding=False, system=None):
             log.warning("Gemini model failed: %s", e)
     raise GeminiError(f"all Gemini models failed: {last_err}")
 
+
 def gemini_upload_file(data, mime, display_name):
+    """Gemini Files API (resumable) for big media that cannot go inline."""
     start = requests.post(
         GEMINI_UPLOAD,
         headers={
@@ -283,7 +322,7 @@ def gemini_upload_file(data, mime, display_name):
         timeout=60,
     )
     if start.status_code != 200 or "X-Goog-Upload-URL" not in start.headers:
-        raise GeminiError(f"upload start failed: {start.status_code}")
+        raise GeminiError(f"upload start failed: {start.status_code} {start.text[:150]}")
     up = requests.post(
         start.headers["X-Goog-Upload-URL"],
         headers={
@@ -295,7 +334,7 @@ def gemini_upload_file(data, mime, display_name):
         timeout=300,
     )
     if up.status_code != 200:
-        raise GeminiError(f"upload failed: {up.status_code}")
+        raise GeminiError(f"upload failed: {up.status_code} {up.text[:150]}")
     info = up.json().get("file", {})
     name, uri = info.get("name"), info.get("uri")
     if not name or not uri:
@@ -311,8 +350,9 @@ def gemini_upload_file(data, mime, display_name):
         raise GeminiError(f"uploaded file not ACTIVE (state={state})")
     return uri
 
+
 # ----------------------------------------------------------------------------
-# OpenRouter Fallback
+# OpenRouter text fallback
 # ----------------------------------------------------------------------------
 def openrouter_generate(history, user_text, system=None):
     if not OPENROUTER_API_KEY:
@@ -336,7 +376,7 @@ def openrouter_generate(history, user_text, system=None):
                 timeout=120,
             )
             if r.status_code != 200:
-                raise RuntimeError(f"{model} HTTP {r.status_code}")
+                raise RuntimeError(f"{model} HTTP {r.status_code}: {r.text[:150]}")
             txt = (r.json()["choices"][0]["message"]["content"] or "").strip()
             if not txt:
                 raise RuntimeError(f"{model} empty")
@@ -346,23 +386,45 @@ def openrouter_generate(history, user_text, system=None):
             log.warning("OpenRouter failed: %s", e)
     raise RuntimeError(f"all OpenRouter models failed: {last_err}")
 
+
+# ----------------------------------------------------------------------------
+# Unified text engine: Gemini -> OpenRouter -> friendly message (never "unavailable")
+# ----------------------------------------------------------------------------
 def ask_text(user_text, history=None, grounding=False):
     history = history or []
+
+    # If grounding is needed, query Gemini with Google Search tool first
+    if grounding:
+        contents = [{"role": r, "parts": [{"text": t}]} for r, t in history]
+        contents.append({"role": "user", "parts": [{"text": user_text}]})
+        try:
+            text, sources, model = gemini_generate(contents, grounding=True)
+            log.info("grounded by Gemini %s", model)
+            return text, sources
+        except Exception as e:
+            log.warning("Gemini grounding failed, switching to OpenRouter: %s", e)
+
+    # For copywriting, creative thinking, and natural Amharic: prioritize Claude/GPT via OpenRouter
+    if OPENROUTER_API_KEY:
+        try:
+            text, model = openrouter_generate(history, user_text)
+            log.info("answered by OpenRouter %s", model)
+            return text, []
+        except Exception as e:
+            log.warning("OpenRouter failed, falling back to Gemini: %s", e)
+
+    # Fallback to Gemini
     contents = [{"role": r, "parts": [{"text": t}]} for r, t in history]
     contents.append({"role": "user", "parts": [{"text": user_text}]})
     try:
-        text, sources, model = gemini_generate(contents, grounding=grounding)
+        text, sources, model = gemini_generate(contents, grounding=False)
         log.info("answered by Gemini %s", model)
         return text, sources
     except Exception as e:
-        log.warning("Gemini path failed, switching to OpenRouter: %s", e)
-    try:
-        text, model = openrouter_generate(history, user_text)
-        log.info("answered by OpenRouter %s", model)
-        return text, []
-    except Exception as e:
-        log.error("OpenRouter path failed too: %s", e)
+        log.error("Gemini failed too: %s", e)
+
     return BUSY_TEXT, []
+
 
 def remember(user_id, user_text, reply):
     with state_lock:
@@ -371,9 +433,19 @@ def remember(user_id, user_text, reply):
         h.append(("model", reply[:1500]))
         del h[: max(0, len(h) - MAX_HISTORY_TURNS * 2)]
 
+
 # ----------------------------------------------------------------------------
-# Interactive Categories
+# Interactive categories (inline buttons)
 # ----------------------------------------------------------------------------
+
+def make_pollinations_url(prompt_en):
+    clean = re.sub(r"[^\w\s,-]", "", prompt_en).strip()
+    if not clean:
+        clean = "modern high-tech digital art 3d render clean minimalist"
+    encoded = urllib.parse.quote(clean[:300])
+    seed = int(time.time())
+    return f"https://image.pollinations.ai/prompt/{encoded}?width=1080&height=1080&nologo=true&seed={seed}"
+
 def category_keyboard(mode):
     kb = types.InlineKeyboardMarkup(row_width=2)
     kb.add(
@@ -387,19 +459,26 @@ def category_keyboard(mode):
     kb.add(types.InlineKeyboardButton(CUSTOM_LABEL, callback_data=f"cat:{mode}:custom"))
     return kb
 
+
 def show_categories(chat_id, mode):
     head = ("ሄኖክ፣ ስለየትኛው ዘርፍ ወቅታዊ መረጃ ላምጣልህ? 👇" if mode == "news"
             else "ሄኖክ፣ ለየትኛው ዘርፍ ፖስት ልፍጠር? 👇")
     bot.send_message(chat_id, head, reply_markup=category_keyboard(mode))
 
-def run_news(chat_id, label, topic):
-    ack_id = send_ack(chat_id)
+
+# ----------------------------------------------------------------------------
+# News + Post engines
+# ----------------------------------------------------------------------------
+def run_news(chat_id, label, topic, start_time=None):
+    start_time = start_time or time.time()
+    ack_id = send_ack(chat_id, "⏳ ሄኖክ፣ ወቅታዊ መረጃዎችን ከ Google Search እያሰባሰብኩ ነው (ከ10-15 ሰከንድ ይወስዳል)...")
     prompt = (
         f"ርዕስ/ዘርፍ: {topic}\n\n"
         "Use live Google Search to find the most important, VERIFIED developments from the last few days "
         "on this topic. Deliver 4-5 punchy insights. Each insight: an emoji + one-line headline, then 1-2 "
         "energetic sentences on why it matters to an Ethiopian creator/marketer like Henok. "
-        "Finish with '🎯 ለዛሬ የይዘት ሀሳብ:' and ONE concrete content idea. Plain text only, no markdown."
+        "Mention the source name inline when you can. Finish with '🎯 ለዛሬ የይዘት ሀሳብ:' and ONE concrete "
+        "content idea (video or post) he can make from this. Plain text only, no markdown."
     )
     text, sources = ask_text(prompt, grounding=True)
     body = text
@@ -414,23 +493,30 @@ def run_news(chat_id, label, topic):
         prune(news_cache)
         markup = types.InlineKeyboardMarkup()
         markup.add(types.InlineKeyboardButton("📝 ከዚህ ፖስት ፍጠርልኝ", callback_data=f"mk:{nid}"))
+        elapsed = int(time.time() - start_time)
+    body += f"\n\n⏱ የፈጀበት ጊዜ: {elapsed} ሰከንድ"
     deliver(chat_id, ack_id, body, markup)
+
 
 POST_FORMAT = (
     "Return EXACTLY this structure and nothing before ===POST===:\n"
     "===POST===\n"
-    "(the ready-to-publish Telegram post for the 'Henok Graphics' community of video editors, motion "
-    "designers and creators: 1) 🔥 Catchy Hook line, 2) Structured body copy with short lines/bullets, "
-    "3) CTA, 4) 5-8 relevant Hashtags. Plain text, no markdown symbols.)\n"
+    "(The ready-to-publish Telegram post for the 'Henok Graphics' community of video editors, motion "
+    "designers and creators: 1) 🔥 Catchy Hook line, 2) Structured body copy in natural, flawless modern Amharic, "
+    "3) Clear Actionable CTA, 4) 5-8 relevant Hashtags. Plain text, no markdown symbols like ** or ##.)\n"
+    "===IMAGE_PROMPT===\n"
+    "(A standalone, highly detailed English prompt describing a cinematic, clean, modern commercial marketing visual or 3D digital illustration representing this exact topic for image generation. Do NOT include text on the image; focus on visual aesthetics, lighting, render style, 8k resolution.)\n"
     "===CANVA===\n"
     "🎨 Canva Design Blueprint:\n"
-    "• Color palette: 3-4 HEX codes with role of each (background / accent / text)\n"
+    "• Color palette: 3-4 HEX codes with role of each\n"
     "• Bold overlay hook text (max 6 words)\n"
-    "• Visual composition: layout, focal point, fonts feel, what image/element goes where\n"
+    "• Visual composition: layout, focal point, fonts feel\n"
 )
 
-def run_post(chat_id, label, topic, context_text=None):
-    ack_id = send_ack(chat_id)
+
+def run_post(chat_id, label, topic, context_text=None, start_time=None):
+    start_time = start_time or time.time()
+    ack_id = send_ack(chat_id, "⏳ ሄኖክ፣ ጥናቱን አድርጌ ፖስቱን እና AI ምስሉን እያዘጋጀሁ ነው (ከ20-30 ሰከንድ ይወስዳል)...")
     prompt = f"Create a full social post package about: {topic}\n"
     if context_text:
         prompt += f"\nUse these verified insights as the base:\n{context_text}\n"
@@ -439,25 +525,42 @@ def run_post(chat_id, label, topic, context_text=None):
     if text == BUSY_TEXT:
         deliver(chat_id, ack_id, text)
         return
-    m = re.search(r"===POST===\s*(.*?)\s*(?:===CANVA===\s*(.*))?\Z", text, re.S)
-    if m:
-        post, canva = m.group(1).strip(), (m.group(2) or "").strip()
-    else:
-        post, canva = text.strip(), ""
-    if not post:
-        post = text.strip()
+
+    m_post = re.search(r"===POST===\s*(.*?)\s*(?:===IMAGE_PROMPT===|===CANVA===|\Z)", text, re.S)
+    m_img = re.search(r"===IMAGE_PROMPT===\s*(.*?)\s*(?:===CANVA===|\Z)", text, re.S)
+    m_canva = re.search(r"===CANVA===\s*(.*)\Z", text, re.S)
+
+    post = m_post.group(1).strip() if m_post else text.strip()
+    img_prompt = m_img.group(1).strip() if m_img else f"modern cinematic digital render representing {topic}"
+    canva = m_canva.group(1).strip() if m_canva else ""
+
+    image_url = make_pollinations_url(img_prompt)
+
     did = uuid.uuid4().hex[:10]
     with state_lock:
-        drafts[did] = {"post": post, "ts": time.time()}
+        drafts[did] = {
+            "post": post,
+            "image_url": image_url,
+            "canva": canva,
+            "ts": time.time(),
+        }
     prune(drafts)
+
+    elapsed = int(time.time() - start_time)
+
     preview = f"📝 የፖስት ረቂቅ — {label}\n━━━━━━━━━━━━\n{post}"
     if canva:
         preview += f"\n\n━━━━━━━━━━━━\n{canva}"
     src = format_sources(sources)
     if src:
         preview += f"\n\n{src}"
-    preview += ("\n\n━━━━━━━━━━━━\n🔒 ወደ Henok Graphics የሚላከው ከላይ ያለው ፖስት ብቻ ነው (Canva Blueprint አይላክም)። "
-                "አንተ ካላጸደቅክ ምንም አይወጣም።")
+
+    preview += f"\n\n⏱ የፈጀበት ጊዜ: {elapsed} ሰከንድ"
+    preview += (
+        f"\n\n━━━━━━━━━━━━\n🔒 ወደ {TARGET_CHANNEL} የሚላከው ከላይ ያለው ፖስት እና ከታች ያለው AI ምስል ነው (Canva Blueprint አይላክም)። "
+        "አንተ ካላጸደቅክ ምንም አይወጣም።"
+    )
+
     kb = types.InlineKeyboardMarkup()
     kb.add(
         types.InlineKeyboardButton("✅ አጽድቅና ፖስት አድርግ", callback_data=f"ok:{did}"),
@@ -465,32 +568,44 @@ def run_post(chat_id, label, topic, context_text=None):
     )
     deliver(chat_id, ack_id, preview, kb)
 
+    try:
+        bot.send_photo(
+            chat_id,
+            photo=image_url,
+            caption=f"🎨 ለዚህ ፖስት የተዘጋጀ AI ምስል ({label})\nበማጽደቂያው ቁልፍ ስታጸድቅ ይህ ምስል ከነፖስቱ ይለጠፋል።",
+        )
+    except Exception as e:
+        log.warning("failed to send photo preview: %s", e)
+
+
 # ----------------------------------------------------------------------------
-# Multimodal (Voice, Video, Photo)
+# Multimodal (voice / audio / video / photo)
 # ----------------------------------------------------------------------------
 AUDIO_PROMPT = (
     "This is a voice/audio message from Henok. Do three things:\n"
-    "1) 📝 ትራንስክሪፕት: transcribe it accurately in Amharic.\n"
+    "1) 📝 ትራንስክሪፕት: transcribe it accurately (Amharic if spoken in Amharic; keep the original language "
+    "and add an Amharic translation if it is another language).\n"
     "2) 📌 ማጠቃለያ: a short summary in 2-4 lines.\n"
-    "3) ✅ Action Items: a clear checklist of tasks/decisions.\n"
+    "3) ✅ Action Items: a clear checklist of tasks/decisions with any deadlines mentioned.\n"
     "Plain text, no markdown symbols."
 )
 VIDEO_PROMPT = (
     "Analyze this video for Henok (video producer). Provide:\n"
-    "1) 🎬 Scene-by-scene breakdown with timestamps (MM:SS).\n"
+    "1) 🎬 Scene-by-scene breakdown with approximate timestamps (MM:SS).\n"
     "2) 📌 Short summary of the video.\n"
-    "3) 🔥 THREE viral ~30-second clip candidates for Whop clipping / TikTok / Shorts with exact timestamps, hook, and hashtags.\n"
-    "4) ✂️ Quick editing tips.\n"
+    "3) 🔥 THREE viral ~30-second clip candidates for Whop clipping / TikTok / Shorts: for each give exact "
+    "start-end timestamps (MM:SS-MM:SS), why it can go viral, a hook caption for the first 2 seconds, and "
+    "hashtags.\n"
+    "4) ✂️ One quick editing tip per clip.\n"
     "Plain text, no markdown symbols."
 )
 PHOTO_PROMPT = (
-    "Analyze this image for Henok's Canva design work. Give:\n"
-    "1) 🖼 what you see\n"
-    "2) composition & layout\n"
-    "3) 3-4 color palette with HEX codes\n"
-    "4) concrete Canva improvement steps.\n"
-    "Plain text, no markdown symbols."
+    "Analyze this image for Henok's Canva design work. Give: 1) 🖼 what you see, 2) composition & layout "
+    "(focal point, balance, empty space), 3) dominant colors as HEX codes and a matching 3-4 color palette, "
+    "4) strengths, 5) weaknesses, 6) 4-6 concrete Canva improvement steps (fonts feel, overlay hook text, "
+    "contrast, cropping). Plain text, no markdown symbols."
 )
+
 
 def multimodal_generate(parts):
     if not GEMINI_API_KEY:
@@ -510,7 +625,9 @@ def multimodal_generate(parts):
             log.warning("Multimodal model failed: %s", e)
     raise GeminiError(f"all models failed for media: {last_err}")
 
+
 def detect_media(message):
+    """Return (kind, file_id, mime, size) or None."""
     ct = message.content_type
     if ct == "voice":
         v = message.voice
@@ -538,6 +655,7 @@ def detect_media(message):
             return "audio", d.file_id, mime, d.file_size or 0
     return None
 
+
 @bot.message_handler(content_types=["voice", "audio", "video", "video_note", "photo", "document"])
 @owner_only
 def handle_media(message):
@@ -548,7 +666,8 @@ def handle_media(message):
         return
     kind, file_id, mime, size = info
     if size and size > MAX_MEDIA_BYTES:
-        bot.reply_to(message, f"ሄኖክ፣ ፋይሉ {size / 1048576:.1f}MB ነው — እስከ 18MB ብቻ ነው የምተነትነው።")
+        bot.reply_to(message, f"ሄኖክ፣ ፋይሉ {size / 1048576:.1f}MB ነው — እስከ 18MB ብቻ ነው የምተነትነው። "
+                              "አሳጥረህ ወይም compress አድርገህ ላክልኝ 🎞")
         return
     ack_id = send_ack(chat_id)
     try:
@@ -570,7 +689,10 @@ def handle_media(message):
         deliver(chat_id, ack_id, result)
     except Exception as e:
         log.error("media handling failed: %s", e)
-        deliver(chat_id, ack_id, "ሄኖክ፣ ፋይሉን አሁን ማጠናቀቅ አልቻልኩም 😅 ጥቂት ቆይተህ እንደገና ላክልኝ።")
+        deliver(chat_id, ack_id,
+                "ሄኖክ፣ ፋይሉን አሁን ማጠናቀቅ አልቻልኩም 😅 ጥቂት ቆይተህ እንደገና ላክልኝ — "
+                "ቪዲዮ ከሆነ አጠር ያለ ክፍል ብትልክ ይሻላል።")
+
 
 # ----------------------------------------------------------------------------
 # Commands
@@ -592,15 +714,18 @@ def cmd_start(message):
         "🔒 ያለ አንተ ፈቃድ ምንም አልለጥፍም — ሁሉም በ ✅ / ❌ ቁልፍ ያልፋል።",
     )
 
+
 @bot.message_handler(commands=["news", "trends"])
 @owner_only
 def cmd_news(message):
     show_categories(message.chat.id, "news")
 
+
 @bot.message_handler(commands=["post"])
 @owner_only
 def cmd_post(message):
     show_categories(message.chat.id, "post")
+
 
 @bot.message_handler(commands=["cancel"])
 @owner_only
@@ -608,6 +733,7 @@ def cmd_cancel(message):
     with state_lock:
         awaiting_topic.pop(message.from_user.id, None)
     bot.send_message(message.chat.id, "እሺ ሄኖክ፣ ተሰርዟል ✅")
+
 
 @bot.message_handler(commands=["ai_status"])
 @owner_only
@@ -625,13 +751,15 @@ def cmd_ai_status(message):
         try:
             r = requests.get(f"{GEMINI_BASE}/models", headers={"x-goog-api-key": GEMINI_API_KEY},
                              params={"pageSize": 1}, timeout=20)
-            lines.append("✅ Gemini API: ንቁ" if r.status_code == 200 else f"⚠️ Gemini API: HTTP {r.status_code}")
+            lines.append("✅ Gemini API: ንቁ" if r.status_code == 200
+                         else f"⚠️ Gemini API: HTTP {r.status_code}")
         except Exception as e:
             lines.append(f"⚠️ Gemini API: ግንኙነት አልተሳካም ({str(e)[:60]})")
         lines.append("\n🤖 Gemini ሞዴሎች:")
         for m in STATUS_MODELS:
             try:
-                r = requests.get(f"{GEMINI_BASE}/models/{m}", headers={"x-goog-api-key": GEMINI_API_KEY}, timeout=20)
+                r = requests.get(f"{GEMINI_BASE}/models/{m}", headers={"x-goog-api-key": GEMINI_API_KEY},
+                                 timeout=20)
                 if r.status_code == 200:
                     role = " (በ ቅደም ተከተሉ ውስጥ)" if m in GEMINI_MODELS else " (ተጠባባቂ)"
                     lines.append(f"  ✅ {m}{role}")
@@ -644,16 +772,20 @@ def cmd_ai_status(message):
     lines.append("\n🛟 OpenRouter Fallback: " +
                  ("✅ ቁልፍ አለ — " + ", ".join(OPENROUTER_MODELS) if OPENROUTER_API_KEY
                   else "❌ OPENROUTER_API_KEY አልተሞላም"))
-    lines.append(f"\n📣 Target Channel: {TARGET_CHANNEL_ID}")
+    lines.append(f"\n📣 Target Channel: {TARGET_CHANNEL}")
     lines.append(f"👤 Owner ID: {OWNER_ID}")
     lines.append(f"🕒 የአዲስ አበባ ሰዓት: {addis_now().strftime('%Y-%m-%d %H:%M')}")
     deliver(chat_id, ack_id, "\n".join(lines))
 
+
 # ----------------------------------------------------------------------------
-# Callbacks
+# Callbacks (categories, approval gate)
 # ----------------------------------------------------------------------------
 @bot.callback_query_handler(func=lambda c: True)
 def on_callback(call):
+    chat = getattr(call.message, "chat", None)
+    if not chat or chat.type != "private":
+        return
     uid = call.from_user.id
     if not is_owner(uid):
         try:
@@ -679,7 +811,7 @@ def on_callback(call):
                 bot.send_message(chat_id, "እሺ ሄኖክ ✍️ ርዕሱን ጻፍልኝ (ለመሰረዝ /cancel):")
                 return
             label, topic = CATEGORIES[key]
-            bot.edit_message_text(f"✅ የመረጥከው: {label}", chat_id, msg_id)
+            bot.edit_message_text(f"✅ የመረጥከው: {label}", chat_id, msg_id)  # locks selection in chat record
             if mode == "news":
                 run_news(chat_id, label, topic)
             else:
@@ -705,16 +837,40 @@ def on_callback(call):
             if not draft:
                 bot.edit_message_text("⚠️ ይህ ረቂቅ ጊዜው አልፏል ወይም ቀድሞ ተስተናግዷል።", chat_id, msg_id)
                 return
+
             try:
-                for chunk in split_text(draft["post"], 4000):
-                    bot.send_message(TARGET_CHANNEL_ID, chunk, disable_web_page_preview=False)
+                post_text = draft["post"]
+                image_url = draft.get("image_url")
+
+                posted_photo = False
+                if image_url:
+                    try:
+                        bot.send_photo(TARGET_CHANNEL, photo=image_url, caption=post_text[:1024])
+                        posted_photo = True
+                        if len(post_text) > 1024:
+                            for chunk in split_text(post_text[1024:], 4000):
+                                bot.send_message(TARGET_CHANNEL, chunk, disable_web_page_preview=False)
+                    except Exception as pe:
+                        log.warning("send_photo failed, falling back to text: %s", pe)
+
+                if not posted_photo:
+                    for chunk in split_text(post_text, 4000):
+                        bot.send_message(TARGET_CHANNEL, chunk, disable_web_page_preview=False)
+
                 bot.edit_message_text(
-                    f"✅ ጸድቋል እና ወደ Henok Graphics ተለጥፏል! 🚀\n\n{draft['post'][:3500]}", chat_id, msg_id)
+                    f"✅ ጸድቋል እና ወደ {TARGET_CHANNEL} ተለጥፏል! 🚀\n\n{post_text[:3000]}",
+                    chat_id,
+                    msg_id,
+                )
             except Exception as e:
                 log.error("publish failed: %s", e)
                 with state_lock:
                     drafts[did] = draft
-                bot.send_message(chat_id, f"መለጠፍ አልተሳካም: {str(e)[:150]}")
+                bot.send_message(
+                    chat_id,
+                    f"ሄኖክ፣ መለጠፍ አልተሳካም 😕 ቦቱ የ {TARGET_CHANNEL} አድሚን መሆኑን እና 'Post Messages' "
+                    f"ፈቃድ እንዳለው አረጋግጥ።\nዝርዝር: {str(e)[:150]}\nበድጋሚ ✅ ን መንካት ትችላለህ።",
+                )
 
         elif data.startswith("no:"):
             did = data.split(":", 1)[1]
@@ -724,6 +880,11 @@ def on_callback(call):
 
     except Exception as e:
         log.error("callback error: %s", e)
+        try:
+            bot.send_message(chat_id, "ሄኖክ፣ ትንሽ ችግር ገጠመኝ 😅 እባክህ እንደገና ሞክር።")
+        except Exception:
+            pass
+
 
 # ----------------------------------------------------------------------------
 # Free text
@@ -736,6 +897,7 @@ def handle_text(message):
         return
     uid, chat_id = message.from_user.id, message.chat.id
 
+    # Custom topic typed after tapping "write my own topic"
     with state_lock:
         pending_mode = awaiting_topic.pop(uid, None)
     if pending_mode:
@@ -749,7 +911,7 @@ def handle_text(message):
     mode = "post" if has_any(text, POST_WORDS) else ("news" if has_any(text, NEWS_WORDS) else None)
     if mode:
         if len(text.split()) <= 5:
-            show_categories(chat_id, mode)
+            show_categories(chat_id, mode)   # short/vague => buttons, no typing fatigue
             return
         if mode == "news":
             run_news(chat_id, f"✍️ {text[:40]}", text)
@@ -757,6 +919,7 @@ def handle_text(message):
             run_post(chat_id, f"✍️ {text[:40]}", text)
         return
 
+    # General conversation / research / scripts
     ack_id = send_ack(chat_id)
     with state_lock:
         history = list(histories.get(uid, []))
@@ -770,8 +933,9 @@ def handle_text(message):
         remember(uid, text, reply)
     deliver(chat_id, ack_id, body)
 
+
 # ----------------------------------------------------------------------------
-# Main Polling
+# Main: webhook cleanup + resilient polling
 # ----------------------------------------------------------------------------
 def main():
     log.info("Starting Henok Assistant agent...")
@@ -798,7 +962,7 @@ def main():
         except ApiTelegramException as e:
             first = False
             if getattr(e, "error_code", None) == 409 or "409" in str(e):
-                log.warning("409 Conflict. Retrying in 5s...")
+                log.warning("409 Conflict (another instance polling). Retrying in 5s...")
             else:
                 log.error("Telegram API error: %s. Retrying in 5s...", e)
             time.sleep(5)
@@ -809,6 +973,7 @@ def main():
             else:
                 log.error("Polling crashed: %s. Retrying in 5s...", e)
             time.sleep(5)
+
 
 if __name__ == "__main__":
     main()
