@@ -1,334 +1,814 @@
 # -*- coding: utf-8 -*-
-"""HENOK AI — Render-hosted Telegram assistant with dynamic model discovery and OpenRouter fallback."""
-import os
-import time
+"""
+agent.py  -  Henok's personal Telegram command cockpit (@HenokAssistantBot)
+
+Runs 24/7 on Render (Python 3). Single file.
+
+Required env vars:
+  TELEGRAM_BOT_TOKEN, GEMINI_API_KEY, OPENROUTER_API_KEY
+Optional env vars:
+  TARGET_CHANNEL_ID (default -1003098019114), OWNER_ID (default 511440586), PORT (default 10000)
+
+requirements.txt:
+  pyTelegramBotAPI
+  requests
+"""
+
 import base64
 import logging
+import os
+import re
+import sys
 import threading
+import time
+import uuid
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import requests
 import telebot
-from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
+from telebot import types
+from telebot.apihelper import ApiTelegramException
 
-logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO").upper(),
-    format="%(asctime)s %(levelname)s %(message)s",
-)
+# ----------------------------------------------------------------------------
+# Config
+# ----------------------------------------------------------------------------
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "").strip()
+TARGET_CHANNEL_ID = int(os.environ.get("TARGET_CHANNEL_ID", "-1003098019114"))
+OWNER_ID = int(os.environ.get("OWNER_ID", "511440586"))
+PORT = int(os.environ.get("PORT", "10000"))
+
+GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta"
+GEMINI_UPLOAD = "https://generativelanguage.googleapis.com/upload/v1beta/files"
+GEMINI_MODELS = ["gemini-flash-latest", "gemini-2.5-flash", "gemini-pro-latest"]
+STATUS_MODELS = ["gemini-flash-latest", "gemini-pro-latest", "gemini-2.5-flash", "gemini-2.5-pro"]
+OPENROUTER_MODELS = ["deepseek/deepseek-chat", "meta-llama/llama-3.3-70b-instruct:free"]
+
+MAX_MEDIA_BYTES = 18 * 1024 * 1024
+INLINE_LIMIT_BYTES = 12 * 1024 * 1024
+MAX_HISTORY_TURNS = 8
+
+ACK_TEXT = "⏳ እሺ ሄኖክ! መረጃውን እያሰባሰብኩ ነው፤ ጥቂት ሰከንዶች ጠብቀኝ..."
+BUSY_TEXT = ("ሄኖክ፣ አሁን መስመሮቹ ለአፍታ ተጨናንቀዋል 😅 መልእክትህ አልጠፋም — "
+             "ከ1 ደቂቃ በኋላ ደግመህ ላክልኝ፣ ወዲያው እመልሳለሁ።")
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("henok-agent")
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
-
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "").strip()
-TARGET_CHANNEL_ID = os.getenv("TARGET_CHANNEL_ID", "-1003098019114").strip()
-OWNER_ID = os.getenv("OWNER_ID", "511440586").strip()
-MAX_BYTES = 18 * 1024 * 1024
-TEXT_LIMIT = 3900
-HTTP = requests.Session()
-
-bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN, parse_mode=None, threaded=True)
-
-# Google በሚፈቅደው መሰረት ሞዴሎችን በራስ-ሰር ለማግኘት
-AVAILABLE_MODELS = []
-
-SYSTEM_PROMPT = """
-You are HENOK AI, Henok's personal AI assistant and creative research partner.
-LANGUAGE & TONE:
-- Reply in fluent, natural Amharic when the user writes Amharic; otherwise use the user's language.
-- Be warm, confident, energetic, engaging and human.
-- Be concise for everyday questions and structured for complex tasks.
-CREATOR CONTEXT:
-- Henok Travel focuses on cinematic travel storytelling, local history, culture and landscapes.
-- Telegram Community: Henok Graphics.
-- Long-form scripts should have a strong hook, narrative arc, scene-by-scene narration and B-roll directions.
-"""
-
+# ----------------------------------------------------------------------------
+# Health server (Render 24/7)
+# ----------------------------------------------------------------------------
 class HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        body = b"HENOK AI is running 24/7"
+    def _ok(self, body=True):
+        payload = b"OK - Henok Assistant is alive"
         self.send_response(200)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
-        self.wfile.write(body)
+        if body:
+            self.wfile.write(payload)
+
+    def do_GET(self):
+        self._ok()
 
     def do_HEAD(self):
-        self.send_response(200)
-        self.end_headers()
+        self._ok(body=False)
 
-    def log_message(self, fmt, *args):
-        log.info("health: " + fmt, *args)
+    def log_message(self, *args):
+        pass
 
 def start_health_server():
-    port = int(os.getenv("PORT", "10000"))
-    server = ThreadingHTTPServer(("0.0.0.0", port), HealthHandler)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    log.info("Health server listening on port %s", port)
-
-def send_text(chat_id, text, reply_markup=None, reply_to=None):
-    text = str(text or "").strip() or "ምላሽ ማመንጨት አልተቻለም።"
-    chunks = [text[i:i + TEXT_LIMIT] for i in range(0, len(text), TEXT_LIMIT)]
-    sent_messages = []
-    for i, chunk in enumerate(chunks):
-        sent_messages.append(bot.send_message(
-            chat_id, chunk,
-            reply_markup=reply_markup if i == len(chunks) - 1 else None,
-            reply_to_message_id=reply_to,
-        ))
-    return sent_messages
-
-# ከአንተ የ Google AI Studio ቁልፍ ጋር የሚሰሩ ሞዴሎችን በራስ-ሰር ማግኘት
-def get_available_gemini_models():
-    global AVAILABLE_MODELS
-    if AVAILABLE_MODELS:
-        return AVAILABLE_MODELS
-    if not GEMINI_API_KEY:
-        return []
-    try:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models?key={GEMINI_API_KEY}"
-        r = HTTP.get(url, timeout=15)
-        if r.ok:
-            data = r.json()
-            models = []
-            for m in data.get("models", []):
-                methods = m.get("supportedGenerationMethods", [])
-                if "generateContent" in methods:
-                    name = m["name"].replace("models/", "")
-                    models.append(name)
-            if models:
-                AVAILABLE_MODELS = models
-                log.info("Discovered available Google Gemini models: %s", models[:5])
-                return AVAILABLE_MODELS
-    except Exception as e:
-        log.warning("Could not list models: %s", e)
-    return ["gemini-1.5-flash", "gemini-2.0-flash", "gemini-3.8-flash"]
-
-def call_openrouter(messages):
-    if not OPENROUTER_API_KEY:
-        return None
-    models = ["deepseek/deepseek-chat", "meta-llama/llama-3.3-70b-instruct:free", "google/gemini-2.0-flash-exp:free"]
-    for m in models:
+    def _serve():
         try:
-            r = HTTP.post(
-                "https://openrouter.ai/api/v1/chat/completions",
-                headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"},
-                json={"model": m, "messages": messages},
-                timeout=25,
-            )
-            if r.status_code == 200:
-                content = r.json()["choices"][0]["message"]["content"]
-                if content:
-                    return str(content).strip()
-        except Exception:
-            continue
-    return None
+            server = ThreadingHTTPServer(("0.0.0.0", PORT), HealthHandler)
+            log.info("Health server listening on port %s", PORT)
+            server.serve_forever()
+        except Exception as e:
+            log.error("Health server error: %s", e)
 
-def gemini_generate(parts, timeout=45, use_web_search=False, system_instruction=None):
-    if not GEMINI_API_KEY:
-        log.error('Gemini request blocked: GEMINI_API_KEY is not configured')
-        return None
+    threading.Thread(target=_serve, daemon=True, name="health").start()
 
-    discovered = get_available_gemini_models()
-    candidate_models = []
-    if GEMINI_MODEL:
-        candidate_models.append(GEMINI_MODEL)
-    candidate_models.extend(discovered)
-    candidate_models.extend(["gemini-1.5-flash", "gemini-2.0-flash", "gemini-3.8-flash"])
-    models = list(dict.fromkeys(candidate_models))
+start_health_server()
 
-    payload = {
-        'systemInstruction': {'parts': [{'text': system_instruction or SYSTEM_PROMPT}]},
-        'contents': [{'role': 'user', 'parts': parts}]
-    }
-    if use_web_search:
-        payload['tools'] = [{'google_search': {}}]
+if not TELEGRAM_BOT_TOKEN:
+    log.error("TELEGRAM_BOT_TOKEN is missing. Set it in Render environment variables.")
+    time.sleep(5)
+    sys.exit(1)
 
-    for model in models:
-        url = f'https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_API_KEY}'
-        try:
-            response = HTTP.post(
-                url,
-                headers={'Content-Type': 'application/json'},
-                json=payload,
-                timeout=(10, timeout)
-            )
-            if response.ok:
-                data = response.json()
-                candidates = data.get('candidates') or []
-                if candidates:
-                    candidate = candidates[0]
-                    parts_out = candidate.get('content', {}).get('parts', [])
-                    answer = '\n'.join(p.get('text', '') for p in parts_out if p.get('text')).strip()
-                    if answer:
-                        if use_web_search:
-                            meta = candidate.get('groundingMetadata') or {}
-                            chunks = meta.get('groundingChunks') or []
-                            sources, seen = [], set()
-                            for chunk in chunks:
-                                web = chunk.get('web') or {}
-                                uri = web.get('uri')
-                                title = web.get('title') or uri
-                                if uri and uri not in seen:
-                                    seen.add(uri)
-                                    sources.append(f'- {title}: {uri}')
-                            if sources:
-                                answer += '\n\nSources:\n' + '\n'.join(sources[:6])
-                        return answer
-            if response.status_code == 404:
-                continue
-        except Exception:
-            continue
-    return None
+bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN, parse_mode=None, threaded=True, num_threads=8)
 
-def reply_ai(chat_id, text, extra_parts=None, use_search=False):
-    if extra_parts:
-        return gemini_generate(extra_parts, timeout=60)
+state_lock = threading.Lock()
+histories = {}
+awaiting_topic = {}
+drafts = {}
+news_cache = {}
 
-    # ጽሑፍ ከሆነ መጀመሪያ በ Google Gemini ይሞክራል
-    ans = gemini_generate([{"text": text}], timeout=30, use_web_search=use_search)
-    if ans:
-        return ans
+CATEGORIES = {
+    "ai": ("🤖 AI እና ቴክኖሎጂ", "AI & Technology"),
+    "crypto": ("🪙 Crypto እና ገበያ", "Crypto & Markets"),
+    "biz": ("💼 ኢኮኖሚና ቢዝነስ", "Economy & Business"),
+    "creator": ("🎬 ፈጣሪዎችና ሶሻል ሚዲያ", "Creators, Video Creation, Editing & Social Media"),
+}
+CUSTOM_LABEL = "✍️ የራሴን ርዕስ እጽፋለሁ"
 
-    # ጎግል ቢዘገይ ወይም 404 ቢጥል ወዲያውኑ ወደ OpenRouter ይሸጋገራል
-    log.info("Gemini failed, falling back to OpenRouter")
-    msgs = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": text}]
-    return call_openrouter(msgs)
+NEWS_WORDS = ["ዜና", "ትሬንድ", "ወቅታዊ", "አዲስ ነገር", "news", "trend", "latest", "trending"]
+POST_WORDS = ["ፖስት", "ካፕሽን", "ለቻናል", "ለማህበረሰብ", "post", "caption"]
+REALTIME_WORDS = ["ዛሬ", "አሁን", "ዋጋ", "ምንዛሬ", "ዜና", "ትሬንድ", "ወቅታዊ", "ቅርብ ጊዜ",
+                  "today", "now", "price", "latest", "news", "trend", "current", "bitcoin", "btc",
+                  "usd", "rate", "2026"]
 
-def is_owner(message):
-    return str(message.from_user.id) == OWNER_ID
+def addis_now():
+    return datetime.now(timezone.utc) + timedelta(hours=3)
 
-def download_telegram_file(file_id):
-    info = bot.get_file(file_id)
-    if getattr(info, "file_size", 0) and info.file_size > MAX_BYTES:
-        raise ValueError("ፋይሉ ከ18MB በላይ ነው።")
-    data = bot.download_file(info.file_path)
-    return data
-
-@bot.message_handler(commands=["start", "menu"])
-def start_command(message):
-    send_text(
-        message.chat.id,
-        "ሰላም ሄኖክ! 👋 HENOK AI ዝግጁ ነው።\n"
-        "• በድምፅ ወይም በጽሑፍ የፈለከውን ጠይቀኝ።\n"
-        "• ሞዴሎችን ለመፈተሽ /ai_status በለኝ።\n"
-        "• ወደ Henok Graphics ይዘት ለመለጠፍ /publish ተጠቀም።"
+def system_prompt():
+    t = addis_now().strftime("%A, %d %B %Y, %H:%M")
+    return (
+        "You are the personal AI chief-of-staff of ሄኖክ (Henok Habtamu), a digital marketer, video producer "
+        "and creator in Addis Ababa, Ethiopia. You live inside his private Telegram bot.\n"
+        f"Current Addis Ababa time: {t}.\n\n"
+        "BRAND CONTEXT: YouTube 'Henok Travel' (cinematic Ethiopian travel documentaries); community "
+        "'Henok Graphics' (video editors, motion designers, creators); commerce: Whop viral clipping "
+        "campaigns, Amazon KDP, Ye-buna (የቡና), Sekela Marketing. Content pillars: AI & Tech, Crypto & "
+        "Markets, Economy & Business, Video Creation & Editing.\n\n"
+        "STYLE RULES (strict):\n"
+        "- Always reply in natural, energetic, modern Amharic as used by digital creatives in Addis Ababa. "
+        "English tech/marketing terms (Hook, CTA, Reels, Canva, CapCut) may stay in English.\n"
+        "- Address him warmly as 'ሄኖክ'.\n"
+        "- No robotic fluff, no clinical essays, no repeated apologies. Be punchy, practical, specific.\n"
+        "- This is Telegram plain text: do NOT use markdown symbols (no **, no ##, no backticks, no tables). "
+        "Use emojis, short lines and simple '•' bullets.\n"
+        "- Never claim you published anything. Publishing only happens when Henok taps the approval button.\n"
+        "- If you are not sure about a fact, say so instead of inventing it."
     )
+
+def split_text(text, limit=3900):
+    text = (text or "").strip() or "…"
+    chunks = []
+    while len(text) > limit:
+        cut = text.rfind("\n", 0, limit)
+        if cut < limit * 0.5:
+            cut = text.rfind(" ", 0, limit)
+        if cut < limit * 0.5:
+            cut = limit
+        chunks.append(text[:cut].rstrip())
+        text = text[cut:].lstrip()
+    chunks.append(text)
+    return chunks
+
+def deliver(chat_id, ack_id, text, markup=None):
+    chunks = split_text(text)
+    for i, chunk in enumerate(chunks):
+        mk = markup if i == len(chunks) - 1 else None
+        if i == 0 and ack_id:
+            try:
+                bot.edit_message_text(chunk, chat_id, ack_id, reply_markup=mk,
+                                      disable_web_page_preview=True)
+                continue
+            except Exception as e:
+                log.warning("edit failed, sending new message: %s", e)
+        bot.send_message(chat_id, chunk, reply_markup=mk, disable_web_page_preview=True)
+
+def send_ack(chat_id):
+    try:
+        return bot.send_message(chat_id, ACK_TEXT).message_id
+    except Exception as e:
+        log.error("ack failed: %s", e)
+        return None
+
+def format_sources(sources, limit=6):
+    if not sources:
+        return ""
+    lines = ["🔗 የተረጋገጡ ምንጮች:"]
+    for i, (title, uri) in enumerate(sources[:limit], 1):
+        lines.append(f"{i}. {title or 'ምንጭ'}\n{uri}")
+    return "\n".join(lines)
+
+def prune(store, max_items=60):
+    with state_lock:
+        if len(store) > max_items:
+            for k in sorted(store, key=lambda k: store[k].get("ts", 0))[: len(store) - max_items]:
+                store.pop(k, None)
+
+def has_any(text, words):
+    low = (text or "").lower()
+    return any(w.lower() in low for w in words)
+
+def is_owner(user_id):
+    return user_id == OWNER_ID
+
+def owner_only(func):
+    def wrapper(message, *a, **kw):
+        if not is_owner(message.from_user.id):
+            try:
+                bot.reply_to(message, "ይህ የሄኖክ የግል ቦት ነው 🔒")
+            except Exception:
+                pass
+            return
+        return func(message, *a, **kw)
+    wrapper.__name__ = func.__name__
+    return wrapper
+
+# ----------------------------------------------------------------------------
+# Gemini Engine
+# ----------------------------------------------------------------------------
+class GeminiError(Exception):
+    pass
+
+def _gemini_call(model, payload):
+    url = f"{GEMINI_BASE}/models/{model}:generateContent"
+    headers = {"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"}
+    for attempt in range(2):
+        r = requests.post(url, headers=headers, json=payload, timeout=180)
+        if r.status_code == 200:
+            return r.json()
+        if r.status_code in (429, 500, 502, 503, 504) and attempt == 0:
+            time.sleep(2)
+            continue
+        raise GeminiError(f"{model} HTTP {r.status_code}: {r.text[:200]}")
+    raise GeminiError(f"{model}: exhausted retries")
+
+def _extract(data):
+    cands = data.get("candidates") or []
+    if not cands:
+        raise GeminiError(f"no candidates: {str(data.get('promptFeedback'))[:150]}")
+    cand = cands[0]
+    parts = (cand.get("content") or {}).get("parts") or []
+    text = "".join(p.get("text", "") for p in parts if not p.get("thought")).strip()
+    if not text:
+        raise GeminiError(f"empty text (finish={cand.get('finishReason')})")
+    sources, seen = [], set()
+    for ch in (cand.get("groundingMetadata") or {}).get("groundingChunks") or []:
+        web = ch.get("web") or {}
+        uri = web.get("uri")
+        if uri and uri not in seen:
+            seen.add(uri)
+            sources.append((web.get("title") or "", uri))
+    return text, sources
+
+def gemini_generate(contents, grounding=False, system=None):
+    if not GEMINI_API_KEY:
+        raise GeminiError("GEMINI_API_KEY missing")
+    payload = {
+        "systemInstruction": {"parts": [{"text": system or system_prompt()}]},
+        "contents": contents,
+        "generationConfig": {"temperature": 0.8, "maxOutputTokens": 8192},
+    }
+    if grounding:
+        payload["tools"] = [{"google_search": {}}]
+    last_err = None
+    for model in GEMINI_MODELS:
+        try:
+            data = _gemini_call(model, payload)
+            text, sources = _extract(data)
+            return text, sources, model
+        except Exception as e:
+            last_err = e
+            log.warning("Gemini model failed: %s", e)
+    raise GeminiError(f"all Gemini models failed: {last_err}")
+
+def gemini_upload_file(data, mime, display_name):
+    start = requests.post(
+        GEMINI_UPLOAD,
+        headers={
+            "x-goog-api-key": GEMINI_API_KEY,
+            "X-Goog-Upload-Protocol": "resumable",
+            "X-Goog-Upload-Command": "start",
+            "X-Goog-Upload-Header-Content-Length": str(len(data)),
+            "X-Goog-Upload-Header-Content-Type": mime,
+            "Content-Type": "application/json",
+        },
+        json={"file": {"display_name": display_name}},
+        timeout=60,
+    )
+    if start.status_code != 200 or "X-Goog-Upload-URL" not in start.headers:
+        raise GeminiError(f"upload start failed: {start.status_code}")
+    up = requests.post(
+        start.headers["X-Goog-Upload-URL"],
+        headers={
+            "Content-Length": str(len(data)),
+            "X-Goog-Upload-Offset": "0",
+            "X-Goog-Upload-Command": "upload, finalize",
+        },
+        data=data,
+        timeout=300,
+    )
+    if up.status_code != 200:
+        raise GeminiError(f"upload failed: {up.status_code}")
+    info = up.json().get("file", {})
+    name, uri = info.get("name"), info.get("uri")
+    if not name or not uri:
+        raise GeminiError("upload returned no file info")
+    deadline = time.time() + 150
+    state = info.get("state", "PROCESSING")
+    while state == "PROCESSING" and time.time() < deadline:
+        time.sleep(3)
+        r = requests.get(f"{GEMINI_BASE}/{name}", headers={"x-goog-api-key": GEMINI_API_KEY}, timeout=30)
+        if r.status_code == 200:
+            state = r.json().get("state", state)
+    if state != "ACTIVE":
+        raise GeminiError(f"uploaded file not ACTIVE (state={state})")
+    return uri
+
+# ----------------------------------------------------------------------------
+# OpenRouter Fallback
+# ----------------------------------------------------------------------------
+def openrouter_generate(history, user_text, system=None):
+    if not OPENROUTER_API_KEY:
+        raise RuntimeError("OPENROUTER_API_KEY missing")
+    messages = [{"role": "system", "content": system or system_prompt()}]
+    for role, txt in history:
+        messages.append({"role": "assistant" if role == "model" else "user", "content": txt})
+    messages.append({"role": "user", "content": user_text})
+    last_err = None
+    for model in OPENROUTER_MODELS:
+        try:
+            r = requests.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                    "Content-Type": "application/json",
+                    "HTTP-Referer": "https://t.me/HenokAssistantBot",
+                    "X-Title": "Henok Assistant",
+                },
+                json={"model": model, "messages": messages, "temperature": 0.8, "max_tokens": 4096},
+                timeout=120,
+            )
+            if r.status_code != 200:
+                raise RuntimeError(f"{model} HTTP {r.status_code}")
+            txt = (r.json()["choices"][0]["message"]["content"] or "").strip()
+            if not txt:
+                raise RuntimeError(f"{model} empty")
+            return txt, model
+        except Exception as e:
+            last_err = e
+            log.warning("OpenRouter failed: %s", e)
+    raise RuntimeError(f"all OpenRouter models failed: {last_err}")
+
+def ask_text(user_text, history=None, grounding=False):
+    history = history or []
+    contents = [{"role": r, "parts": [{"text": t}]} for r, t in history]
+    contents.append({"role": "user", "parts": [{"text": user_text}]})
+    try:
+        text, sources, model = gemini_generate(contents, grounding=grounding)
+        log.info("answered by Gemini %s", model)
+        return text, sources
+    except Exception as e:
+        log.warning("Gemini path failed, switching to OpenRouter: %s", e)
+    try:
+        text, model = openrouter_generate(history, user_text)
+        log.info("answered by OpenRouter %s", model)
+        return text, []
+    except Exception as e:
+        log.error("OpenRouter path failed too: %s", e)
+    return BUSY_TEXT, []
+
+def remember(user_id, user_text, reply):
+    with state_lock:
+        h = histories.setdefault(user_id, [])
+        h.append(("user", user_text[:1500]))
+        h.append(("model", reply[:1500]))
+        del h[: max(0, len(h) - MAX_HISTORY_TURNS * 2)]
+
+# ----------------------------------------------------------------------------
+# Interactive Categories
+# ----------------------------------------------------------------------------
+def category_keyboard(mode):
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        types.InlineKeyboardButton(CATEGORIES["ai"][0], callback_data=f"cat:{mode}:ai"),
+        types.InlineKeyboardButton(CATEGORIES["crypto"][0], callback_data=f"cat:{mode}:crypto"),
+    )
+    kb.add(
+        types.InlineKeyboardButton(CATEGORIES["biz"][0], callback_data=f"cat:{mode}:biz"),
+        types.InlineKeyboardButton(CATEGORIES["creator"][0], callback_data=f"cat:{mode}:creator"),
+    )
+    kb.add(types.InlineKeyboardButton(CUSTOM_LABEL, callback_data=f"cat:{mode}:custom"))
+    return kb
+
+def show_categories(chat_id, mode):
+    head = ("ሄኖክ፣ ስለየትኛው ዘርፍ ወቅታዊ መረጃ ላምጣልህ? 👇" if mode == "news"
+            else "ሄኖክ፣ ለየትኛው ዘርፍ ፖስት ልፍጠር? 👇")
+    bot.send_message(chat_id, head, reply_markup=category_keyboard(mode))
+
+def run_news(chat_id, label, topic):
+    ack_id = send_ack(chat_id)
+    prompt = (
+        f"ርዕስ/ዘርፍ: {topic}\n\n"
+        "Use live Google Search to find the most important, VERIFIED developments from the last few days "
+        "on this topic. Deliver 4-5 punchy insights. Each insight: an emoji + one-line headline, then 1-2 "
+        "energetic sentences on why it matters to an Ethiopian creator/marketer like Henok. "
+        "Finish with '🎯 ለዛሬ የይዘት ሀሳብ:' and ONE concrete content idea. Plain text only, no markdown."
+    )
+    text, sources = ask_text(prompt, grounding=True)
+    body = text
+    src = format_sources(sources)
+    if src:
+        body += "\n\n" + src
+    markup = None
+    if text != BUSY_TEXT:
+        nid = uuid.uuid4().hex[:10]
+        with state_lock:
+            news_cache[nid] = {"label": label, "text": text, "ts": time.time()}
+        prune(news_cache)
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton("📝 ከዚህ ፖስት ፍጠርልኝ", callback_data=f"mk:{nid}"))
+    deliver(chat_id, ack_id, body, markup)
+
+POST_FORMAT = (
+    "Return EXACTLY this structure and nothing before ===POST===:\n"
+    "===POST===\n"
+    "(the ready-to-publish Telegram post for the 'Henok Graphics' community of video editors, motion "
+    "designers and creators: 1) 🔥 Catchy Hook line, 2) Structured body copy with short lines/bullets, "
+    "3) CTA, 4) 5-8 relevant Hashtags. Plain text, no markdown symbols.)\n"
+    "===CANVA===\n"
+    "🎨 Canva Design Blueprint:\n"
+    "• Color palette: 3-4 HEX codes with role of each (background / accent / text)\n"
+    "• Bold overlay hook text (max 6 words)\n"
+    "• Visual composition: layout, focal point, fonts feel, what image/element goes where\n"
+)
+
+def run_post(chat_id, label, topic, context_text=None):
+    ack_id = send_ack(chat_id)
+    prompt = f"Create a full social post package about: {topic}\n"
+    if context_text:
+        prompt += f"\nUse these verified insights as the base:\n{context_text}\n"
+    prompt += "\nUse Google Search to verify any facts or numbers you include.\n\n" + POST_FORMAT
+    text, sources = ask_text(prompt, grounding=True)
+    if text == BUSY_TEXT:
+        deliver(chat_id, ack_id, text)
+        return
+    m = re.search(r"===POST===\s*(.*?)\s*(?:===CANVA===\s*(.*))?\Z", text, re.S)
+    if m:
+        post, canva = m.group(1).strip(), (m.group(2) or "").strip()
+    else:
+        post, canva = text.strip(), ""
+    if not post:
+        post = text.strip()
+    did = uuid.uuid4().hex[:10]
+    with state_lock:
+        drafts[did] = {"post": post, "ts": time.time()}
+    prune(drafts)
+    preview = f"📝 የፖስት ረቂቅ — {label}\n━━━━━━━━━━━━\n{post}"
+    if canva:
+        preview += f"\n\n━━━━━━━━━━━━\n{canva}"
+    src = format_sources(sources)
+    if src:
+        preview += f"\n\n{src}"
+    preview += ("\n\n━━━━━━━━━━━━\n🔒 ወደ Henok Graphics የሚላከው ከላይ ያለው ፖስት ብቻ ነው (Canva Blueprint አይላክም)። "
+                "አንተ ካላጸደቅክ ምንም አይወጣም።")
+    kb = types.InlineKeyboardMarkup()
+    kb.add(
+        types.InlineKeyboardButton("✅ አጽድቅና ፖስት አድርግ", callback_data=f"ok:{did}"),
+        types.InlineKeyboardButton("❌ ሰርዝ", callback_data=f"no:{did}"),
+    )
+    deliver(chat_id, ack_id, preview, kb)
+
+# ----------------------------------------------------------------------------
+# Multimodal (Voice, Video, Photo)
+# ----------------------------------------------------------------------------
+AUDIO_PROMPT = (
+    "This is a voice/audio message from Henok. Do three things:\n"
+    "1) 📝 ትራንስክሪፕት: transcribe it accurately in Amharic.\n"
+    "2) 📌 ማጠቃለያ: a short summary in 2-4 lines.\n"
+    "3) ✅ Action Items: a clear checklist of tasks/decisions.\n"
+    "Plain text, no markdown symbols."
+)
+VIDEO_PROMPT = (
+    "Analyze this video for Henok (video producer). Provide:\n"
+    "1) 🎬 Scene-by-scene breakdown with timestamps (MM:SS).\n"
+    "2) 📌 Short summary of the video.\n"
+    "3) 🔥 THREE viral ~30-second clip candidates for Whop clipping / TikTok / Shorts with exact timestamps, hook, and hashtags.\n"
+    "4) ✂️ Quick editing tips.\n"
+    "Plain text, no markdown symbols."
+)
+PHOTO_PROMPT = (
+    "Analyze this image for Henok's Canva design work. Give:\n"
+    "1) 🖼 what you see\n"
+    "2) composition & layout\n"
+    "3) 3-4 color palette with HEX codes\n"
+    "4) concrete Canva improvement steps.\n"
+    "Plain text, no markdown symbols."
+)
+
+def multimodal_generate(parts):
+    if not GEMINI_API_KEY:
+        raise GeminiError("GEMINI_API_KEY missing")
+    payload = {
+        "systemInstruction": {"parts": [{"text": system_prompt()}]},
+        "contents": [{"role": "user", "parts": parts}],
+        "generationConfig": {"temperature": 0.6, "maxOutputTokens": 8192},
+    }
+    last_err = None
+    for model in GEMINI_MODELS:
+        try:
+            text, _ = _extract(_gemini_call(model, payload))
+            return text
+        except Exception as e:
+            last_err = e
+            log.warning("Multimodal model failed: %s", e)
+    raise GeminiError(f"all models failed for media: {last_err}")
+
+def detect_media(message):
+    ct = message.content_type
+    if ct == "voice":
+        v = message.voice
+        return "audio", v.file_id, v.mime_type or "audio/ogg", v.file_size or 0
+    if ct == "audio":
+        a = message.audio
+        return "audio", a.file_id, a.mime_type or "audio/mpeg", a.file_size or 0
+    if ct == "video":
+        v = message.video
+        return "video", v.file_id, v.mime_type or "video/mp4", v.file_size or 0
+    if ct == "video_note":
+        v = message.video_note
+        return "video", v.file_id, "video/mp4", v.file_size or 0
+    if ct == "photo":
+        p = message.photo[-1]
+        return "photo", p.file_id, "image/jpeg", p.file_size or 0
+    if ct == "document":
+        d = message.document
+        mime = (d.mime_type or "").lower()
+        if mime.startswith("image/"):
+            return "photo", d.file_id, mime, d.file_size or 0
+        if mime.startswith("video/"):
+            return "video", d.file_id, mime, d.file_size or 0
+        if mime.startswith("audio/"):
+            return "audio", d.file_id, mime, d.file_size or 0
+    return None
+
+@bot.message_handler(content_types=["voice", "audio", "video", "video_note", "photo", "document"])
+@owner_only
+def handle_media(message):
+    info = detect_media(message)
+    chat_id = message.chat.id
+    if not info:
+        bot.reply_to(message, "ሄኖክ፣ ይህን የፋይል አይነት ገና አልተረዳሁም 🙈 ድምፅ፣ ቪዲዮ ወይም ፎቶ ላክልኝ።")
+        return
+    kind, file_id, mime, size = info
+    if size and size > MAX_MEDIA_BYTES:
+        bot.reply_to(message, f"ሄኖክ፣ ፋይሉ {size / 1048576:.1f}MB ነው — እስከ 18MB ብቻ ነው የምተነትነው።")
+        return
+    ack_id = send_ack(chat_id)
+    try:
+        fobj = bot.get_file(file_id)
+        data = bot.download_file(fobj.file_path)
+        if len(data) > MAX_MEDIA_BYTES:
+            deliver(chat_id, ack_id, "ሄኖክ፣ ፋይሉ ከ18MB በላይ ነው — አሳጥረህ ላክልኝ 🎞")
+            return
+        prompt = {"audio": AUDIO_PROMPT, "video": VIDEO_PROMPT, "photo": PHOTO_PROMPT}[kind]
+        caption = (message.caption or "").strip()
+        if caption:
+            prompt += f"\n\nHenok's extra instruction/context: {caption}"
+        if len(data) > INLINE_LIMIT_BYTES:
+            uri = gemini_upload_file(data, mime, f"{kind}-{uuid.uuid4().hex[:6]}")
+            media_part = {"fileData": {"mimeType": mime, "fileUri": uri}}
+        else:
+            media_part = {"inlineData": {"mimeType": mime, "data": base64.b64encode(data).decode("ascii")}}
+        result = multimodal_generate([{"text": prompt}, media_part])
+        deliver(chat_id, ack_id, result)
+    except Exception as e:
+        log.error("media handling failed: %s", e)
+        deliver(chat_id, ack_id, "ሄኖክ፣ ፋይሉን አሁን ማጠናቀቅ አልቻልኩም 😅 ጥቂት ቆይተህ እንደገና ላክልኝ።")
+
+# ----------------------------------------------------------------------------
+# Commands
+# ----------------------------------------------------------------------------
+@bot.message_handler(commands=["start", "help"])
+@owner_only
+def cmd_start(message):
+    bot.send_message(
+        message.chat.id,
+        "ሰላም ሄኖክ! 👋🔥 እኔ የአንተ የግል ረዳት ነኝ — 24/7 ዝግጁ።\n\n"
+        "ምን ላደርግልህ እችላለሁ:\n"
+        "📰 /news — ወቅታዊ ዜና እና ትሬንድ (በቁልፍ ምረጥ)\n"
+        "📝 /post — ሙሉ የፖስት ፓኬጅ + Canva Blueprint\n"
+        "🎙 ድምፅ ላክልኝ — ትራንስክሪፕት + ማጠቃለያ + Action Items\n"
+        "🎬 ቪዲዮ (እስከ 18MB) — ትንታኔ + 3 ቫይራል ክሊፖች\n"
+        "🖼 ፎቶ — የ Canva ዲዛይን አስተያየት\n"
+        "💬 ወይም ማንኛውንም ነገር ጻፍልኝ — ስክሪፕት፣ ሀሳብ፣ ጥናት\n"
+        "🩺 /ai_status — የ AI ሞተር ሁኔታ\n\n"
+        "🔒 ያለ አንተ ፈቃድ ምንም አልለጥፍም — ሁሉም በ ✅ / ❌ ቁልፍ ያልፋል።",
+    )
+
+@bot.message_handler(commands=["news", "trends"])
+@owner_only
+def cmd_news(message):
+    show_categories(message.chat.id, "news")
+
+@bot.message_handler(commands=["post"])
+@owner_only
+def cmd_post(message):
+    show_categories(message.chat.id, "post")
+
+@bot.message_handler(commands=["cancel"])
+@owner_only
+def cmd_cancel(message):
+    with state_lock:
+        awaiting_topic.pop(message.from_user.id, None)
+    bot.send_message(message.chat.id, "እሺ ሄኖክ፣ ተሰርዟል ✅")
 
 @bot.message_handler(commands=["ai_status"])
-def ai_status_command(message):
-    if not is_owner(message):
-        return
-    bot.send_chat_action(message.chat.id, "typing")
-    models = get_available_gemini_models()
-    if models:
-        send_text(
-            message.chat.id,
-            f"✅ AI STATUS: OK\n\nለአንተ ቁልፍ የተፈቀዱ Google Gemini ሞዴሎች፦\n" +
-            "\n".join(f"• {m}" for m in models[:10]) +
-            "\n\n👉 ቦቱ ከእነዚህ ውስጥ አንዱን በራስ-ሰር መርጦ ይሰራል!"
-        )
-    else:
-        send_text(message.chat.id, "⚠️ Google AI Studio ሞዴሎችን ማግኘት አልተቻለም፤ GEMINI_API_KEYን ፈትሽ።")
-
-@bot.message_handler(commands=["id"])
-def id_command(message):
-    send_text(message.chat.id, f"Telegram ID: {message.from_user.id}")
-
-@bot.message_handler(commands=["publish"])
-def publish_command(message):
-    if not is_owner(message):
-        return
-    content = (message.text or "").partition(" ")[2].strip()
-    if not content:
-        send_text(message.chat.id, "አጠቃቀም፦ /publish ከዚያ የሚለጠፈውን ይዘት ጻፍ።")
-        return
-    keyboard = InlineKeyboardMarkup()
-    keyboard.row(
-        InlineKeyboardButton("✅ አጽድቅ", callback_data="publish:yes"),
-        InlineKeyboardButton("❌ ተው", callback_data="publish:no"),
-    )
-    sent = send_text(message.chat.id, "ይህን ወደ Henok Graphics ልላክ?\n\n" + content, reply_markup=keyboard)
-    if sent:
-        PENDING_POSTS[sent[-1].message_id] = content
-
-PENDING_POSTS = {}
-
-@bot.callback_query_handler(func=lambda call: call.data in ("publish:yes", "publish:no"))
-def approval_callback(call):
-    if str(call.from_user.id) != OWNER_ID:
-        bot.answer_callback_query(call.id, "ፈቃድ የለህም።", show_alert=True)
-        return
-    content = PENDING_POSTS.pop(call.message.message_id, None)
-    if not content:
-        bot.answer_callback_query(call.id, "ይህ ይዘት አልተገኘም።", show_alert=True)
-        return
-    if call.data == "publish:no":
-        bot.answer_callback_query(call.id, "ተሰርዟል።")
-        bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
-        send_text(call.message.chat.id, "❌ ይዘቱ ተወ።")
-        return
-    try:
-        bot.send_message(TARGET_CHANNEL_ID, content)
-        bot.answer_callback_query(call.id, "ተሳክቷል።")
-        bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
-        send_text(call.message.chat.id, "✅ ይዘቱ ወደ Henok Graphics ተልኳል።")
-    except Exception:
-        bot.answer_callback_query(call.id, "መላክ አልተቻለም።", show_alert=True)
-
-@bot.message_handler(content_types=["text"])
-def text_handler(message):
-    text = (message.text or "").strip()
-    if not text or text.startswith("/"):
-        return
-    bot.send_chat_action(message.chat.id, "typing")
-    use_search = any(w in text.lower() for w in ["ዛሬ", "ወቅታዊ", "አዲስ ዜና", "ትሬንድ", "today", "news"])
-    answer = reply_ai(message.chat.id, text, use_search=use_search)
-    if answer:
-        send_text(message.chat.id, answer, reply_to=message.message_id)
-    else:
-        send_text(message.chat.id, "የAI አገልግሎቱ አሁን ምላሽ አልሰጠም። እባክህ በድጋሚ ሞክር።", reply_to=message.message_id)
-
-@bot.message_handler(content_types=["voice", "audio"])
-def voice_handler(message):
+@owner_only
+def cmd_ai_status(message):
     chat_id = message.chat.id
-    bot.send_chat_action(chat_id, "typing")
-    audio = message.voice or message.audio
+    ack_id = None
     try:
-        raw = download_telegram_file(audio.file_id)
-        mime = getattr(audio, "mime_type", None) or ("audio/ogg" if message.voice else "audio/mpeg")
-        prompt = "Listen to this audio. Transcribe it accurately in Amharic, then answer the speaker's actual request."
-        parts = [
-            {"text": prompt},
-            {"inlineData": {"mimeType": mime, "data": base64.b64encode(raw).decode("ascii")}},
-        ]
-        answer = reply_ai(chat_id, "", extra_parts=parts)
-        if answer:
-            send_text(chat_id, answer, reply_to=message.message_id)
-        else:
-            send_text(chat_id, "ድምፁን ማቀናበር አልተሳካም። እባክህ በድጋሚ ላክ።", reply_to=message.message_id)
-    except Exception as exc:
-        send_text(chat_id, "የድምፅ ፋይሉን ማውረድ አልተቻለም።")
+        ack_id = bot.send_message(chat_id, "🩺 የ AI ሞተሮችን እየፈተሽኩ ነው...").message_id
+    except Exception:
+        pass
+    lines = ["🩺 AI Status\n━━━━━━━━━━━━"]
+    if not GEMINI_API_KEY:
+        lines.append("❌ GEMINI_API_KEY አልተሞላም")
+    else:
+        try:
+            r = requests.get(f"{GEMINI_BASE}/models", headers={"x-goog-api-key": GEMINI_API_KEY},
+                             params={"pageSize": 1}, timeout=20)
+            lines.append("✅ Gemini API: ንቁ" if r.status_code == 200 else f"⚠️ Gemini API: HTTP {r.status_code}")
+        except Exception as e:
+            lines.append(f"⚠️ Gemini API: ግንኙነት አልተሳካም ({str(e)[:60]})")
+        lines.append("\n🤖 Gemini ሞዴሎች:")
+        for m in STATUS_MODELS:
+            try:
+                r = requests.get(f"{GEMINI_BASE}/models/{m}", headers={"x-goog-api-key": GEMINI_API_KEY}, timeout=20)
+                if r.status_code == 200:
+                    role = " (በ ቅደም ተከተሉ ውስጥ)" if m in GEMINI_MODELS else " (ተጠባባቂ)"
+                    lines.append(f"  ✅ {m}{role}")
+                elif r.status_code == 404:
+                    lines.append(f"  ❌ {m} — 404 (ለቁልፍህ አይገኝም)")
+                else:
+                    lines.append(f"  ⚠️ {m} — HTTP {r.status_code}")
+            except Exception as e:
+                lines.append(f"  ⚠️ {m} — {str(e)[:50]}")
+    lines.append("\n🛟 OpenRouter Fallback: " +
+                 ("✅ ቁልፍ አለ — " + ", ".join(OPENROUTER_MODELS) if OPENROUTER_API_KEY
+                  else "❌ OPENROUTER_API_KEY አልተሞላም"))
+    lines.append(f"\n📣 Target Channel: {TARGET_CHANNEL_ID}")
+    lines.append(f"👤 Owner ID: {OWNER_ID}")
+    lines.append(f"🕒 የአዲስ አበባ ሰዓት: {addis_now().strftime('%Y-%m-%d %H:%M')}")
+    deliver(chat_id, ack_id, "\n".join(lines))
 
-if __name__ == "__main__":
-    start_health_server()
+# ----------------------------------------------------------------------------
+# Callbacks
+# ----------------------------------------------------------------------------
+@bot.callback_query_handler(func=lambda c: True)
+def on_callback(call):
+    uid = call.from_user.id
+    if not is_owner(uid):
+        try:
+            bot.answer_callback_query(call.id, "ይህ የሄኖክ የግል ቦት ነው 🔒", show_alert=True)
+        except Exception:
+            pass
+        return
+    data = call.data or ""
+    chat_id = call.message.chat.id
+    msg_id = call.message.message_id
     try:
-        bot.remove_webhook()
+        bot.answer_callback_query(call.id)
     except Exception:
         pass
 
-    log.info("Starting HENOK AI long polling")
+    try:
+        if data.startswith("cat:"):
+            _, mode, key = data.split(":", 2)
+            if key == "custom":
+                with state_lock:
+                    awaiting_topic[uid] = mode
+                bot.edit_message_text(f"✅ የመረጥከው: {CUSTOM_LABEL}", chat_id, msg_id)
+                bot.send_message(chat_id, "እሺ ሄኖክ ✍️ ርዕሱን ጻፍልኝ (ለመሰረዝ /cancel):")
+                return
+            label, topic = CATEGORIES[key]
+            bot.edit_message_text(f"✅ የመረጥከው: {label}", chat_id, msg_id)
+            if mode == "news":
+                run_news(chat_id, label, topic)
+            else:
+                run_post(chat_id, label, topic)
+
+        elif data.startswith("mk:"):
+            nid = data.split(":", 1)[1]
+            with state_lock:
+                item = news_cache.get(nid)
+            if not item:
+                bot.send_message(chat_id, "ሄኖክ፣ ይህ መረጃ ጊዜው አልፏል — /news ብለህ እንደገና ጠይቀኝ 🙏")
+                return
+            try:
+                bot.edit_message_reply_markup(chat_id, msg_id, reply_markup=None)
+            except Exception:
+                pass
+            run_post(chat_id, item["label"], item["label"], context_text=item["text"])
+
+        elif data.startswith("ok:"):
+            did = data.split(":", 1)[1]
+            with state_lock:
+                draft = drafts.pop(did, None)
+            if not draft:
+                bot.edit_message_text("⚠️ ይህ ረቂቅ ጊዜው አልፏል ወይም ቀድሞ ተስተናግዷል።", chat_id, msg_id)
+                return
+            try:
+                for chunk in split_text(draft["post"], 4000):
+                    bot.send_message(TARGET_CHANNEL_ID, chunk, disable_web_page_preview=False)
+                bot.edit_message_text(
+                    f"✅ ጸድቋል እና ወደ Henok Graphics ተለጥፏል! 🚀\n\n{draft['post'][:3500]}", chat_id, msg_id)
+            except Exception as e:
+                log.error("publish failed: %s", e)
+                with state_lock:
+                    drafts[did] = draft
+                bot.send_message(chat_id, f"መለጠፍ አልተሳካም: {str(e)[:150]}")
+
+        elif data.startswith("no:"):
+            did = data.split(":", 1)[1]
+            with state_lock:
+                drafts.pop(did, None)
+            bot.edit_message_text("❌ ተሰርዟል — ምንም አልተለጠፈም።", chat_id, msg_id)
+
+    except Exception as e:
+        log.error("callback error: %s", e)
+
+# ----------------------------------------------------------------------------
+# Free text
+# ----------------------------------------------------------------------------
+@bot.message_handler(content_types=["text"])
+@owner_only
+def handle_text(message):
+    text = (message.text or "").strip()
+    if not text or text.startswith("/"):
+        return
+    uid, chat_id = message.from_user.id, message.chat.id
+
+    with state_lock:
+        pending_mode = awaiting_topic.pop(uid, None)
+    if pending_mode:
+        label = f"✍️ {text[:40]}"
+        if pending_mode == "news":
+            run_news(chat_id, label, text)
+        else:
+            run_post(chat_id, label, text)
+        return
+
+    mode = "post" if has_any(text, POST_WORDS) else ("news" if has_any(text, NEWS_WORDS) else None)
+    if mode:
+        if len(text.split()) <= 5:
+            show_categories(chat_id, mode)
+            return
+        if mode == "news":
+            run_news(chat_id, f"✍️ {text[:40]}", text)
+        else:
+            run_post(chat_id, f"✍️ {text[:40]}", text)
+        return
+
+    ack_id = send_ack(chat_id)
+    with state_lock:
+        history = list(histories.get(uid, []))
+    grounding = has_any(text, REALTIME_WORDS)
+    reply, sources = ask_text(text, history=history, grounding=grounding)
+    body = reply
+    src = format_sources(sources)
+    if src:
+        body += "\n\n" + src
+    if reply != BUSY_TEXT:
+        remember(uid, text, reply)
+    deliver(chat_id, ack_id, body)
+
+# ----------------------------------------------------------------------------
+# Main Polling
+# ----------------------------------------------------------------------------
+def main():
+    log.info("Starting Henok Assistant agent...")
+    try:
+        bot.remove_webhook()
+    except Exception as e:
+        log.warning("remove_webhook failed: %s", e)
+    try:
+        bot.set_my_commands([
+            types.BotCommand("news", "ወቅታዊ ዜና እና ትሬንድ"),
+            types.BotCommand("post", "ፖስት ፓኬጅ + Canva Blueprint"),
+            types.BotCommand("ai_status", "የ AI ሞተር ሁኔታ"),
+            types.BotCommand("cancel", "ሰርዝ"),
+            types.BotCommand("help", "እገዛ"),
+        ])
+    except Exception as e:
+        log.warning("set_my_commands failed: %s", e)
+
+    first = True
     while True:
         try:
-            bot.infinity_polling(
-                timeout=30,
-                long_polling_timeout=25,
-                skip_pending=True,
-                allowed_updates=["message", "callback_query"],
-            )
-        except Exception as e:
-            if "409" in str(e):
-                time.sleep(5)
+            bot.infinity_polling(skip_pending=first, timeout=30, long_polling_timeout=25)
+            first = False
+        except ApiTelegramException as e:
+            first = False
+            if getattr(e, "error_code", None) == 409 or "409" in str(e):
+                log.warning("409 Conflict. Retrying in 5s...")
             else:
-                time.sleep(3)
+                log.error("Telegram API error: %s. Retrying in 5s...", e)
+            time.sleep(5)
+        except Exception as e:
+            first = False
+            if "409" in str(e):
+                log.warning("409 Conflict. Retrying in 5s...")
+            else:
+                log.error("Polling crashed: %s. Retrying in 5s...", e)
+            time.sleep(5)
+
+if __name__ == "__main__":
+    main()
