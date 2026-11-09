@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""HENOK AI — Render-hosted Telegram assistant (single long-polling worker)."""
+"""HENOK AI — Render-hosted Telegram assistant with dynamic model discovery and OpenRouter fallback."""
 import os
 import time
 import base64
@@ -19,45 +19,35 @@ log = logging.getLogger("henok-agent")
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
 
-# እውነተኛውና ፈጣኑ የ Google AI ሞዴል
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash").strip()
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "").strip()
 TARGET_CHANNEL_ID = os.getenv("TARGET_CHANNEL_ID", "-1003098019114").strip()
 OWNER_ID = os.getenv("OWNER_ID", "511440586").strip()
 MAX_BYTES = 18 * 1024 * 1024
 TEXT_LIMIT = 3900
 HTTP = requests.Session()
 
-if not TELEGRAM_BOT_TOKEN:
-    raise RuntimeError("TELEGRAM_BOT_TOKEN is missing")
-if not GEMINI_API_KEY:
-    log.warning("GEMINI_API_KEY is missing; bot will start but AI replies will fail")
-
 bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN, parse_mode=None, threaded=True)
+
+# Google በሚፈቅደው መሰረት ሞዴሎችን በራስ-ሰር ለማግኘት
+AVAILABLE_MODELS = []
 
 SYSTEM_PROMPT = """
 You are HENOK AI, Henok's personal AI assistant and creative research partner.
 LANGUAGE & TONE:
 - Reply in fluent, natural Amharic when the user writes Amharic; otherwise use the user's language.
-- Be warm, confident, energetic, engaging and human, without sounding robotic or exaggerating.
+- Be warm, confident, energetic, engaging and human.
 - Be concise for everyday questions and structured for complex tasks.
-ACCURACY:
-- Never invent facts, statistics, quotes, sources, dates or personal experiences.
-- Distinguish verified facts, estimates and uncertainty.
-- For current events, trends, prices, policies and recent developments, use web search when available and provide source links.
 CREATOR CONTEXT:
-- The only owner-confirmed account in the Account Registry is Henok Travel.
-- Henok Travel focuses on cinematic travel storytelling, local history and culture, landscapes and useful visitor context.
-- Long-form scripts should have a strong hook, narrative arc, scene-by-scene narration, visual/B-roll directions, smooth transitions and a natural call to action.
-- Keep narration separate from visual directions. Do not fabricate research.
-PUBLISHING SAFETY:
-- Never publish, post, email or distribute content externally without explicit owner approval through the approval buttons.
-- Drafting content in this chat is allowed without approval.
+- Henok Travel focuses on cinematic travel storytelling, local history, culture and landscapes.
+- Telegram Community: Henok Graphics.
+- Long-form scripts should have a strong hook, narrative arc, scene-by-scene narration and B-roll directions.
 """
 
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        body = b"HENOK AI is running"
+        body = b"HENOK AI is running 24/7"
         self.send_response(200)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
@@ -89,20 +79,81 @@ def send_text(chat_id, text, reply_markup=None, reply_to=None):
         ))
     return sent_messages
 
+# ከአንተ የ Google AI Studio ቁልፍ ጋር የሚሰሩ ሞዴሎችን በራስ-ሰር ማግኘት
+def get_available_gemini_models():
+    global AVAILABLE_MODELS
+    if AVAILABLE_MODELS:
+        return AVAILABLE_MODELS
+    if not GEMINI_API_KEY:
+        return []
+    try:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models?key={GEMINI_API_KEY}"
+        r = HTTP.get(url, timeout=15)
+        if r.ok:
+            data = r.json()
+            models = []
+            for m in data.get("models", []):
+                methods = m.get("supportedGenerationMethods", [])
+                if "generateContent" in methods:
+                    name = m["name"].replace("models/", "")
+                    models.append(name)
+            if models:
+                AVAILABLE_MODELS = models
+                log.info("Discovered available Google Gemini models: %s", models[:5])
+                return AVAILABLE_MODELS
+    except Exception as e:
+        log.warning("Could not list models: %s", e)
+    return ["gemini-1.5-flash", "gemini-2.0-flash", "gemini-3.8-flash"]
+
+def call_openrouter(messages):
+    if not OPENROUTER_API_KEY:
+        return None
+    models = ["deepseek/deepseek-chat", "meta-llama/llama-3.3-70b-instruct:free", "google/gemini-2.0-flash-exp:free"]
+    for m in models:
+        try:
+            r = HTTP.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"},
+                json={"model": m, "messages": messages},
+                timeout=25,
+            )
+            if r.status_code == 200:
+                content = r.json()["choices"][0]["message"]["content"]
+                if content:
+                    return str(content).strip()
+        except Exception:
+            continue
+    return None
+
 def gemini_generate(parts, timeout=45, use_web_search=False, system_instruction=None):
     if not GEMINI_API_KEY:
         log.error('Gemini request blocked: GEMINI_API_KEY is not configured')
         return None
-    models = list(dict.fromkeys([GEMINI_MODEL, 'gemini-1.5-flash', 'gemini-2.0-flash', 'gemini-1.5-pro']))
-    payload = {'systemInstruction': {'parts': [{'text': system_instruction or SYSTEM_PROMPT}]},
-               'contents': [{'role': 'user', 'parts': parts}]}
+
+    discovered = get_available_gemini_models()
+    candidate_models = []
+    if GEMINI_MODEL:
+        candidate_models.append(GEMINI_MODEL)
+    candidate_models.extend(discovered)
+    candidate_models.extend(["gemini-1.5-flash", "gemini-2.0-flash", "gemini-3.8-flash"])
+    models = list(dict.fromkeys(candidate_models))
+
+    payload = {
+        'systemInstruction': {'parts': [{'text': system_instruction or SYSTEM_PROMPT}]},
+        'contents': [{'role': 'user', 'parts': parts}]
+    }
     if use_web_search:
         payload['tools'] = [{'google_search': {}}]
+
     for model in models:
-        url = f'https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent'
+        url = f'https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_API_KEY}'
         try:
-            response = HTTP.post(url, headers={'Content-Type': 'application/json', 'x-goog-api-key': GEMINI_API_KEY},
-                                 json=payload, timeout=(10, timeout))
+            response = HTTP.post(
+                url,
+                headers={'Content-Type': 'application/json'},
+                json=payload,
+                timeout=(10, timeout)
+            )
             if response.ok:
                 data = response.json()
                 candidates = data.get('candidates') or []
@@ -111,7 +162,6 @@ def gemini_generate(parts, timeout=45, use_web_search=False, system_instruction=
                     parts_out = candidate.get('content', {}).get('parts', [])
                     answer = '\n'.join(p.get('text', '') for p in parts_out if p.get('text')).strip()
                     if answer:
-                        log.info('Gemini succeeded: model=%s web_search=%s', model, use_web_search)
                         if use_web_search:
                             meta = candidate.get('groundingMetadata') or {}
                             chunks = meta.get('groundingChunks') or []
@@ -126,30 +176,25 @@ def gemini_generate(parts, timeout=45, use_web_search=False, system_instruction=
                             if sources:
                                 answer += '\n\nSources:\n' + '\n'.join(sources[:6])
                         return answer
-                continue
-            if response.status_code in (400, 401, 403):
+            if response.status_code == 404:
                 continue
         except Exception:
             continue
     return None
 
-def needs_live_search(text):
-    import re
-    patterns = [
-        r'(?i)\b(today|latest|current|right now|this week|trending|breaking|recent|news|update)\b',
-        r'(ዛሬ|አሁን|በዚህ ሳምንት|ወቅታዊ|አዲስ ዜና|የዛሬ ዜና|ትሬንድ|ትሬንዲንግ|አሁናዊ|በቅርቡ የወጣ)',
-        r'(ፈልግ|በኢንተርኔት ፈልግ|ምንጭ አምጣ|ማስረጃ አምጣ)'
-    ]
-    return any(re.search(pattern, text or '') for pattern in patterns)
+def reply_ai(chat_id, text, extra_parts=None, use_search=False):
+    if extra_parts:
+        return gemini_generate(extra_parts, timeout=60)
 
-def build_script_instruction(channel, topic):
-    channel = (channel or '').strip().lower()
-    channel_name = 'Henok Travel'
-    focus = 'cinematic travel documentary: destination context, history, culture, landscapes, practical travel tips'
-    return (
-        f'Create a research-led long-form YouTube video package for {channel_name}. Topic: {topic}. Focus: {focus}. '
-        'Include title options, thumbnail concept, powerful hook, narration and visual directions. Write in natural Amharic.'
-    )
+    # ጽሑፍ ከሆነ መጀመሪያ በ Google Gemini ይሞክራል
+    ans = gemini_generate([{"text": text}], timeout=30, use_web_search=use_search)
+    if ans:
+        return ans
+
+    # ጎግል ቢዘገይ ወይም 404 ቢጥል ወዲያውኑ ወደ OpenRouter ይሸጋገራል
+    log.info("Gemini failed, falling back to OpenRouter")
+    msgs = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": text}]
+    return call_openrouter(msgs)
 
 def is_owner(message):
     return str(message.from_user.id) == OWNER_ID
@@ -157,7 +202,7 @@ def is_owner(message):
 def download_telegram_file(file_id):
     info = bot.get_file(file_id)
     if getattr(info, "file_size", 0) and info.file_size > MAX_BYTES:
-        raise ValueError("ፋይሉ ከ18MB በላይ ነው። እባክህ አጭር ፋይል ላክ።")
+        raise ValueError("ፋይሉ ከ18MB በላይ ነው።")
     data = bot.download_file(info.file_path)
     return data
 
@@ -166,8 +211,9 @@ def start_command(message):
     send_text(
         message.chat.id,
         "ሰላም ሄኖክ! 👋 HENOK AI ዝግጁ ነው።\n"
-        "ጽሑፍ፣ Voice Note፣ ፎቶ ወይም ቪዲዮ ላክልኝ።\n"
-        "ወደ Henok Graphics የሚላክ ይዘት ለማጽደቅ /publish ተጠቀም።"
+        "• በድምፅ ወይም በጽሑፍ የፈለከውን ጠይቀኝ።\n"
+        "• ሞዴሎችን ለመፈተሽ /ai_status በለኝ።\n"
+        "• ወደ Henok Graphics ይዘት ለመለጠፍ /publish ተጠቀም።"
     )
 
 @bot.message_handler(commands=["ai_status"])
@@ -175,17 +221,16 @@ def ai_status_command(message):
     if not is_owner(message):
         return
     bot.send_chat_action(message.chat.id, "typing")
-    url = f'https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent'
-    payload = {"contents": [{"role": "user", "parts": [{"text": "Reply with OK."}]}]}
-    try:
-        response = HTTP.post(url, headers={"Content-Type": "application/json", "x-goog-api-key": GEMINI_API_KEY},
-                             json=payload, timeout=(10, 20))
-        if response.ok:
-            send_text(message.chat.id, f"✅ AI STATUS: OK\nModel: {GEMINI_MODEL}\nGemini API ይሰራል!")
-        else:
-            send_text(message.chat.id, f"⚠️ AI STATUS: HTTP {response.status_code}\n{response.text[:300]}")
-    except Exception as exc:
-        send_text(message.chat.id, f"⚠️ AI STATUS: ERROR\n{str(exc)[:200]}")
+    models = get_available_gemini_models()
+    if models:
+        send_text(
+            message.chat.id,
+            f"✅ AI STATUS: OK\n\nለአንተ ቁልፍ የተፈቀዱ Google Gemini ሞዴሎች፦\n" +
+            "\n".join(f"• {m}" for m in models[:10]) +
+            "\n\n👉 ቦቱ ከእነዚህ ውስጥ አንዱን በራስ-ሰር መርጦ ይሰራል!"
+        )
+    else:
+        send_text(message.chat.id, "⚠️ Google AI Studio ሞዴሎችን ማግኘት አልተቻለም፤ GEMINI_API_KEYን ፈትሽ።")
 
 @bot.message_handler(commands=["id"])
 def id_command(message):
@@ -213,7 +258,7 @@ PENDING_POSTS = {}
 @bot.callback_query_handler(func=lambda call: call.data in ("publish:yes", "publish:no"))
 def approval_callback(call):
     if str(call.from_user.id) != OWNER_ID:
-        bot.answer_callback_query(call.id, "ይህን ማጽደቅ የሚችለው ባለቤቱ ብቻ ነው።", show_alert=True)
+        bot.answer_callback_query(call.id, "ፈቃድ የለህም።", show_alert=True)
         return
     content = PENDING_POSTS.pop(call.message.message_id, None)
     if not content:
@@ -222,7 +267,7 @@ def approval_callback(call):
     if call.data == "publish:no":
         bot.answer_callback_query(call.id, "ተሰርዟል።")
         bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
-        send_text(call.message.chat.id, "❌ ይዘቱ ተወ፤ አልተላከም።")
+        send_text(call.message.chat.id, "❌ ይዘቱ ተወ።")
         return
     try:
         bot.send_message(TARGET_CHANNEL_ID, content)
@@ -238,7 +283,8 @@ def text_handler(message):
     if not text or text.startswith("/"):
         return
     bot.send_chat_action(message.chat.id, "typing")
-    answer = gemini_generate([{"text": text}], timeout=40, use_web_search=needs_live_search(text))
+    use_search = any(w in text.lower() for w in ["ዛሬ", "ወቅታዊ", "አዲስ ዜና", "ትሬንድ", "today", "news"])
+    answer = reply_ai(message.chat.id, text, use_search=use_search)
     if answer:
         send_text(message.chat.id, answer, reply_to=message.message_id)
     else:
@@ -252,55 +298,18 @@ def voice_handler(message):
     try:
         raw = download_telegram_file(audio.file_id)
         mime = getattr(audio, "mime_type", None) or ("audio/ogg" if message.voice else "audio/mpeg")
-        prompt = "Listen to this audio. Transcribe it accurately, identify its language, then answer the speaker's actual request."
+        prompt = "Listen to this audio. Transcribe it accurately in Amharic, then answer the speaker's actual request."
         parts = [
             {"text": prompt},
             {"inlineData": {"mimeType": mime, "data": base64.b64encode(raw).decode("ascii")}},
         ]
-        answer = gemini_generate(parts, timeout=60)
+        answer = reply_ai(chat_id, "", extra_parts=parts)
         if answer:
             send_text(chat_id, answer, reply_to=message.message_id)
         else:
             send_text(chat_id, "ድምፁን ማቀናበር አልተሳካም። እባክህ በድጋሚ ላክ።", reply_to=message.message_id)
     except Exception as exc:
-        send_text(chat_id, "የድምፅ ፋይሉን ማውረድ ወይም ማንበብ አልተቻለም።")
-
-@bot.message_handler(content_types=["photo"])
-def photo_handler(message):
-    chat_id = message.chat.id
-    bot.send_chat_action(chat_id, "typing")
-    try:
-        photo = message.photo[-1]
-        raw = download_telegram_file(photo.file_id)
-        prompt = (message.caption or "Describe this image accurately in Amharic.").strip()
-        parts = [
-            {"text": prompt},
-            {"inlineData": {"mimeType": "image/jpeg", "data": base64.b64encode(raw).decode("ascii")}},
-        ]
-        answer = gemini_generate(parts, timeout=45)
-        send_text(chat_id, answer or "ምስሉን መተንተን አልተቻለም።", reply_to=message.message_id)
-    except Exception:
-        send_text(chat_id, "ፎቶውን ማቀናበር አልተቻለም።")
-
-@bot.message_handler(content_types=["video", "document"])
-def video_handler(message):
-    chat_id = message.chat.id
-    media = message.video or message.document
-    mime = getattr(media, "mime_type", None) or ("video/mp4" if message.video else "")
-    if not mime.startswith("video/"):
-        return
-    bot.send_chat_action(chat_id, "upload_video")
-    try:
-        raw = download_telegram_file(media.file_id)
-        prompt = (getattr(message, "caption", None) or "Analyze this video. Summarize the events and identify useful moments with timestamps.").strip()
-        parts = [
-            {"text": prompt},
-            {"inlineData": {"mimeType": mime, "data": base64.b64encode(raw).decode("ascii")}},
-        ]
-        answer = gemini_generate(parts, timeout=70)
-        send_text(chat_id, answer or "ቪዲዮውን መተንተን አልተቻለም።", reply_to=message.message_id)
-    except Exception:
-        send_text(chat_id, "ቪዲዮውን ማቀናበር አልተቻለም።")
+        send_text(chat_id, "የድምፅ ፋይሉን ማውረድ አልተቻለም።")
 
 if __name__ == "__main__":
     start_health_server()
@@ -309,7 +318,7 @@ if __name__ == "__main__":
     except Exception:
         pass
 
-    log.info("Starting HENOK AI long polling; model=%s", GEMINI_MODEL)
+    log.info("Starting HENOK AI long polling")
     while True:
         try:
             bot.infinity_polling(
