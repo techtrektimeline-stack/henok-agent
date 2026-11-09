@@ -7,7 +7,7 @@ Runs 24/7 on Render (Python 3). Single file.
 Required env vars:
   TELEGRAM_BOT_TOKEN, GEMINI_API_KEY, OPENROUTER_API_KEY
 Optional env vars:
-  TARGET_CHANNEL (default -1003098019114), OWNER_ID (default 511440586), PORT (default 10000)
+  TARGET_CHANNEL_ID (default -1003098019114), OWNER_ID (default 511440586), PORT (default 10000)
 
 requirements.txt:
   pyTelegramBotAPI
@@ -20,7 +20,6 @@ import os
 import re
 import sys
 import threading
-import urllib.parse
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -37,7 +36,7 @@ from telebot.apihelper import ApiTelegramException
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "").strip()
-TARGET_CHANNEL = os.environ.get("TARGET_CHANNEL", "@HenokGraphics").strip()
+TARGET_CHANNEL_ID = int(os.environ.get("TARGET_CHANNEL_ID", "-1003098019114"))
 OWNER_ID = int(os.environ.get("OWNER_ID", "511440586"))
 PORT = int(os.environ.get("PORT", "10000"))
 
@@ -46,12 +45,7 @@ GEMINI_UPLOAD = "https://generativelanguage.googleapis.com/upload/v1beta/files"
 # Resilient sequence (primary -> fallbacks). No deprecated aliases.
 GEMINI_MODELS = ["gemini-flash-latest", "gemini-2.5-flash", "gemini-pro-latest"]
 STATUS_MODELS = ["gemini-flash-latest", "gemini-pro-latest", "gemini-2.5-flash", "gemini-2.5-pro"]
-OPENROUTER_MODELS = [
-    "anthropic/claude-3.5-sonnet",
-    "openai/gpt-4o-mini",
-    "deepseek/deepseek-chat",
-    "meta-llama/llama-3.3-70b-instruct:free",
-]
+OPENROUTER_MODELS = ["deepseek/deepseek-chat", "meta-llama/llama-3.3-70b-instruct:free"]
 
 MAX_MEDIA_BYTES = 18 * 1024 * 1024      # Henok's limit for video/audio/photo
 INLINE_LIMIT_BYTES = 12 * 1024 * 1024   # above this, use Gemini Files API (inline body cap is ~20MB incl. base64)
@@ -229,11 +223,7 @@ def is_owner(user_id):
 
 def owner_only(func):
     def wrapper(message, *a, **kw):
-        chat = getattr(message, "chat", None)
-        if not chat or chat.type != "private":
-            return  # Complete silence in groups/channels
-        uid = getattr(message, "from_user", None) and message.from_user.id
-        if not is_owner(uid):
+        if not is_owner(message.from_user.id):
             try:
                 bot.reply_to(message, "ይህ የሄኖክ የግል ቦት ነው 🔒")
             except Exception:
@@ -392,37 +382,22 @@ def openrouter_generate(history, user_text, system=None):
 # ----------------------------------------------------------------------------
 def ask_text(user_text, history=None, grounding=False):
     history = history or []
-
-    # If grounding is needed, query Gemini with Google Search tool first
-    if grounding:
-        contents = [{"role": r, "parts": [{"text": t}]} for r, t in history]
-        contents.append({"role": "user", "parts": [{"text": user_text}]})
-        try:
-            text, sources, model = gemini_generate(contents, grounding=True)
-            log.info("grounded by Gemini %s", model)
-            return text, sources
-        except Exception as e:
-            log.warning("Gemini grounding failed, switching to OpenRouter: %s", e)
-
-    # For copywriting, creative thinking, and natural Amharic: prioritize Claude/GPT via OpenRouter
-    if OPENROUTER_API_KEY:
-        try:
-            text, model = openrouter_generate(history, user_text)
-            log.info("answered by OpenRouter %s", model)
-            return text, []
-        except Exception as e:
-            log.warning("OpenRouter failed, falling back to Gemini: %s", e)
-
-    # Fallback to Gemini
     contents = [{"role": r, "parts": [{"text": t}]} for r, t in history]
     contents.append({"role": "user", "parts": [{"text": user_text}]})
     try:
-        text, sources, model = gemini_generate(contents, grounding=False)
+        text, sources, model = gemini_generate(contents, grounding=grounding)
         log.info("answered by Gemini %s", model)
         return text, sources
     except Exception as e:
-        log.error("Gemini failed too: %s", e)
-
+        log.warning("Gemini path failed, switching to OpenRouter: %s", e)
+    try:
+        text, model = openrouter_generate(history, user_text)
+        log.info("answered by OpenRouter %s", model)
+        if grounding:
+            text += "\n\nℹ️ ሄኖክ፣ ይህ መልስ ከአጠቃላይ እውቀት ነው (ቀጥታ የድር ፍለጋ በዚህ ጊዜ አልተቻለም) — ወሳኝ ቁጥሮችን ከምንጭ ማረጋገጥ ጥሩ ነው።"
+        return text, []
+    except Exception as e:
+        log.error("OpenRouter path failed too: %s", e)
     return BUSY_TEXT, []
 
 
@@ -437,15 +412,6 @@ def remember(user_id, user_text, reply):
 # ----------------------------------------------------------------------------
 # Interactive categories (inline buttons)
 # ----------------------------------------------------------------------------
-
-def make_pollinations_url(prompt_en):
-    clean = re.sub(r"[^\w\s,-]", "", prompt_en).strip()
-    if not clean:
-        clean = "modern high-tech digital art 3d render clean minimalist"
-    encoded = urllib.parse.quote(clean[:300])
-    seed = int(time.time())
-    return f"https://image.pollinations.ai/prompt/{encoded}?width=1080&height=1080&nologo=true&seed={seed}"
-
 def category_keyboard(mode):
     kb = types.InlineKeyboardMarkup(row_width=2)
     kb.add(
@@ -469,9 +435,8 @@ def show_categories(chat_id, mode):
 # ----------------------------------------------------------------------------
 # News + Post engines
 # ----------------------------------------------------------------------------
-def run_news(chat_id, label, topic, start_time=None):
-    start_time = start_time or time.time()
-    ack_id = send_ack(chat_id, "⏳ ሄኖክ፣ ወቅታዊ መረጃዎችን ከ Google Search እያሰባሰብኩ ነው (ከ10-15 ሰከንድ ይወስዳል)...")
+def run_news(chat_id, label, topic):
+    ack_id = send_ack(chat_id)
     prompt = (
         f"ርዕስ/ዘርፍ: {topic}\n\n"
         "Use live Google Search to find the most important, VERIFIED developments from the last few days "
@@ -493,30 +458,25 @@ def run_news(chat_id, label, topic, start_time=None):
         prune(news_cache)
         markup = types.InlineKeyboardMarkup()
         markup.add(types.InlineKeyboardButton("📝 ከዚህ ፖስት ፍጠርልኝ", callback_data=f"mk:{nid}"))
-        elapsed = int(time.time() - start_time)
-    body += f"\n\n⏱ የፈጀበት ጊዜ: {elapsed} ሰከንድ"
     deliver(chat_id, ack_id, body, markup)
 
 
 POST_FORMAT = (
     "Return EXACTLY this structure and nothing before ===POST===:\n"
     "===POST===\n"
-    "(The ready-to-publish Telegram post for the 'Henok Graphics' community of video editors, motion "
-    "designers and creators: 1) 🔥 Catchy Hook line, 2) Structured body copy in natural, flawless modern Amharic, "
-    "3) Clear Actionable CTA, 4) 5-8 relevant Hashtags. Plain text, no markdown symbols like ** or ##.)\n"
-    "===IMAGE_PROMPT===\n"
-    "(A standalone, highly detailed English prompt describing a cinematic, clean, modern commercial marketing visual or 3D digital illustration representing this exact topic for image generation. Do NOT include text on the image; focus on visual aesthetics, lighting, render style, 8k resolution.)\n"
+    "(the ready-to-publish Telegram post for the 'Henok Graphics' community of video editors, motion "
+    "designers and creators: 1) 🔥 Catchy Hook line, 2) Structured body copy with short lines/bullets, "
+    "3) CTA, 4) 5-8 relevant Hashtags. Plain text, no markdown symbols.)\n"
     "===CANVA===\n"
     "🎨 Canva Design Blueprint:\n"
-    "• Color palette: 3-4 HEX codes with role of each\n"
+    "• Color palette: 3-4 HEX codes with role of each (background / accent / text)\n"
     "• Bold overlay hook text (max 6 words)\n"
-    "• Visual composition: layout, focal point, fonts feel\n"
+    "• Visual composition: layout, focal point, fonts feel, what image/element goes where\n"
 )
 
 
-def run_post(chat_id, label, topic, context_text=None, start_time=None):
-    start_time = start_time or time.time()
-    ack_id = send_ack(chat_id, "⏳ ሄኖክ፣ ጥናቱን አድርጌ ፖስቱን እና AI ምስሉን እያዘጋጀሁ ነው (ከ20-30 ሰከንድ ይወስዳል)...")
+def run_post(chat_id, label, topic, context_text=None):
+    ack_id = send_ack(chat_id)
     prompt = f"Create a full social post package about: {topic}\n"
     if context_text:
         prompt += f"\nUse these verified insights as the base:\n{context_text}\n"
@@ -525,57 +485,31 @@ def run_post(chat_id, label, topic, context_text=None, start_time=None):
     if text == BUSY_TEXT:
         deliver(chat_id, ack_id, text)
         return
-
-    m_post = re.search(r"===POST===\s*(.*?)\s*(?:===IMAGE_PROMPT===|===CANVA===|\Z)", text, re.S)
-    m_img = re.search(r"===IMAGE_PROMPT===\s*(.*?)\s*(?:===CANVA===|\Z)", text, re.S)
-    m_canva = re.search(r"===CANVA===\s*(.*)\Z", text, re.S)
-
-    post = m_post.group(1).strip() if m_post else text.strip()
-    img_prompt = m_img.group(1).strip() if m_img else f"modern cinematic digital render representing {topic}"
-    canva = m_canva.group(1).strip() if m_canva else ""
-
-    image_url = make_pollinations_url(img_prompt)
-
+    m = re.search(r"===POST===\s*(.*?)\s*(?:===CANVA===\s*(.*))?\Z", text, re.S)
+    if m:
+        post, canva = m.group(1).strip(), (m.group(2) or "").strip()
+    else:
+        post, canva = text.strip(), ""
+    if not post:
+        post = text.strip()
     did = uuid.uuid4().hex[:10]
     with state_lock:
-        drafts[did] = {
-            "post": post,
-            "image_url": image_url,
-            "canva": canva,
-            "ts": time.time(),
-        }
+        drafts[did] = {"post": post, "ts": time.time()}
     prune(drafts)
-
-    elapsed = int(time.time() - start_time)
-
     preview = f"📝 የፖስት ረቂቅ — {label}\n━━━━━━━━━━━━\n{post}"
     if canva:
         preview += f"\n\n━━━━━━━━━━━━\n{canva}"
     src = format_sources(sources)
     if src:
         preview += f"\n\n{src}"
-
-    preview += f"\n\n⏱ የፈጀበት ጊዜ: {elapsed} ሰከንድ"
-    preview += (
-        f"\n\n━━━━━━━━━━━━\n🔒 ወደ {TARGET_CHANNEL} የሚላከው ከላይ ያለው ፖስት እና ከታች ያለው AI ምስል ነው (Canva Blueprint አይላክም)። "
-        "አንተ ካላጸደቅክ ምንም አይወጣም።"
-    )
-
+    preview += ("\n\n━━━━━━━━━━━━\n🔒 ወደ Henok Graphics የሚላከው ከላይ ያለው ፖስት ብቻ ነው (Canva Blueprint አይላክም)። "
+                "አንተ ካላጸደቅክ ምንም አይወጣም።")
     kb = types.InlineKeyboardMarkup()
     kb.add(
         types.InlineKeyboardButton("✅ አጽድቅና ፖስት አድርግ", callback_data=f"ok:{did}"),
         types.InlineKeyboardButton("❌ ሰርዝ", callback_data=f"no:{did}"),
     )
     deliver(chat_id, ack_id, preview, kb)
-
-    try:
-        bot.send_photo(
-            chat_id,
-            photo=image_url,
-            caption=f"🎨 ለዚህ ፖስት የተዘጋጀ AI ምስል ({label})\nበማጽደቂያው ቁልፍ ስታጸድቅ ይህ ምስል ከነፖስቱ ይለጠፋል።",
-        )
-    except Exception as e:
-        log.warning("failed to send photo preview: %s", e)
 
 
 # ----------------------------------------------------------------------------
@@ -772,7 +706,7 @@ def cmd_ai_status(message):
     lines.append("\n🛟 OpenRouter Fallback: " +
                  ("✅ ቁልፍ አለ — " + ", ".join(OPENROUTER_MODELS) if OPENROUTER_API_KEY
                   else "❌ OPENROUTER_API_KEY አልተሞላም"))
-    lines.append(f"\n📣 Target Channel: {TARGET_CHANNEL}")
+    lines.append(f"\n📣 Target Channel: {TARGET_CHANNEL_ID}")
     lines.append(f"👤 Owner ID: {OWNER_ID}")
     lines.append(f"🕒 የአዲስ አበባ ሰዓት: {addis_now().strftime('%Y-%m-%d %H:%M')}")
     deliver(chat_id, ack_id, "\n".join(lines))
@@ -783,9 +717,6 @@ def cmd_ai_status(message):
 # ----------------------------------------------------------------------------
 @bot.callback_query_handler(func=lambda c: True)
 def on_callback(call):
-    chat = getattr(call.message, "chat", None)
-    if not chat or chat.type != "private":
-        return
     uid = call.from_user.id
     if not is_owner(uid):
         try:
@@ -833,44 +764,23 @@ def on_callback(call):
         elif data.startswith("ok:"):
             did = data.split(":", 1)[1]
             with state_lock:
-                draft = drafts.pop(did, None)
+                draft = drafts.pop(did, None)   # pop => cannot be double-posted
             if not draft:
                 bot.edit_message_text("⚠️ ይህ ረቂቅ ጊዜው አልፏል ወይም ቀድሞ ተስተናግዷል።", chat_id, msg_id)
                 return
-
             try:
-                post_text = draft["post"]
-                image_url = draft.get("image_url")
-
-                posted_photo = False
-                if image_url:
-                    try:
-                        bot.send_photo(TARGET_CHANNEL, photo=image_url, caption=post_text[:1024])
-                        posted_photo = True
-                        if len(post_text) > 1024:
-                            for chunk in split_text(post_text[1024:], 4000):
-                                bot.send_message(TARGET_CHANNEL, chunk, disable_web_page_preview=False)
-                    except Exception as pe:
-                        log.warning("send_photo failed, falling back to text: %s", pe)
-
-                if not posted_photo:
-                    for chunk in split_text(post_text, 4000):
-                        bot.send_message(TARGET_CHANNEL, chunk, disable_web_page_preview=False)
-
+                for chunk in split_text(draft["post"], 4000):
+                    bot.send_message(TARGET_CHANNEL_ID, chunk, disable_web_page_preview=False)
                 bot.edit_message_text(
-                    f"✅ ጸድቋል እና ወደ {TARGET_CHANNEL} ተለጥፏል! 🚀\n\n{post_text[:3000]}",
-                    chat_id,
-                    msg_id,
-                )
+                    f"✅ ጸድቋል እና ወደ Henok Graphics ተለጥፏል! 🚀\n\n{draft['post'][:3500]}", chat_id, msg_id)
             except Exception as e:
                 log.error("publish failed: %s", e)
                 with state_lock:
-                    drafts[did] = draft
+                    drafts[did] = draft  # restore so Henok can retry
                 bot.send_message(
                     chat_id,
-                    f"ሄኖክ፣ መለጠፍ አልተሳካም 😕 ቦቱ የ {TARGET_CHANNEL} አድሚን መሆኑን እና 'Post Messages' "
-                    f"ፈቃድ እንዳለው አረጋግጥ።\nዝርዝር: {str(e)[:150]}\nበድጋሚ ✅ ን መንካት ትችላለህ።",
-                )
+                    "ሄኖክ፣ መለጠፍ አልተሳካም 😕 ቦቱ የ Henok Graphics አድሚን መሆኑን እና 'Post Messages' "
+                    f"ፈቃድ እንዳለው አረጋግጥ።\nዝርዝር: {str(e)[:150]}\nበድጋሚ ✅ ን መንካት ትችላለህ።")
 
         elif data.startswith("no:"):
             did = data.split(":", 1)[1]
