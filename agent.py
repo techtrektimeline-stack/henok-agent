@@ -12,7 +12,7 @@ Facebook : FB_PAGE_ACCESS_TOKEN  (Page access token with pages_manage_posts, pag
            FB_API_VERSION        (default v25.0)
 Optional : OWNER_ID              (default 511440586)
            TARGET_CHANNEL        (default @HenokGraphics)
-           OPENROUTER_MODELS     (comma list; default anthropic/claude-3.5-sonnet,deepseek/deepseek-chat,openai/gpt-4o-mini)
+           OPENROUTER_MODELS     (comma list; default deepseek/deepseek-chat,openai/gpt-4o-mini,anthropic/claude-3.5-sonnet)
            FONT_PATH             (path to an Ethiopic .ttf; otherwise auto-detected / downloaded, see find_ethiopic_font)
            PORT                  (default 10000)
            RENDER_EXTERNAL_URL   (set automatically by Render; enables self keep-alive)
@@ -100,7 +100,7 @@ TARGET_CHANNEL = normalize_channel(os.environ.get("TARGET_CHANNEL", "@HenokGraph
 
 OPENROUTER_MODELS = [m.strip() for m in os.environ.get(
     "OPENROUTER_MODELS",
-    "anthropic/claude-3-5-sonnet,deepseek/deepseek-chat,openai/gpt-4o-mini,anthropic/claude-3.5-haiku").split(",") if m.strip()]
+    "deepseek/deepseek-chat,openai/gpt-4o-mini,anthropic/claude-3.5-sonnet").split(",") if m.strip()]
 OPENROUTER_URL = "https://openrouter.ai/api/v1"
 
 GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta"
@@ -1205,7 +1205,7 @@ def fb_analytics_text():
         return "⚪ ፌስቡክ አልተዋቀረም — በ Render ላይ FB_PAGE_ACCESS_TOKEN ጨምር።"
     lines = [f"📊 {FB_PAGE_NAME} — Facebook Analytics", "━━━━━━━━━━━━"]
     try:
-        info = _fb_request("GET", FB_PAGE_ID, params={"fields": "name,id"}, timeout=40)
+        info = _fb_request("GET", "me", params={"fields": "name,id"}, timeout=40)
         followers = info.get("followers_count", info.get("fan_count"))
         lines.append(f"📄 ገጽ: {info.get('name', FB_PAGE_NAME)}")
         lines.append(f"👥 ተከታዮች: {followers:,}" if isinstance(followers, int) else "👥 ተከታዮች: —")
@@ -1258,9 +1258,9 @@ def run_post(chat_id, label, topic, context_text=None, context_sources=None):
         else:
             facts, sources = research(topic)
         if not facts:
-            facts = f"Current industry developments, updates and opportunities regarding {topic}."
+            facts = f"Major verified industry news, updates and strategic developments concerning {topic}."
             if not sources:
-                sources = [("Sekela Editorial Insights", "https://t.me/HenokGraphics")]
+                sources = [("ሰከላ ኒውስ (Sekela News)", "https://facebook.com/1252817724577069")]
         brief = SEKELA_BRIEF.replace("{topic}", topic).replace("{facts}", facts)
         text, _ = llm_write(brief, max_tokens=2600)
         if not text:
@@ -1691,8 +1691,8 @@ def _fb_status_lines():
     if not FB_PAGE_ACCESS_TOKEN:
         return lines + ["  ⚪ FB_PAGE_ACCESS_TOKEN አልተሞላም — ወደ ፌስቡክ አይለጠፍም"]
     try:
-        info = _fb_request("GET", FB_PAGE_ID, params={"fields": "name,id"}, timeout=30)
-        lines.append(f"  ✅ ተገናኝቷል: {info.get('name')} — ተከታዮች {info.get('followers_count', '—')}")
+        info = _fb_request("GET", "me", params={"fields": "name,id"}, timeout=30)
+        lines.append(f"  ✅ ተገናኝቷል: {info.get('name')} (id: {info.get('id')})")
     except FBError as e:
         lines.append(f"  ❌ {short_reason(e, 140)}")
         if fb_error_hint(e):
