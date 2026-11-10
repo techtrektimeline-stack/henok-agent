@@ -1,53 +1,71 @@
 # -*- coding: utf-8 -*-
 """
-agent.py  -  Henok's personal Telegram command cockpit (@HenokAssistantBot)
+agent.py  -  Henok's personal Telegram command cockpit (@HenokAssistantBot) + Sekela News publisher
 
 Runs 24/7 on Render (Python 3 + pyTelegramBotAPI). Single file.
 
 Environment variables
 ---------------------
 Required : TELEGRAM_BOT_TOKEN, OPENROUTER_API_KEY, GEMINI_API_KEY
-Optional : OWNER_ID            (default 511440586)
-           TARGET_CHANNEL      (default @HenokGraphics)
-           OPENROUTER_MODELS   (comma list, default: anthropic/claude-3.5-sonnet,
-                                deepseek/deepseek-chat, openai/gpt-4o-mini)
-           PORT                (default 10000)
-           RENDER_EXTERNAL_URL (set automatically by Render; used for self keep-alive)
+Facebook : FB_PAGE_ACCESS_TOKEN  (Page access token with pages_manage_posts, pages_read_engagement, read_insights)
+           FB_PAGE_ID            (default 1252817724577069)
+           FB_API_VERSION        (default v25.0)
+Optional : OWNER_ID              (default 511440586)
+           TARGET_CHANNEL        (default @HenokGraphics)
+           OPENROUTER_MODELS     (comma list; default anthropic/claude-3.5-sonnet,deepseek/deepseek-chat,openai/gpt-4o-mini)
+           FONT_PATH             (path to an Ethiopic .ttf; otherwise auto-detected / downloaded, see find_ethiopic_font)
+           PORT                  (default 10000)
+           RENDER_EXTERNAL_URL   (set automatically by Render; enables self keep-alive)
 
 requirements.txt
 ----------------
 pyTelegramBotAPI
 requests
+Pillow
 
-Architecture in one paragraph
------------------------------
-Writing (chat, news, posts, polishing) goes OpenRouter-first (Claude -> DeepSeek -> GPT-4o-mini) because
-Gemini's Amharic is weaker, and falls back to Gemini when OpenRouter is unreachable / out of credits.
-Live web facts always come from Gemini + Google Search grounding (English research notes), which the
-OpenRouter writer then turns into native Amharic. Audio/video analysis is Gemini-only (multimodal), and the
-Amharic analysis text is polished through OpenRouter when available.
-The bot talks ONLY in a private 1-on-1 chat with the owner. In groups/channels it is silent; its only
-group/channel capability is publishing posts that the owner approved with the button.
+Architecture
+------------
+* Writing (chat, news, posts, audio summaries, polishing): OpenRouter first (Claude -> DeepSeek -> GPT-4o-mini),
+  Gemini as fallback when OpenRouter is unreachable / out of credits.
+* Research: Gemini + Google Search grounding (English notes, preferring BBC Amharic, Reuters, AP, Fana, DW Amharic,
+  Al Ain...), which the writer turns into Amharic. No verified research -> no news post is drafted.
+* Voice notes: Gemini only TRANSCRIBES (long-audio safe); the summary / action items are written by the OpenRouter
+  writer straight from the transcript, so the Amharic is native and one failure cannot lose the transcript.
+* Sekela News card: AI background (Pollinations, no text) + headline, gradient and brand badge composed locally with
+  Pillow, because image generators cannot render Amharic lettering reliably.
+* Publishing: ONLY after Henok taps the approval button -> Telegram channel, then the Facebook Page.
+* STRICT NO-COMMENTING POLICY: the Facebook layer can only POST to /photos and /feed and READ page info, insights and
+  post counters. Any path containing "comment" is refused in code (see _fb_request). The bot never replies to comments.
+* The bot talks ONLY in a private chat with the owner; in groups/channels it is silent.
 """
 
 import base64
+import copy
 import functools
+import glob
 import io
 import logging
 import os
 import re
 import sys
+import tempfile
 import threading
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 import requests
 import telebot
-from telebot import types
+from telebot import apihelper, types
 from telebot.apihelper import ApiTelegramException
+
+try:  # Pillow is optional: without it the bot still works, just without the composed headline card
+    from PIL import Image, ImageDraw, ImageEnhance, ImageFont
+    PIL_OK = True
+except Exception:  # pragma: no cover
+    PIL_OK = False
 
 # ----------------------------------------------------------------------------
 # Config
@@ -58,6 +76,12 @@ OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "").strip()
 OWNER_ID = int(os.environ.get("OWNER_ID", "511440586"))
 PORT = int(os.environ.get("PORT", "10000"))
 RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "").strip()
+
+FB_PAGE_ID = os.environ.get("FB_PAGE_ID", "1252817724577069").strip()
+FB_PAGE_ACCESS_TOKEN = os.environ.get("FB_PAGE_ACCESS_TOKEN", "").strip()
+FB_API_VERSION = os.environ.get("FB_API_VERSION", "v25.0").strip()
+FB_GRAPH = f"https://graph.facebook.com/{FB_API_VERSION}"
+FB_PAGE_NAME = "ሰከላ Sekela"
 
 
 def normalize_channel(value):
@@ -83,11 +107,16 @@ GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta"
 GEMINI_UPLOAD = "https://generativelanguage.googleapis.com/upload/v1beta/files"
 GEMINI_MODELS = ["gemini-flash-latest", "gemini-pro-latest", "gemini-2.5-flash"]
 STATUS_GEMINI_MODELS = ["gemini-flash-latest", "gemini-pro-latest", "gemini-2.5-flash", "gemini-2.5-pro"]
+GEMINI_TIMEOUT = 180
 
 MAX_MEDIA_BYTES = 18 * 1024 * 1024
 INLINE_LIMIT_BYTES = 12 * 1024 * 1024
 MAX_HISTORY_TURNS = 8
 CAPTION_LIMIT = 1024  # Telegram photo-caption hard limit
+
+BRAND_TAGS = ["#ሰከላ_ኒውስ", "#SekelaNews", "#HenokGraphics"]
+BRAND_RED = (214, 40, 40)
+AI_LABEL = True  # small "AI illustration" tag on cards (the background is generated, not a real photo)
 
 BUSY_TEXT = ("ሄኖክ፣ አሁን መስመሮቹ ለአፍታ ተጨናንቀዋል 😅 መልእክትህ አልጠፋም — "
              "ከ1 ደቂቃ በኋላ ደግመህ ላክልኝ፣ ወዲያውኑ እመልሳለሁ።")
@@ -157,8 +186,8 @@ bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN or "000000:MISSING", parse_mode=None, t
 state_lock = threading.Lock()
 histories = {}        # user_id -> [(role, text)]
 awaiting_topic = {}   # user_id -> "news" | "post"
-drafts = {}           # draft_id -> {"post": str, "file_id": str|None, "ts": float}
-news_cache = {}       # news_id -> {"label": str, "text": str, "ts": float}
+drafts = {}           # draft_id -> draft dict (see run_post)
+news_cache = {}       # news_id -> {"label","text","sources","ts"}
 
 CATEGORIES = {
     "ai": ("🤖 AI እና ቴክኖሎጂ", "AI & Technology"),
@@ -176,8 +205,23 @@ REALTIME_WORDS = ["ዛሬ", "አሁን", "ዋጋ", "ምንዛሬ", "ዜና", "�
 
 GREET_FIRST_WORDS = {"hi", "hello", "hey", "selam", "salam", "ሰላም", "ታዲያስ", "ጤና"}
 GREET_PHRASES = {"good morning", "good afternoon", "good evening", "እንዴት ነህ", "እንደምን ነህ",
-                 "ጤና ይስጥልኝ", "ሰላም ነው", "እንዴት ነው", "ደህና ነህ"}
+                 "ጤና ይስጥልኝ", "ሰላም ነው", "እንዴት ነው", "ደህና ነህ", "እንዴት አለህ"}
 THANKS_PHRASES = {"thanks", "thank you", "thx", "አመሰግናለሁ", "እናመሰግናለን", "ok", "okay", "እሺ", "ጥሩ"}
+
+# Top-tier outlets recognised for the mandatory "ምንጭ፡" line: (display name, regex)
+OUTLETS = [
+    ("BBC Amharic", r"bbc\s*amharic|bbc\.com/amharic|amharic\.bbc"),
+    ("BBC", r"\bbbc\b"),
+    ("Reuters", r"reuters"),
+    ("AP", r"\bap\b|associated press|apnews"),
+    ("Fana (ፋና)", r"\bfana\b|fanabc|ፋና|\bfbc\b"),
+    ("DW Amharic", r"dw\s*amharic|dw\.com/am"),
+    ("DW", r"\bdw\b|dw\.com|deutsche welle"),
+    ("Al Ain", r"al[\s\-]*ain"),
+    ("AFP", r"\bafp\b"),
+    ("Bloomberg", r"bloomberg"),
+    ("Al Jazeera", r"al[\s\-]*jazeera"),
+]
 
 
 # ----------------------------------------------------------------------------
@@ -193,12 +237,12 @@ def system_prompt():
         "You are the personal AI chief-of-staff of ሄኖክ (Henok Habtamu), a digital marketer, video producer "
         "and creator in Addis Ababa, Ethiopia. You live inside his private Telegram bot.\n"
         f"Current Addis Ababa time: {t}.\n\n"
-        "BRAND CONTEXT: YouTube 'Henok Travel' (cinematic Ethiopian travel documentaries); community "
-        "'Henok Graphics' (@HenokGraphics: video editors, motion designers, creators); commerce: Whop viral "
-        "clipping campaigns, Amazon KDP, Ye-buna (የቡና), Sekela Marketing. Content pillars: AI & Tech, Crypto & "
-        "Markets, Economy & Business, Video Creation & Editing.\n\n"
+        "BRAND CONTEXT: news brand 'ሰከላ ኒውስ (Sekela News)' on Facebook (ሰከላ Sekela page) and Telegram; YouTube "
+        "'Henok Travel'; community 'Henok Graphics' (@HenokGraphics: video editors, motion designers, creators); "
+        "commerce: Whop viral clipping campaigns, Amazon KDP, Ye-buna (የቡና), Sekela Marketing. Content pillars: AI & "
+        "Tech, Crypto & Markets, Economy & Business, Video Creation & Editing.\n\n"
         "AMHARIC QUALITY GUARDRAIL (strict, highest priority):\n"
-        "- Write natural, native, modern Amharic exactly as a creative marketer in Addis Ababa writes it. "
+        "- Write natural, native, modern Amharic exactly as a creative marketer / news editor in Addis Ababa writes it. "
         "Think in Amharic; never translate English word-for-word. No robotic, textbook or machine-translated phrasing.\n"
         "- Use correct Ethiopic script and punctuation (። ፣ ፡). Every Amharic word must be a real, correctly "
         "spelled word. If you are not sure of an Amharic word, use the common English term in Latin letters instead "
@@ -209,8 +253,8 @@ def system_prompt():
         "Never use 'we' forms (እናደርጋለን, እናዘጋጃለን) for yourself. Address Henok in the second person masculine "
         "singular, warm and respectful (አንተ; ታደርጋለህ, ትችላለህ, ላክልኝ, ልርዳህ). Never mix with እርስዎ or plural "
         "forms when talking to him.\n"
-        "- For public community posts, choose ONE consistent voice for the whole post (second person plural: "
-        "እናንተ, ታደርጋላችሁ, ትችላላችሁ) and never switch between singular/plural or between እኛ/አንተ inside one text.\n"
+        "- For public posts, choose ONE consistent voice for the whole post and never switch between singular/plural "
+        "or between እኛ/አንተ inside one text.\n"
         "- Address him warmly as 'ሄኖክ'. Be punchy, practical and specific. No clinical essays, no repeated apologies, "
         "no filler.\n"
         "- Telegram plain text: do NOT use markdown symbols (no **, no ##, no backticks, no tables). Use emojis, short "
@@ -239,7 +283,7 @@ def split_text(text, limit=3900):
 
 
 def clean_md(text):
-    """Strip markdown the models sometimes add; Telegram messages here are plain text."""
+    """Strip markdown the models sometimes add; messages here are plain text."""
     text = text or ""
     text = text.replace("**", "").replace("__", "").replace("`", "")
     text = re.sub(r"(?m)^\s{0,3}#{1,6}\s+", "", text)
@@ -289,7 +333,7 @@ def greeting_reply():
         g = "እንደምን ዋልክ ሄኖክ! 👋"
     else:
         g = "እንደምን አመሸህ ሄኖክ! 🌙"
-    return g + "\nዛሬ ምን ላግዝህ? 📰 /news · 📝 /post ወይም ማንኛውንም ነገር ጻፍልኝ።"
+    return g + "\nዛሬ ምን ላግዝህ? 📰 /news · 📝 /post · 📊 /analytics ወይም ማንኛውንም ነገር ጻፍልኝ።"
 
 
 def format_sources(sources, limit=6):
@@ -301,7 +345,7 @@ def format_sources(sources, limit=6):
     return "\n".join(lines)
 
 
-def prune(store, max_items=40):
+def prune(store, max_items=25):
     with state_lock:
         if len(store) > max_items:
             for k in sorted(store, key=lambda k: store[k].get("ts", 0))[: len(store) - max_items]:
@@ -339,6 +383,14 @@ def drop_message(chat_id, message_id):
         bot.delete_message(chat_id, message_id)
     except Exception:
         pass
+
+
+def short_reason(e, limit=140):
+    s = re.sub(r"\s+", " ", str(e))
+    for secret in (FB_PAGE_ACCESS_TOKEN, GEMINI_API_KEY, OPENROUTER_API_KEY, TELEGRAM_BOT_TOKEN):
+        if secret:
+            s = s.replace(secret, "***")
+    return s[:limit]
 
 
 class Typing:
@@ -399,15 +451,15 @@ class GeminiError(Exception):
     pass
 
 
-def _gemini_call(model, payload):
+def _gemini_call(model, payload, retries=3, timeout=GEMINI_TIMEOUT):
     url = f"{GEMINI_BASE}/models/{model}:generateContent"
     headers = {"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"}
-    for attempt in range(2):
-        r = requests.post(url, headers=headers, json=payload, timeout=180)
+    for attempt in range(1, retries + 1):
+        r = requests.post(url, headers=headers, json=payload, timeout=timeout)
         if r.status_code == 200:
             return r.json()
-        if r.status_code in (429, 500, 502, 503, 504) and attempt == 0:
-            time.sleep(2)
+        if r.status_code in (429, 500, 502, 503, 504) and attempt < retries:
+            time.sleep(2 * attempt)
             continue
         raise GeminiError(f"{model} HTTP {r.status_code}: {r.text[:200]}")
     raise GeminiError(f"{model}: exhausted retries")
@@ -422,6 +474,8 @@ def _extract(data):
     text = "".join(p.get("text", "") for p in parts if not p.get("thought")).strip()
     if not text:
         raise GeminiError(f"empty text (finish={cand.get('finishReason')})")
+    if cand.get("finishReason") == "MAX_TOKENS":
+        log.warning("Gemini output hit MAX_TOKENS (text kept, may be truncated)")
     sources, seen = [], set()
     for ch in (cand.get("groundingMetadata") or {}).get("groundingChunks") or []:
         web = ch.get("web") or {}
@@ -453,20 +507,24 @@ def gemini_generate(contents, system=None, grounding=False, temperature=0.8, max
     raise GeminiError(f"all Gemini models failed: {last_err}")
 
 
+RESEARCH_PROMPT = (
+    "Topic: {topic}\n\n"
+    "Search the web and return concise ENGLISH research notes (max 320 words) with the most important, verified, "
+    "recent facts about this topic: concrete numbers, dates, names, what changed and why it matters. "
+    "Prefer reporting from top-tier outlets such as BBC Amharic, Reuters, AP, Fana, DW Amharic and Al Ain (or "
+    "equally reputable international/business media); ignore rumours, anonymous blogs and unverified social posts. "
+    "Bullet points only. After EACH fact put the outlet name in brackets, e.g. [Reuters]. Do not write Amharic. "
+    "Do not invent anything; if you cannot verify something, leave it out."
+)
+
+
 def research(topic):
     """Live web facts via Gemini + Google Search. Returns (English notes, sources); ("", []) on failure."""
-    prompt = (
-        f"Topic: {topic}\n\n"
-        "Search the web and return concise ENGLISH research notes (max 300 words) with the most important, "
-        "verified, recent facts about this topic: concrete numbers, dates, names, what changed and why it "
-        "matters. Bullet points only. Mention the source name in brackets after each fact. Do not write Amharic. "
-        "Do not invent anything; if you cannot verify something, leave it out."
-    )
     try:
         text, sources, model = gemini_generate(
-            [{"role": "user", "parts": [{"text": prompt}]}],
-            system="You are a precise web research assistant. Output plain text bullet notes in English only.",
-            grounding=True, temperature=0.3, max_tokens=2048)
+            [{"role": "user", "parts": [{"text": RESEARCH_PROMPT.replace("{topic}", topic)}]}],
+            system="You are a precise news research assistant. Output plain-text English bullet notes only.",
+            grounding=True, temperature=0.3, max_tokens=4096)
         log.info("research done by Gemini %s (%d sources)", model, len(sources))
         return clean_md(text), sources
     except Exception as e:
@@ -515,22 +573,33 @@ def gemini_upload_file(data, mime, display_name):
     return uri
 
 
-def multimodal_generate(parts):
+def multimodal_generate(parts, temperature=0.4, max_tokens=24000, thinking_budget=None):
+    """Audio/video/image analysis. Large output budget (long Amharic transcripts need many tokens) and an optional
+    thinking budget so 'thinking' cannot eat the whole output. If a model rejects the thinking config (HTTP 400),
+    that model is retried once without it."""
     if not GEMINI_API_KEY:
         raise GeminiError("GEMINI_API_KEY missing")
-    payload = {
+    base = {
         "systemInstruction": {"parts": [{"text": system_prompt()}]},
         "contents": [{"role": "user", "parts": parts}],
-        "generationConfig": {"temperature": 0.5, "maxOutputTokens": 8192},
+        "generationConfig": {"temperature": temperature, "maxOutputTokens": max_tokens},
     }
     last_err = None
     for model in GEMINI_MODELS:
-        try:
-            text, _ = _extract(_gemini_call(model, payload))
-            return text
-        except Exception as e:
-            last_err = e
-            log.warning("Multimodal model failed: %s", e)
+        variants = [True, False] if thinking_budget is not None else [False]
+        for with_thinking in variants:
+            payload = copy.deepcopy(base)
+            if with_thinking:
+                payload["generationConfig"]["thinkingConfig"] = {"thinkingBudget": thinking_budget}
+            try:
+                text, _ = _extract(_gemini_call(model, payload))
+                return text
+            except Exception as e:
+                last_err = e
+                log.warning("Multimodal %s (thinking=%s) failed: %s", model, with_thinking, e)
+                if with_thinking and "HTTP 400" in str(e):
+                    continue  # model does not accept this thinking config -> retry same model without it
+                break
     raise GeminiError(f"all models failed for media: {last_err}")
 
 
@@ -554,7 +623,7 @@ def openrouter_chat(messages, max_tokens=1800, temperature=0.8):
                 },
                 json={"model": model, "messages": messages, "temperature": temperature,
                       "max_tokens": max_tokens},
-                timeout=120,
+                timeout=150,
             )
             if r.status_code in (401, 402):
                 log.warning("OpenRouter %s (key/credits problem) - switching to Gemini", r.status_code)
@@ -572,7 +641,8 @@ def openrouter_chat(messages, max_tokens=1800, temperature=0.8):
 
 
 def llm_write(user_text, history=None, system=None, allow_gemini=True, max_tokens=1800, temperature=0.8):
-    """Writer used for chat, news, posts: OpenRouter first, Gemini fallback. Returns (text, engine) or (None, None)."""
+    """Writer used for chat, news, posts, summaries: OpenRouter first, Gemini fallback.
+    Returns (text, engine) or (None, None)."""
     history = history or []
     sys_prompt = system or system_prompt()
     messages = [{"role": "system", "content": sys_prompt}]
@@ -587,7 +657,8 @@ def llm_write(user_text, history=None, system=None, allow_gemini=True, max_token
         contents = [{"role": r, "parts": [{"text": t}]} for r, t in history]
         contents.append({"role": "user", "parts": [{"text": user_text}]})
         try:
-            text, _, gmodel = gemini_generate(contents, system=sys_prompt, temperature=temperature)
+            text, _, gmodel = gemini_generate(contents, system=sys_prompt, temperature=temperature,
+                                              max_tokens=max(max_tokens, 4096))
             log.info("written by Gemini %s (fallback)", gmodel)
             return clean_md(text), f"gemini:{gmodel}"
         except Exception as e:
@@ -605,7 +676,7 @@ def polish_amharic(text):
         "number, score, hashtag, name and the structure/emojis exactly as they are. Do not add or remove facts. "
         "Plain text only, no markdown. Output only the rewritten text.\n\n" + text
     )
-    out, _ = llm_write(prompt, allow_gemini=False, max_tokens=3000, temperature=0.4)
+    out, _ = llm_write(prompt, allow_gemini=False, max_tokens=4000, temperature=0.4)
     if out and len(out) > len(text) * 0.5:
         return out
     return text
@@ -656,12 +727,12 @@ def category_keyboard(mode):
 
 def show_categories(chat_id, mode):
     head = ("ሄኖክ፣ ስለየትኛው ዘርፍ ወቅታዊ መረጃ ላምጣልህ? 👇" if mode == "news"
-            else "ሄኖክ፣ ለየትኛው ዘርፍ ፖስት ላዘጋጅልህ? 👇")
+            else "ሄኖክ፣ ለየትኛው ዘርፍ የሰከላ ኒውስ ፖስት ላዘጋጅልህ? 👇")
     bot.send_message(chat_id, head, reply_markup=category_keyboard(mode))
 
 
 # ----------------------------------------------------------------------------
-# News
+# News digest (for Henok to read; "make a post" turns it into a Sekela News card)
 # ----------------------------------------------------------------------------
 def run_news(chat_id, label, topic):
     start = time.time()
@@ -672,25 +743,27 @@ def run_news(chat_id, label, topic):
                 f"ዘርፍ/ርዕስ: {topic}\n\n"
                 "Write 4-5 punchy, verified insights for ሄኖክ based ONLY on the research notes below. Each insight: "
                 "an emoji + one-line headline, then 1-2 energetic sentences on why it matters to an Ethiopian "
-                "creator/marketer. Mention the source name inline. Finish with '🎯 ለዛሬ የይዘት ሀሳብ:' and ONE concrete "
-                "video/post idea he can make. Plain text.\n\n"
+                "audience. Mention the outlet name inline. Finish with '🎯 ለዛሬ የሰከላ ኒውስ ሀሳብ:' and ONE concrete "
+                "story he can publish. Plain text.\n\n"
             )
             if facts:
                 prompt += "[RESEARCH NOTES]\n" + facts
             else:
                 prompt += ("[Live search was unavailable. Give general insights from your own knowledge and say "
-                           "clearly that they may not be the latest.]")
+                           "clearly that they may not be the latest and are unverified.]")
             text, _ = llm_write(prompt)
         if not text:
             deliver(chat_id, None, BUSY_TEXT)
             return
-        nid = uuid.uuid4().hex[:10]
-        with state_lock:
-            news_cache[nid] = {"label": label, "text": text, "ts": time.time()}
-        prune(news_cache)
-        kb = types.InlineKeyboardMarkup()
-        kb.add(types.InlineKeyboardButton("📝 ከዚህ ፖስት አዘጋጅልኝ", callback_data=f"mk:{nid}"))
         body = text
+        kb = None
+        if facts:  # only verified digests can become a publishable post
+            nid = uuid.uuid4().hex[:10]
+            with state_lock:
+                news_cache[nid] = {"label": label, "text": facts, "sources": sources, "ts": time.time()}
+            prune(news_cache)
+            kb = types.InlineKeyboardMarkup()
+            kb.add(types.InlineKeyboardButton("📰 የሰከላ ኒውስ ካርድ አዘጋጅልኝ", callback_data=f"mk:{nid}"))
         src = format_sources(sources)
         if src:
             body += "\n\n" + src
@@ -702,52 +775,130 @@ def run_news(chat_id, label, topic):
 
 
 # ----------------------------------------------------------------------------
-# Post package: Amharic copy + Canva blueprint + AI image (Pollinations)
+# Sekela News copy: parsing, sourcing, branding
 # ----------------------------------------------------------------------------
-POST_BRIEF = (
-    "Write ONE ready-to-publish Telegram post for 'Henok Graphics' (@HenokGraphics), a community of video "
-    "editors, motion designers and creators in Ethiopia.\n"
-    "Topic: {topic}\n\n{facts}"
-    "Rules: native Addis Ababa creative-marketing Amharic. The whole post speaks to the community in ONE "
-    "consistent voice (second person plural: እናንተ / ታደርጋላችሁ / ትችላላችሁ); never mix singular/plural or እኛ/አንተ. "
-    "Keep tech terms in English (CapCut, Canva, Whop, Hook, CTA, Reels, Shorts, AI). Maximum 850 characters "
-    "INCLUDING hashtags. Structure: 🔥 catchy Hook line, short body with • bullets, a CTA line, then 5-8 hashtags. "
-    "Use only facts present in the research notes (if any); invent no numbers.\n\n"
+SEKELA_BRIEF = (
+    "You are the editor of 'ሰከላ ኒውስ (Sekela News)', an Amharic news brand for Facebook and Telegram mobile feeds. "
+    "Editorial style: sharp, fast, authoritative and easy to scan.\n"
+    "Topic: {topic}\n\n[RESEARCH NOTES]\n{facts}\n\n"
+    "Write ONE post using ONLY facts found in the research notes (no invented numbers, names or quotes).\n"
+    "Structure:\n"
+    "- Paragraph 1: an undeniable hook, 1-2 punchy sentences opening with the most striking verified fact "
+    "(one fitting emoji at the start is fine).\n"
+    "- Then 4-5 concise paragraphs, 1-2 short sentences each, separated by blank lines: what happened, the key "
+    "numbers/names, why it matters to Ethiopian readers (only if the notes support it), what comes next.\n"
+    "- Then ONE line: ምንጭ፡ <outlet name> using only outlets that appear in the notes (e.g. BBC Amharic, Reuters, AP, "
+    "Fana, DW Amharic, Al Ain).\n"
+    "- Last line: hashtags: #ሰከላ_ኒውስ #SekelaNews #HenokGraphics plus 2-4 specific story hashtags.\n"
+    "Voice: neutral, native Addis Ababa news Amharic; ONE consistent way of addressing readers; no opinion stated as "
+    "fact; no sensational claim the notes do not support. Keep English terms (AI, CapCut, Whop...) in Latin letters.\n\n"
     "Return EXACTLY these three blocks and nothing else:\n"
-    "===POST===\n(the post)\n"
-    "===CANVA===\n🎨 Canva Design Blueprint:\n"
-    "• Color palette: 3-4 HEX codes with the role of each (background / accent / text)\n"
-    "• Overlay hook text: max 6 words, in Amharic\n"
-    "• Composition: layout, focal point, font feel, where each element goes\n"
-    "===IMAGE===\nOne English paragraph, 25-45 words: a cinematic photographic scene that visualizes the post's "
-    "concept (subject, setting, lighting, lens, mood, colour grade). No text, no logos, no real people's names.\n"
+    "===HEADLINE===\n5-7 punchy Amharic words for the poster headline; no quotes, no emoji, no full stop.\n"
+    "===POST===\n(the post as specified above)\n"
+    "===IMAGE===\nOne English paragraph, 25-45 words: a symbolic, cinematic photojournalism scene that visualizes the "
+    "story's theme (setting, subject matter, lighting, lens, mood, high-contrast colour grade). No identifiable real "
+    "people, no text, no logos, no flags, no depiction of violence or casualties.\n"
 )
 
-IMAGE_STYLE = ("cinematic lighting, ultra detailed, sharp focus, professional social media marketing poster, "
-               "square composition, no text, no watermark")
-IMAGE_FALLBACK = ("a modern creative studio with a video editor working at a glowing multi-monitor workstation, "
-                  "neon rim light, shallow depth of field, teal and orange colour grade")
+IMAGE_STYLE = ("high-contrast cinematic news photography, dramatic lighting, shallow depth of field, ultra detailed, "
+               "sharp focus, dark moody tones, square composition, no text, no letters, no watermark")
+IMAGE_FALLBACK = ("a dramatic dusk skyline of a modern African capital with glowing city lights and a newsroom "
+                  "feel, teal and orange colour grade")
 
 
 def parse_package(text):
-    """Split the writer output into {'post','canva','image'}. Tolerant to missing blocks."""
-    out = {"post": "", "canva": "", "image": ""}
-    parts = re.split(r"===(POST|CANVA|IMAGE)===", text or "")
+    """Split the writer output into {'headline','post','image'}. Tolerant to missing blocks."""
+    out = {"headline": "", "post": "", "image": ""}
+    parts = re.split(r"===(HEADLINE|POST|CANVA|IMAGE)===", text or "")
     if len(parts) < 3:
         out["post"] = (text or "").strip()
         return out
     for i in range(1, len(parts) - 1, 2):
-        out[parts[i].lower()] = parts[i + 1].strip()
+        key = parts[i].lower()
+        if key in out:
+            out[key] = parts[i + 1].strip()
     if not out["post"]:
         out["post"] = (parts[0] or text).strip()
     return out
 
 
-def build_image_prompt(scene, topic_hint=""):
+def clean_headline(h, fallback_text=""):
+    """Max 7 words, no quotes / leading emoji / trailing full stop."""
+    def _tidy(s):
+        s = re.sub(r"[\"'“”‘’«»]", "", s or "").strip()
+        s = re.sub(r"^[^\wሀ-፿]+", "", s)
+        return s.rstrip(".።").strip()
+
+    h = _tidy(h)
+    if not h:
+        first = next((ln for ln in (fallback_text or "").splitlines() if ln.strip()), "")
+        h = _tidy(first)
+    return " ".join(h.split()[:7])
+
+
+def detect_outlets(text):
+    low = (text or "").lower()
+    found = [name for name, rx in OUTLETS if re.search(rx, low)]
+    if "BBC Amharic" in found and "BBC" in found:
+        found.remove("BBC")
+    if "DW Amharic" in found and "DW" in found:
+        found.remove("DW")
+    return found
+
+
+def derive_source(facts, sources):
+    blob = (facts or "") + " " + " ".join(f"{t} {u}" for t, u in (sources or []))
+    outlets = detect_outlets(blob)
+    if outlets:
+        return ", ".join(outlets[:3])
+    if sources:
+        title = sources[0][0]
+        return title or urlparse(sources[0][1]).netloc or None
+    return None
+
+
+_HASHTAG_LINE = re.compile(r"^\s*(?:#\S+\s*)+$")
+_SOURCE_LINE = re.compile(r"^\s*(?:📰\s*|📌\s*)?ምንጭ\s*[:፡]\s*(.+?)\s*$")
+
+
+def finalize_post(raw, facts="", sources=None):
+    """Normalize the writer's post into: body + 'ምንጭ፡ <outlet>' + hashtags (brand tags always first).
+    Returns None when no source can be established (a news post must never go out unsourced)."""
+    tags, src, body = [], None, []
+    for ln in (raw or "").strip().splitlines():
+        if _HASHTAG_LINE.match(ln):
+            tags += re.findall(r"#\S+", ln)
+            continue
+        m = _SOURCE_LINE.match(ln)
+        if m and src is None:
+            src = m.group(1).strip()
+            continue
+        body.append(ln)
+    body_text = re.sub(r"\n{3,}", "\n\n", "\n".join(body)).strip()
+    if not detect_outlets(src or ""):
+        derived = derive_source(facts, sources)
+        if derived and (detect_outlets(derived) or not src):
+            src = derived
+    if not src or not body_text:
+        return None
+    seen = {t.lower() for t in BRAND_TAGS}
+    story = []
+    for t in tags:
+        t = t.rstrip(".,;")
+        if t and t.lower() not in seen:
+            seen.add(t.lower())
+            story.append(t)
+    return f"{body_text}\n\nምንጭ፡ {src}\n\n" + " ".join(BRAND_TAGS + story[:5])
+
+
+# ----------------------------------------------------------------------------
+# Sekela News card (Pollinations background + Pillow overlay)
+# ----------------------------------------------------------------------------
+def build_image_prompt(scene):
     scene = re.sub(r"\s+", " ", (scene or "")).strip()
     if not scene or re.search(r"[ሀ-፿]", scene):  # empty or accidentally Amharic -> safe default
         scene = IMAGE_FALLBACK
-    return (scene[:420].rstrip(" ,.") + ", " + IMAGE_STYLE)[:600]
+    return (scene[:420].rstrip(" ,.") + ", " + IMAGE_STYLE)[:640]
 
 
 def pollinations_url(prompt):
@@ -756,7 +907,7 @@ def pollinations_url(prompt):
 
 
 def fetch_image(prompt, attempts=3):
-    """Download the AI image bytes. Returns bytes or None."""
+    """Download the AI background bytes. Returns bytes or None."""
     url = pollinations_url(prompt)
     for i in range(attempts):
         try:
@@ -771,63 +922,396 @@ def fetch_image(prompt, attempts=3):
     return None
 
 
+FONT_URLS = [
+    "https://cdn.jsdelivr.net/gh/notofonts/ethiopic@main/fonts/NotoSansEthiopic/hinted/ttf/NotoSansEthiopic-Bold.ttf",
+    "https://github.com/notofonts/ethiopic/raw/main/fonts/NotoSansEthiopic/hinted/ttf/NotoSansEthiopic-Bold.ttf",
+    "https://github.com/googlefonts/noto-fonts/raw/main/hinted/ttf/NotoSansEthiopic/NotoSansEthiopic-Bold.ttf",
+]
+_font_cache = {}
+_font_lock = threading.Lock()
+
+
+def _font_loadable(path):
+    try:
+        ImageFont.truetype(path, 40)
+        return True
+    except Exception:
+        return False
+
+
+def find_ethiopic_font():
+    """Path of a bold Ethiopic font, or None. Order: FONT_PATH env, files next to agent.py (commit
+    NotoSansEthiopic-Bold.ttf to the repo for 100% reliability), system fonts, previously downloaded copy, download."""
+    if not PIL_OK:
+        return None
+    with _font_lock:
+        if "eth" in _font_cache:
+            return _font_cache["eth"]
+        here = os.path.dirname(os.path.abspath(__file__))
+        cached = os.path.join(tempfile.gettempdir(), "sekela-NotoSansEthiopic-Bold.ttf")
+        cands = [os.environ.get("FONT_PATH", "").strip()]
+        for pat in ("*Ethiopic*Bold*.[to]tf", "*Ethiopic*.[to]tf", "fonts/*Ethiopic*.[to]tf"):
+            cands += sorted(glob.glob(os.path.join(here, pat)))
+        for pat in ("**/*Ethiopic*Bold*.[to]tf", "**/*Ethiopic*.[to]tf", "**/*Abyssinica*.[to]tf"):
+            cands += sorted(glob.glob("/usr/share/fonts/" + pat, recursive=True))
+        cands.append(cached)
+        for p in cands:
+            if p and os.path.isfile(p) and _font_loadable(p):
+                _font_cache["eth"] = p
+                return p
+        for url in FONT_URLS:
+            try:
+                r = requests.get(url, timeout=60)
+                if r.status_code == 200 and len(r.content) > 20000 and r.content[:4] in (
+                        b"\x00\x01\x00\x00", b"OTTO", b"true", b"ttcf"):
+                    with open(cached, "wb") as f:
+                        f.write(r.content)
+                    if _font_loadable(cached):
+                        log.info("Ethiopic font downloaded from %s", url)
+                        _font_cache["eth"] = cached
+                        return cached
+            except Exception as e:
+                log.warning("font download failed (%s): %s", url, e)
+        log.warning("No Ethiopic font available - cards will be sent without the baked headline")
+        _font_cache["eth"] = None
+        return None
+
+
+def _latin_font(size):
+    for p in ("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+              "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+              "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf"):
+        if os.path.isfile(p):
+            try:
+                return ImageFont.truetype(p, size)
+            except Exception:
+                pass
+    try:
+        return ImageFont.load_default(size)  # Pillow >= 10.1 (scalable)
+    except Exception:
+        return ImageFont.load_default()
+
+
+def _is_eth(ch):
+    o = ord(ch)
+    return 0x1200 <= o <= 0x139F or 0x2D80 <= o <= 0x2DDF or 0xAB00 <= o <= 0xAB2F
+
+
+def _runs(text, f_eth, f_lat):
+    """Split into (substring, font) runs: Ethiopic chars use the Ethiopic font, everything else the Latin font
+    (Noto Sans Ethiopic has no Latin glyphs). Spaces follow the previous run."""
+    runs, cur, cur_font = [], "", None
+    for ch in text:
+        if _is_eth(ch):
+            font = f_eth
+        elif ch.isspace() and cur_font is not None:
+            font = cur_font
+        else:
+            font = f_lat
+        if font is not cur_font and cur:
+            runs.append((cur, cur_font))
+            cur = ""
+        cur += ch
+        cur_font = font
+    if cur:
+        runs.append((cur, cur_font))
+    return runs
+
+
+def _measure(text, f_eth, f_lat):
+    return sum(font.getlength(s) for s, font in _runs(text, f_eth, f_lat))
+
+
+def _draw_mixed(draw, x, baseline, text, f_eth, f_lat, fill):
+    for s, font in _runs(text, f_eth, f_lat):
+        draw.text((x, baseline), s, font=font, fill=fill, anchor="ls")
+        x += font.getlength(s)
+
+
+def _wrap(text, f_eth, f_lat, max_w):
+    lines, cur = [], ""
+    for w in text.split():
+        trial = (cur + " " + w).strip()
+        if cur and _measure(trial, f_eth, f_lat) > max_w:
+            lines.append(cur)
+            cur = w
+        else:
+            cur = trial
+    if cur:
+        lines.append(cur)
+    return lines
+
+
+def compose_card(bg_bytes, headline, size=1080):
+    """1080x1080 Sekela News poster: cropped background, dark bottom gradient, bold headline, brand badge.
+    Returns JPEG bytes, or None when Pillow / an Ethiopic font is unavailable or anything fails."""
+    if not PIL_OK or not bg_bytes or not headline:
+        return None
+    eth_path = find_ethiopic_font()
+    if not eth_path:
+        return None
+    try:
+        img = Image.open(io.BytesIO(bg_bytes)).convert("RGB")
+        w, h = img.size
+        s = min(w, h)
+        left, top = (w - s) // 2, (h - s) // 2
+        img = img.crop((left, top, left + s, top + s)).resize((size, size), Image.LANCZOS)
+        img = ImageEnhance.Contrast(img).enhance(1.12)
+
+        overlay = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+        od = ImageDraw.Draw(overlay)
+        g0 = int(size * 0.28)
+        for y in range(g0, size):
+            t = (y - g0) / (size - g0)
+            od.line([(0, y), (size, y)], fill=(0, 0, 0, int(246 * (t ** 1.35))))
+        img = Image.alpha_composite(img.convert("RGBA"), overlay)
+        draw = ImageDraw.Draw(img, "RGBA")
+
+        margin, max_w = 64, size - 128
+        fs = 112
+        lines = []
+        for fs in range(112, 47, -4):
+            f_eth, f_lat = ImageFont.truetype(eth_path, fs), _latin_font(fs)
+            lines = _wrap(headline, f_eth, f_lat, max_w)
+            if len(lines) <= 4 and all(_measure(ln, f_eth, f_lat) <= max_w for ln in lines):
+                break
+        line_h = int(fs * 1.22)
+        badge_h = 64
+        badge_y = size - margin - badge_h
+        y0 = badge_y - 44 - line_h * len(lines)
+        draw.rectangle([margin, y0 - 34, margin + 132, y0 - 24], fill=BRAND_RED + (255,))
+        for i, ln in enumerate(lines):
+            _draw_mixed(draw, margin, y0 + i * line_h + int(fs * 0.98), ln, f_eth, f_lat, (255, 255, 255, 255))
+
+        # signature badge  "ሰከላ | Sekela"
+        b_eth, b_lat = ImageFont.truetype(eth_path, 36), _latin_font(34)
+        badge_text = "ሰከላ | Sekela"
+        bw = int(_measure(badge_text, b_eth, b_lat)) + 56
+        draw.rounded_rectangle([margin, badge_y, margin + bw, badge_y + badge_h], radius=32, fill=BRAND_RED + (255,))
+        _draw_mixed(draw, margin + 28, badge_y + 44, badge_text, b_eth, b_lat, (255, 255, 255, 255))
+
+        if AI_LABEL:
+            t_font = _latin_font(22)
+            label = "AI illustration"
+            lw = int(t_font.getlength(label)) + 28
+            draw.rounded_rectangle([size - margin - lw + 20, 36, size - 44, 36 + 38], radius=19, fill=(0, 0, 0, 120))
+            draw.text((size - margin - lw + 34, 36 + 28), label, font=t_font, fill=(255, 255, 255, 215), anchor="ls")
+
+        out = io.BytesIO()
+        img.convert("RGB").save(out, "JPEG", quality=90, optimize=True)
+        return out.getvalue()
+    except Exception as e:
+        log.error("card composition failed: %s", e)
+        return None
+
+
 def _as_photo(data):
     bio = io.BytesIO(data)
-    bio.name = "henok-graphics.jpg"
+    bio.name = "sekela-card.jpg"
     return bio
 
 
-def run_post(chat_id, label, topic, context_text=None):
+# ----------------------------------------------------------------------------
+# Facebook Page (publish + analytics). NO COMMENT REPLIES - ever.
+# ----------------------------------------------------------------------------
+class FBError(Exception):
+    def __init__(self, message, code=None):
+        super().__init__(message)
+        self.code = code
+
+
+def fb_enabled():
+    return bool(FB_PAGE_ID and FB_PAGE_ACCESS_TOKEN)
+
+
+def _fb_clean(s):
+    s = str(s)
+    return s.replace(FB_PAGE_ACCESS_TOKEN, "***") if FB_PAGE_ACCESS_TOKEN else s
+
+
+def _fb_request(method, path, params=None, data=None, files=None, timeout=90):
+    """Single choke point for Graph API calls. Hard-coded policy: only POST to /photos and /feed, and refuse any
+    path that touches comments (the bot never auto-replies or writes to comments)."""
+    p = path.strip("/").lower()
+    if "comment" in p:
+        raise FBError("blocked by no-commenting policy")
+    if method == "POST" and p.split("/")[-1] not in ("photos", "feed"):
+        raise FBError(f"blocked: POST not allowed on {p}")
+    url = f"{FB_GRAPH}/{path.strip('/')}"
+    try:
+        if method == "POST":
+            body = dict(data or {})
+            body["access_token"] = FB_PAGE_ACCESS_TOKEN
+            r = requests.post(url, data=body, files=files, timeout=timeout)
+        else:
+            q = dict(params or {})
+            q["access_token"] = FB_PAGE_ACCESS_TOKEN
+            r = requests.get(url, params=q, timeout=timeout)
+    except requests.RequestException as e:
+        raise FBError(_fb_clean(f"network error: {e}"))
+    try:
+        js = r.json()
+    except Exception:
+        js = {}
+    if r.status_code != 200 or "error" in js:
+        err = js.get("error", {}) if isinstance(js, dict) else {}
+        raise FBError(_fb_clean(err.get("message") or f"HTTP {r.status_code}"), err.get("code"))
+    return js
+
+
+def fb_publish(post, image_bytes=None):
+    """Photo with caption when an image exists, otherwise a plain feed post. Returns the Graph object id."""
+    if image_bytes:
+        js = _fb_request("POST", f"{FB_PAGE_ID}/photos", data={"caption": post, "published": "true"},
+                         files={"source": ("sekela-card.jpg", image_bytes, "image/jpeg")}, timeout=120)
+    else:
+        js = _fb_request("POST", f"{FB_PAGE_ID}/feed", data={"message": post})
+    return js.get("post_id") or js.get("id")
+
+
+def fb_error_hint(e):
+    code = getattr(e, "code", None)
+    if code == 190:
+        return "ቶክኑ ጊዜው አልፏል ወይም ልክ አይደለም — አዲስ Page Access Token ፍጠር።"
+    if code in (10, 200, 299):
+        return "ፈቃድ ይጎድላል — Page token በ pages_manage_posts ፈቃድ መፈጠሩን አረጋግጥ።"
+    if code == 100:
+        return "FB_PAGE_ID ወይም የጥያቄው መረጃ ልክ አይደለም።"
+    return ""
+
+
+FB_INSIGHT_CANDIDATES = [
+    ("page_total_media_view_unique", "👀 Reach (ልዩ ተመልካቾች)"),
+    ("page_media_view", "📈 Views (እይታዎች)"),
+    ("page_post_engagements", "💬 Engagement (ተሳትፎ)"),
+    ("page_daily_follows", "➕ አዲስ ተከታዮች"),
+]
+
+
+def _sum_values(js):
+    total = 0
+    for item in js.get("data", [])[:1]:
+        for v in item.get("values", []):
+            val = v.get("value")
+            if isinstance(val, (int, float)):
+                total += val
+            elif isinstance(val, dict):
+                total += sum(x for x in val.values() if isinstance(x, (int, float)))
+    return int(total)
+
+
+def fb_analytics_text():
+    if not fb_enabled():
+        return "⚪ ፌስቡክ አልተዋቀረም — በ Render ላይ FB_PAGE_ACCESS_TOKEN ጨምር።"
+    lines = [f"📊 {FB_PAGE_NAME} — Facebook Analytics", "━━━━━━━━━━━━"]
+    try:
+        info = _fb_request("GET", FB_PAGE_ID, params={"fields": "name,followers_count,fan_count"}, timeout=40)
+        followers = info.get("followers_count", info.get("fan_count"))
+        lines.append(f"📄 ገጽ: {info.get('name', FB_PAGE_NAME)}")
+        lines.append(f"👥 ተከታዮች: {followers:,}" if isinstance(followers, int) else "👥 ተከታዮች: —")
+    except FBError as e:
+        return "\n".join(lines + [f"❌ የገጹን መረጃ ማምጣት አልተቻለም: {short_reason(e)}", fb_error_hint(e)]).strip()
+
+    now = int(time.time())
+    got, tried = [], 0
+    for metric, label in FB_INSIGHT_CANDIDATES:
+        tried += 1
+        try:
+            js = _fb_request("GET", f"{FB_PAGE_ID}/insights",
+                             params={"metric": metric, "period": "day", "since": now - 7 * 86400, "until": now},
+                             timeout=40)
+            got.append(f"{label}: {_sum_values(js):,}")
+        except FBError as e:
+            log.info("insight %s unavailable: %s", metric, e)
+    lines.append("\n🗓 ባለፉት 7 ቀናት:")
+    lines += got if got else ["• Insights ማግኘት አልተቻለም (read_insights ፈቃድ ወይም የ Meta metric ለውጥ ሊሆን ይችላል)።"]
+
+    lines.append("\n📰 የቅርብ ጊዜ ፖስቶች:")
+    try:
+        posts = _fb_request(
+            "GET", f"{FB_PAGE_ID}/posts",
+            params={"fields": "message,created_time,permalink_url,reactions.summary(total_count).limit(0),"
+                              "comments.summary(total_count).limit(0),shares", "limit": 5}, timeout=40).get("data", [])
+        if not posts:
+            lines.append("• ፖስት አልተገኘም")
+        for p in posts:
+            msg = re.sub(r"\s+", " ", p.get("message", "") or "(ያለ ጽሑፍ)")[:55]
+            react = ((p.get("reactions") or {}).get("summary") or {}).get("total_count", 0)
+            comm = ((p.get("comments") or {}).get("summary") or {}).get("total_count", 0)
+            shares = (p.get("shares") or {}).get("count", 0)
+            lines.append(f"• {p.get('created_time', '')[:10]} — {msg}\n   ❤️ {react} · 💬 {comm} · 🔁 {shares}")
+    except FBError as e:
+        lines.append(f"• ማምጣት አልተቻለም: {short_reason(e)}")
+    return "\n".join(lines)
+
+
+# ----------------------------------------------------------------------------
+# Post package: Sekela News card + copy -> preview -> approval -> Telegram + Facebook
+# ----------------------------------------------------------------------------
+def run_post(chat_id, label, topic, context_text=None, context_sources=None):
     start = time.time()
     ack_id = send_progress(
-        chat_id, "⏳ ሄኖክ፣ ጥናቱን አድርጌ ፖስቱን እና AI ምስሉን እያዘጋጀሁ ነው (ከ20-40 ሰከንድ ይወስዳል)...")
+        chat_id, "⏳ ሄኖክ፣ ጥናቱን አድርጌ የሰከላ ኒውስ ፖስቱን እና AI ምስሉን እያዘጋጀሁ ነው (ከ20-40 ሰከንድ ይወስዳል)...")
     try:
-        sources = []
         if context_text:
-            facts = "[RESEARCH NOTES]\n" + context_text + "\n\n"
+            facts, sources = context_text, context_sources or []
         else:
-            notes, sources = research(topic)
-            facts = ("[RESEARCH NOTES]\n" + notes + "\n\n") if notes else ""
-        text, _ = llm_write(POST_BRIEF.format(topic=topic, facts=facts), max_tokens=2200)
+            facts, sources = research(topic)
+        if not facts:
+            deliver(chat_id, ack_id,
+                    "ሄኖክ፣ ከታማኝ ምንጮች መረጃውን ማረጋገጥ አልቻልኩም 😕 ያለ ምንጭ የዜና ፖስት አላዘጋጅም። "
+                    "ጥቂት ቆይተህ ደግመህ ሞክር ወይም ርዕሱን ይበልጥ ግልጽ አድርገህ ጻፍልኝ።")
+            return
+        brief = SEKELA_BRIEF.replace("{topic}", topic).replace("{facts}", facts)
+        text, _ = llm_write(brief, max_tokens=2600)
         if not text:
             deliver(chat_id, ack_id, BUSY_TEXT)
             return
         pkg = parse_package(text)
-        post = pkg["post"] or text
-        img_prompt = build_image_prompt(pkg["image"])
-        image = fetch_image(img_prompt)
+        final = finalize_post(pkg["post"] or text, facts, sources)
+        if not final:
+            deliver(chat_id, ack_id, "ሄኖክ፣ ለፖስቱ ምንጭ ማረጋገጥ አልቻልኩም 😕 ያለ ምንጭ አልለጥፍም — እንደገና ሞክር።")
+            return
+        headline = clean_headline(pkg["headline"], final)
+        bg = fetch_image(build_image_prompt(pkg["image"]))
+        card = compose_card(bg, headline) if bg else None
+        image = card or bg
+        post = final if (card or not bg) else f"📰 {headline}\n\n{final}"
 
-        # --- preview to Henok: photo (+ caption if it fits) then the details message with the approval buttons
+        # --- preview to Henok: the card (+ caption if it fits), then details + approval buttons
         file_id = None
         caption_fits = len(post) <= CAPTION_LIMIT
         if image:
             try:
-                sent = bot.send_photo(chat_id, _as_photo(image), caption=post if caption_fits else "🖼 AI ምስል (ቅድመ-እይታ)")
+                sent = bot.send_photo(chat_id, _as_photo(image),
+                                      caption=post if caption_fits else f"📰 {headline}")
                 file_id = sent.photo[-1].file_id
             except Exception as e:
                 log.error("sending preview photo failed: %s", e)
 
         did = uuid.uuid4().hex[:10]
         with state_lock:
-            drafts[did] = {"post": post, "file_id": file_id, "ts": time.time()}
+            drafts[did] = {"post": post, "file_id": file_id, "image": image, "headline": headline,
+                           "tg": False, "fb": False, "busy": False, "ts": time.time()}
         prune(drafts)
 
         details = []
         if not (file_id and caption_fits):
-            details.append(f"📝 የፖስት ረቂቅ — {label}\n━━━━━━━━━━━━\n{post}")
+            details.append(f"📝 ረቂቅ — {label}\n━━━━━━━━━━━━\n{post}")
         else:
-            details.append(f"📝 የፖስት ረቂቅ ዝግጁ ነው — {label}")
-        if not file_id:
+            details.append(f"📝 የሰከላ ኒውስ ረቂቅ ዝግጁ ነው — {label}")
+        details.append(f"📰 የካርዱ ርዕስ: {headline}")
+        if not image:
             details.append("⚠️ ምስሉ በዚህ ጊዜ አልተሳካም — ያለ ምስል መለጠፍ ወይም ሰርዘህ እንደገና መጠየቅ ትችላለህ።")
-        if pkg["canva"]:
-            details.append("━━━━━━━━━━━━\n" + pkg["canva"])
-        if file_id:
-            details.append("🖼 AI image prompt:\n" + img_prompt)
+        elif not card:
+            details.append("⚠️ ርዕሱን በምስሉ ላይ ማተም አልተቻለም (Ethiopic font የለም) — ርዕሱ በፖስቱ ጽሑፍ ውስጥ ገብቷል። "
+                           "NotoSansEthiopic-Bold.ttf ን ከ agent.py ጎን ኮሚት አድርግ።")
         src = format_sources(sources)
         if src:
             details.append(src)
-        details.append("━━━━━━━━━━━━\n🔒 ወደ @HenokGraphics የሚላከው ፖስቱ" + (" + ምስሉ" if file_id else "") +
-                       " ብቻ ነው። አንተ ካላጸደቅክ ምንም አይወጣም።")
+        targets = [str(TARGET_CHANNEL)] + ([FB_PAGE_NAME + " (Facebook)"] if fb_enabled() else [])
+        details.append("━━━━━━━━━━━━\n🔒 ✅ ከነካህ ብቻ ይለጠፋል → " + " + ".join(targets) +
+                       "\nበፌስቡክ ኮመንቶች ላይ ቦቱ ፈጽሞ አይመልስም።")
         details.append(took(start))
         kb = types.InlineKeyboardMarkup()
         kb.add(
@@ -841,14 +1325,15 @@ def run_post(chat_id, label, topic, context_text=None):
         deliver(chat_id, ack_id, "ሄኖክ፣ ፖስቱን አሁን ማዘጋጀት አልቻልኩም 😅 ጥቂት ቆይተህ እንደገና ሞክር።")
 
 
-def publish_draft(draft):
-    """Publish an approved draft (photo + caption, or text) to the target channel."""
-    post, file_id = draft["post"], draft.get("file_id")
-    if file_id:
+def publish_telegram(d):
+    """Photo + caption (or text) to the target channel."""
+    post = d["post"]
+    photo = d.get("file_id") or (_as_photo(d["image"]) if d.get("image") else None)
+    if photo:
         if len(post) <= CAPTION_LIMIT:
-            bot.send_photo(TARGET_CHANNEL, file_id, caption=post)
+            bot.send_photo(TARGET_CHANNEL, photo, caption=post)
         else:
-            bot.send_photo(TARGET_CHANNEL, file_id)
+            bot.send_photo(TARGET_CHANNEL, photo)
             for chunk in split_text(post, 4000):
                 bot.send_message(TARGET_CHANNEL, chunk)
     else:
@@ -856,18 +1341,90 @@ def publish_draft(draft):
             bot.send_message(TARGET_CHANNEL, chunk)
 
 
+def retry_keyboard(did):
+    kb = types.InlineKeyboardMarkup()
+    kb.add(
+        types.InlineKeyboardButton("🔁 ያልተሳካውን እንደገና ሞክር", callback_data=f"ok:{did}"),
+        types.InlineKeyboardButton("❌ ሰርዝ", callback_data=f"no:{did}"),
+    )
+    return kb
+
+
+def approve_and_publish(chat_id, msg_id, did):
+    """Approval gate: Telegram first, then Facebook. Each target is tracked separately so a retry never
+    double-posts to a target that already succeeded."""
+    with state_lock:
+        d = drafts.get(did)
+        if d is None:
+            expired = True
+        else:
+            expired = False
+            if d["busy"]:
+                return
+            d["busy"] = True
+    if expired:
+        bot.edit_message_text("⚠️ ይህ ረቂቅ ጊዜው አልፏል ወይም ቀድሞ ተስተናግዷል።", chat_id, msg_id)
+        return
+
+    tg_err = fb_err = None
+    fb_on = fb_enabled()
+    try:
+        if not d["tg"]:
+            try:
+                publish_telegram(d)
+                d["tg"] = True
+            except Exception as e:
+                log.error("telegram publish failed: %s", e)
+                tg_err = short_reason(e, 200)
+        if fb_on and not d["fb"]:
+            try:
+                fb_publish(d["post"], d.get("image"))
+                d["fb"] = True
+            except FBError as e:
+                log.error("facebook publish failed: %s", e)
+                fb_err = short_reason(e, 200) + (" — " + fb_error_hint(e) if fb_error_hint(e) else "")
+            except Exception as e:
+                log.error("facebook publish failed: %s", e)
+                fb_err = short_reason(e, 200)
+    finally:
+        d["busy"] = False
+
+    tg_line = f"• Telegram: {TARGET_CHANNEL} " + ("✅" if d["tg"] else f"❌ {tg_err or ''}".rstrip())
+    if not fb_on:
+        fb_line = f"• Facebook: {FB_PAGE_NAME} ⚪ አልተዋቀረም (FB_PAGE_ACCESS_TOKEN)"
+    else:
+        fb_line = f"• Facebook: {FB_PAGE_NAME} " + ("✅" if d["fb"] else f"❌ {fb_err or ''}".rstrip())
+
+    if d["tg"] and (d["fb"] or not fb_on):
+        with state_lock:
+            drafts.pop(did, None)
+        bot.edit_message_text(f"✅ ጸድቋል እና ተለጥፏል! 🚀\n{tg_line}\n{fb_line}", chat_id, msg_id)
+    else:
+        extra = ""
+        if tg_err and "chat not found" in tg_err.lower():
+            extra = ("\n\n💡 ቻናሉ public መሆኑን፣ TARGET_CHANNEL በትክክል መጻፉን እና ቦቱ አድሚን ('Post Messages') "
+                     "መሆኑን አረጋግጥ — /ai_status ያሳይሃል።")
+        bot.edit_message_text(f"⚠️ በከፊል ተሳክቷል\n{tg_line}\n{fb_line}{extra}\n\nየተሳካው እንደገና አይለጠፍም።",
+                              chat_id, msg_id, reply_markup=retry_keyboard(did))
+
+
 # ----------------------------------------------------------------------------
-# Audio / video / photo analysis (Gemini multimodal)
+# Audio / video / photo analysis
 # ----------------------------------------------------------------------------
-AUDIO_PROMPT = (
-    "This is a voice/audio message from Henok. Reply in EXACTLY this format:\n"
-    "===TRANSCRIPT===\n"
-    "A faithful word-for-word transcript in the language spoken (Amharic script if Amharic). If it is not "
-    "Amharic, add an Amharic translation below it.\n"
-    "===ANALYSIS===\n"
-    "📌 ማጠቃለያ: 2-4 lines.\n"
-    "✅ Action Items: a checklist with any deadlines mentioned.\n"
-    "Write the ANALYSIS part in natural Amharic. Plain text, no markdown."
+TRANSCRIBE_PROMPT = (
+    "Transcribe this audio faithfully and completely, word for word, from the first second to the last. "
+    "Write Amharic in Ethiopic script (keep English words in Latin letters). If several people speak, start a new "
+    "line for each speaker change. Mark unclear parts as [...]. Do not summarize, translate, comment or repeat "
+    "yourself. Output ONLY the transcript."
+)
+SUMMARY_PROMPT = (
+    "Below is a verbatim transcript of a voice note from ሄኖክ (it may contain small transcription errors). "
+    "Write in natural Amharic, using ONLY what is in the transcript:\n"
+    "📌 ማጠቃለያ: 3-6 lines with the key message.\n"
+    "🔑 ዋና ዋና ነጥቦች: short • bullets.\n"
+    "✅ Action Items: a checklist of tasks/decisions, each with the deadline or owner if mentioned.\n"
+    "❓ ግልጽ ያልሆኑ ነገሮች: only if something important is unclear (otherwise omit this line).\n"
+    "Plain text, no markdown.\n\n[TRANSCRIPT]\n"
 )
 VIDEO_PROMPT = (
     "Analyze this video for Henok (video producer who clips for Whop / TikTok / Shorts). Write in natural "
@@ -886,50 +1443,72 @@ PHOTO_PROMPT = (
 )
 
 
+def normalize_audio_mime(mime):
+    m = (mime or "audio/ogg").split(";")[0].strip().lower()
+    return {"audio/mpeg": "audio/mp3", "audio/x-m4a": "audio/aac", "audio/m4a": "audio/aac",
+            "audio/mp4": "audio/aac", "audio/x-wav": "audio/wav", "application/ogg": "audio/ogg",
+            "audio/opus": "audio/ogg"}.get(m, m)
+
+
 def detect_media(message):
-    """Return (kind, file_id, mime, size) or None."""
+    """Return (kind, file_id, mime, size, duration_seconds) or None."""
     ct = message.content_type
     if ct == "voice":
         v = message.voice
-        return "audio", v.file_id, v.mime_type or "audio/ogg", v.file_size or 0
+        return "audio", v.file_id, v.mime_type or "audio/ogg", v.file_size or 0, getattr(v, "duration", 0) or 0
     if ct == "audio":
         a = message.audio
-        return "audio", a.file_id, a.mime_type or "audio/mpeg", a.file_size or 0
+        return "audio", a.file_id, a.mime_type or "audio/mpeg", a.file_size or 0, getattr(a, "duration", 0) or 0
     if ct == "video":
         v = message.video
-        return "video", v.file_id, v.mime_type or "video/mp4", v.file_size or 0
+        return "video", v.file_id, v.mime_type or "video/mp4", v.file_size or 0, getattr(v, "duration", 0) or 0
     if ct == "video_note":
         v = message.video_note
-        return "video", v.file_id, "video/mp4", v.file_size or 0
+        return "video", v.file_id, "video/mp4", v.file_size or 0, getattr(v, "duration", 0) or 0
     if ct == "photo":
         p = message.photo[-1]
-        return "photo", p.file_id, "image/jpeg", p.file_size or 0
+        return "photo", p.file_id, "image/jpeg", p.file_size or 0, 0
     if ct == "document":
         d = message.document
         mime = (d.mime_type or "").lower()
         if mime.startswith("image/"):
-            return "photo", d.file_id, mime, d.file_size or 0
+            return "photo", d.file_id, mime, d.file_size or 0, 0
         if mime.startswith("video/"):
-            return "video", d.file_id, mime, d.file_size or 0
+            return "video", d.file_id, mime, d.file_size or 0, 0
         if mime.startswith("audio/"):
-            return "audio", d.file_id, mime, d.file_size or 0
+            return "audio", d.file_id, mime, d.file_size or 0, 0
     return None
 
 
-def media_eta(kind, size):
+def media_eta(kind, size, duration=0):
     if kind == "audio":
+        if duration and duration > 180:
+            return "ከ40-90 ሰከንድ"
+        if duration and duration > 60:
+            return "ከ25-50 ሰከንድ"
         return "ከ10-25 ሰከንድ"
     if kind == "video":
         return "ከ30-50 ሰከንድ" if size < 6 * 1024 * 1024 else "ከ45-90 ሰከንድ"
     return ""
 
 
-def format_audio_result(raw):
-    m = re.search(r"===TRANSCRIPT===\s*(.*?)\s*===ANALYSIS===\s*(.*)\Z", raw, re.S)
-    if not m:
-        return polish_amharic(clean_md(raw))
-    transcript, analysis = clean_md(m.group(1)), clean_md(m.group(2))
-    return "📝 ትራንስክሪፕት:\n" + transcript + "\n\n━━━━━━━━━━━━\n" + polish_amharic(analysis)
+def _media_part(data, mime, kind):
+    if len(data) > INLINE_LIMIT_BYTES:
+        uri = gemini_upload_file(data, mime, f"{kind}-{uuid.uuid4().hex[:6]}")
+        return {"fileData": {"mimeType": mime, "fileUri": uri}}
+    return {"inlineData": {"mimeType": mime, "data": base64.b64encode(data).decode("ascii")}}
+
+
+def analyze_voice(data, mime):
+    """Step 1 (Gemini): faithful transcript, thinking disabled/limited and a big output budget so 3-5 minute Amharic
+    voice notes cannot run out of tokens. Step 2 (OpenRouter writer): summary + action items from the transcript."""
+    part = _media_part(data, normalize_audio_mime(mime), "audio")
+    transcript = clean_md(multimodal_generate([{"text": TRANSCRIBE_PROMPT}, part], temperature=0.1,
+                                              max_tokens=32000, thinking_budget=0))
+    analysis, _ = llm_write(SUMMARY_PROMPT + transcript, max_tokens=2500, temperature=0.3)
+    if not analysis:
+        analysis = "⚠️ ማጠቃለያውን አሁን ማዘጋጀት አልተቻለም — ሙሉ ትራንስክሪፕቱ ከታች ነው።"
+    return analysis + "\n\n━━━━━━━━━━━━\n📝 ሙሉ ትራንስክሪፕት:\n" + transcript
 
 
 @bot.message_handler(content_types=["voice", "audio", "video", "video_note", "photo", "document"])
@@ -941,7 +1520,7 @@ def handle_media(message):
     if not info:
         bot.send_message(chat_id, "ሄኖክ፣ ይህን የፋይል አይነት ገና አልተረዳሁም 🙈 ድምፅ፣ ቪዲዮ ወይም ፎቶ ላክልኝ።")
         return
-    kind, file_id, mime, size = info
+    kind, file_id, mime, size, duration = info
     if size and size > MAX_MEDIA_BYTES:
         bot.send_message(chat_id, f"ሄኖክ፣ ፋይሉ {size / 1048576:.1f}MB ነው — እስከ 18MB ብቻ ነው የምተነትነው። "
                                   "አሳጥረህ ወይም compress አድርገህ ላክልኝ 🎞")
@@ -949,7 +1528,7 @@ def handle_media(message):
     ack_id = None
     if kind in ("audio", "video"):
         what = "ድምፁን" if kind == "audio" else "ቪዲዮውን"
-        ack_id = send_progress(chat_id, f"⏳ ሄኖክ፣ {what} እየተነተንኩ ነው ({media_eta(kind, size)} ይወስዳል)...")
+        ack_id = send_progress(chat_id, f"⏳ ሄኖክ፣ {what} እየተነተንኩ ነው ({media_eta(kind, size, duration)} ይወስዳል)...")
     try:
         with Typing(chat_id):
             fobj = bot.get_file(file_id)
@@ -957,39 +1536,42 @@ def handle_media(message):
             if len(data) > MAX_MEDIA_BYTES:
                 deliver(chat_id, ack_id, "ሄኖክ፣ ፋይሉ ከ18MB በላይ ነው — አሳጥረህ ላክልኝ 🎞")
                 return
-            prompt = {"audio": AUDIO_PROMPT, "video": VIDEO_PROMPT, "photo": PHOTO_PROMPT}[kind]
             caption = (message.caption or "").strip()
-            if caption:
-                prompt += f"\n\nHenok's extra instruction/context: {caption}"
-            if len(data) > INLINE_LIMIT_BYTES:
-                uri = gemini_upload_file(data, mime, f"{kind}-{uuid.uuid4().hex[:6]}")
-                media_part = {"fileData": {"mimeType": mime, "fileUri": uri}}
+            if kind == "audio":
+                result = analyze_voice(data, mime)
+                if caption:
+                    result = f"📎 ማስታወሻህ: {caption}\n\n" + result
             else:
-                media_part = {"inlineData": {"mimeType": mime, "data": base64.b64encode(data).decode("ascii")}}
-            raw = multimodal_generate([{"text": prompt}, media_part])
-            result = format_audio_result(raw) if kind == "audio" else polish_amharic(clean_md(raw))
+                prompt = VIDEO_PROMPT if kind == "video" else PHOTO_PROMPT
+                if caption:
+                    prompt += f"\n\nHenok's extra instruction/context: {caption}"
+                raw = multimodal_generate([{"text": prompt}, _media_part(data, mime, kind)],
+                                          temperature=0.5, max_tokens=16000, thinking_budget=1024)
+                result = polish_amharic(clean_md(raw))
         deliver(chat_id, ack_id, result + "\n\n" + took(start))
     except Exception as e:
         log.error("media handling failed: %s", e)
+        what = {"audio": "ድምፁን", "video": "ቪዲዮውን", "photo": "ፎቶውን"}.get(kind, "ፋይሉን")
         deliver(chat_id, ack_id,
-                "ሄኖክ፣ ፋይሉን አሁን ማጠናቀቅ አልቻልኩም 😅 ጥቂት ቆይተህ እንደገና ላክልኝ — "
-                "ቪዲዮ ከሆነ አጠር ያለ ክፍል ብትልክ ይሻላል።")
+                f"ሄኖክ፣ {what} አሁን ማጠናቀቅ አልቻልኩም 😅\n(ምክንያት: {short_reason(e)})\n"
+                "ጥቂት ቆይተህ እንደገና ላክልኝ።")
 
 
 # ----------------------------------------------------------------------------
-# Commands (all instant, all private-owner only)
+# Commands (instant, private-owner only)
 # ----------------------------------------------------------------------------
 HELP_TEXT = (
     "ሰላም ሄኖክ! 👋🔥 እኔ የአንተ የግል ረዳት ነኝ — 24/7 ዝግጁ።\n\n"
     "ምን ላደርግልህ እችላለሁ:\n"
-    "📰 /news — ወቅታዊ ዜና እና ትሬንድ (በቁልፍ ምረጥ)\n"
-    "📝 /post — ፖስት + Canva Blueprint + AI ምስል\n"
-    "🎙 ድምፅ ላክልኝ — ትራንስክሪፕት + ማጠቃለያ + Action Items\n"
+    "📰 /news — ወቅታዊ ዜና (ከታማኝ ምንጮች) በቁልፍ ምረጥ\n"
+    "📝 /post — የሰከላ ኒውስ ካርድ + ፖስት → ✅ ስትነካ ወደ Telegram እና Facebook\n"
+    "📊 /analytics — የ ሰከላ Facebook ገጽ ተከታዮች፣ reach እና ፖስቶች\n"
+    "🎙 ድምፅ ላክልኝ (እስከ 5 ደቂቃ) — ትራንስክሪፕት + ማጠቃለያ + Action Items\n"
     "🎬 ቪዲዮ (እስከ 18MB) — ትንታኔ + 3 ቫይራል ክሊፖች\n"
     "🖼 ፎቶ — የ Canva ዲዛይን አስተያየት\n"
     "💬 ወይም ማንኛውንም ነገር ጻፍልኝ — ስክሪፕት፣ ሀሳብ፣ ጥናት\n"
-    "🩺 /ai_status — የ AI ሞተሮች እና የቻናል ሁኔታ\n\n"
-    "🔒 ያለ አንተ ፈቃድ ምንም አልለጥፍም — ሁሉም በ ✅ / ❌ ቁልፍ ያልፋል።"
+    "🩺 /ai_status — የ AI፣ የቻናል እና የ Facebook ሁኔታ\n\n"
+    "🔒 ያለ አንተ ፈቃድ ምንም አልለጥፍም፤ በፌስቡክ ኮመንቶች ላይም ፈጽሞ አልመልስም።"
 )
 
 
@@ -1019,16 +1601,26 @@ def cmd_cancel(message):
     bot.send_message(message.chat.id, "እሺ ሄኖክ፣ ተሰርዟል ✅")
 
 
+@bot.message_handler(commands=["analytics", "fb_status"])
+@private_owner_only
+def cmd_analytics(message):
+    start = time.time()
+    chat_id = message.chat.id
+    with Typing(chat_id):
+        text = fb_analytics_text()
+    deliver(chat_id, None, text + "\n\n" + took(start))
+
+
 def _gemini_status_lines():
-    lines = []
     if not GEMINI_API_KEY:
         return ["❌ GEMINI_API_KEY አልተሞላም"]
+    lines = []
     try:
         r = requests.get(f"{GEMINI_BASE}/models", headers={"x-goog-api-key": GEMINI_API_KEY},
                          params={"pageSize": 1}, timeout=20)
         lines.append("✅ Gemini API: ንቁ" if r.status_code == 200 else f"⚠️ Gemini API: HTTP {r.status_code}")
     except Exception as e:
-        lines.append(f"⚠️ Gemini API: ግንኙነት አልተሳካም ({str(e)[:60]})")
+        lines.append(f"⚠️ Gemini API: ግንኙነት አልተሳካም ({short_reason(e, 60)})")
     for m in STATUS_GEMINI_MODELS:
         try:
             r = requests.get(f"{GEMINI_BASE}/models/{m}", headers={"x-goog-api-key": GEMINI_API_KEY}, timeout=20)
@@ -1039,7 +1631,7 @@ def _gemini_status_lines():
             else:
                 lines.append(f"  ⚠️ {m} — HTTP {r.status_code}")
         except Exception as e:
-            lines.append(f"  ⚠️ {m} — {str(e)[:50]}")
+            lines.append(f"  ⚠️ {m} — {short_reason(e, 50)}")
     return lines
 
 
@@ -1060,7 +1652,7 @@ def _openrouter_status_lines():
         else:
             lines.append(f"⚠️ OpenRouter ቁልፍ: HTTP {r.status_code} (ቁልፍ ወይም credit ችግር ሊሆን ይችላል)")
     except Exception as e:
-        lines.append(f"⚠️ OpenRouter: ግንኙነት አልተሳካም ({str(e)[:60]})")
+        lines.append(f"⚠️ OpenRouter: ግንኙነት አልተሳካም ({short_reason(e, 60)})")
     try:
         r = requests.get(f"{OPENROUTER_URL}/models", timeout=25)
         ids = {m.get("id") for m in r.json().get("data", [])} if r.status_code == 200 else None
@@ -1078,12 +1670,11 @@ def _openrouter_status_lines():
 
 
 def _channel_status_lines():
-    lines = [f"📣 Target: {TARGET_CHANNEL}"]
+    lines = [f"📣 Telegram target: {TARGET_CHANNEL}"]
     try:
         chat = bot.get_chat(TARGET_CHANNEL)
         lines.append(f"  ✅ ቻናሉ ተገኝቷል: {getattr(chat, 'title', '?')} (id {chat.id})")
-        me = bot.get_me()
-        member = bot.get_chat_member(chat.id, me.id)
+        member = bot.get_chat_member(chat.id, bot.get_me().id)
         status = getattr(member, "status", "?")
         can_post = getattr(member, "can_post_messages", None)
         if status == "administrator" and can_post is not False:
@@ -1091,8 +1682,22 @@ def _channel_status_lines():
         else:
             lines.append(f"  ❌ ቦቱ አድሚን አይደለም ወይም 'Post Messages' ፈቃድ የለውም (status: {status})")
     except Exception as e:
-        lines.append(f"  ❌ ቻናሉን ማግኘት አልተቻለም: {str(e)[:120]}")
+        lines.append(f"  ❌ ቻናሉን ማግኘት አልተቻለም: {short_reason(e, 120)}")
         lines.append("  💡 ቻናሉ public መሆኑን፣ username በትክክል መጻፉን እና ቦቱ አድሚን መሆኑን አረጋግጥ።")
+    return lines
+
+
+def _fb_status_lines():
+    lines = [f"📘 Facebook Page: {FB_PAGE_NAME} (id {FB_PAGE_ID})"]
+    if not FB_PAGE_ACCESS_TOKEN:
+        return lines + ["  ⚪ FB_PAGE_ACCESS_TOKEN አልተሞላም — ወደ ፌስቡክ አይለጠፍም"]
+    try:
+        info = _fb_request("GET", FB_PAGE_ID, params={"fields": "name,followers_count"}, timeout=30)
+        lines.append(f"  ✅ ተገናኝቷል: {info.get('name')} — ተከታዮች {info.get('followers_count', '—')}")
+    except FBError as e:
+        lines.append(f"  ❌ {short_reason(e, 140)}")
+        if fb_error_hint(e):
+            lines.append("  💡 " + fb_error_hint(e))
     return lines
 
 
@@ -1102,13 +1707,17 @@ def cmd_ai_status(message):
     start = time.time()
     chat_id = message.chat.id
     with Typing(chat_id):
-        lines = ["🩺 AI Status\n━━━━━━━━━━━━", "🧠 ዋና ጸሐፊ — OpenRouter:"]
+        lines = ["🩺 System Status\n━━━━━━━━━━━━", "🧠 ዋና ጸሐፊ — OpenRouter:"]
         lines += _openrouter_status_lines()
         lines.append("\n🔎 ምርምር/ሚዲያ — Gemini:")
         lines += _gemini_status_lines()
         lines.append("")
         lines += _channel_status_lines()
-        lines.append(f"\n👤 Owner ID: {OWNER_ID}")
+        lines.append("")
+        lines += _fb_status_lines()
+        font = find_ethiopic_font() if PIL_OK else None
+        lines.append("\n🖼 የካርድ ርዕስ ፊደል (Ethiopic font): " + ("✅ ተገኝቷል" if font else "❌ የለም — NotoSansEthiopic-Bold.ttf ኮሚት አድርግ"))
+        lines.append(f"👤 Owner ID: {OWNER_ID}")
         lines.append(f"🕒 የአዲስ አበባ ሰዓት: {addis_now().strftime('%Y-%m-%d %H:%M')}")
         lines.append("\n" + took(start))
     deliver(chat_id, None, "\n".join(lines))
@@ -1163,28 +1772,11 @@ def on_callback(call):
                 bot.edit_message_reply_markup(chat_id, msg_id, reply_markup=None)
             except Exception:
                 pass
-            run_post(chat_id, item["label"], item["label"], context_text=item["text"])
+            run_post(chat_id, item["label"], item["label"], context_text=item["text"],
+                     context_sources=item.get("sources"))
 
         elif data.startswith("ok:"):
-            did = data.split(":", 1)[1]
-            with state_lock:
-                draft = drafts.pop(did, None)  # pop => can never be double-posted
-            if not draft:
-                bot.edit_message_text("⚠️ ይህ ረቂቅ ጊዜው አልፏል ወይም ቀድሞ ተስተናግዷል።", chat_id, msg_id)
-                return
-            try:
-                publish_draft(draft)
-                bot.edit_message_text(f"✅ ጸድቋል እና ወደ {TARGET_CHANNEL} ተለጥፏል! 🚀", chat_id, msg_id)
-            except Exception as e:
-                log.error("publish failed: %s", e)
-                with state_lock:
-                    drafts[did] = draft  # restore so Henok can retry
-                bot.send_message(
-                    chat_id,
-                    f"ሄኖክ፣ ወደ {TARGET_CHANNEL} መለጠፍ አልተሳካም 😕\nዝርዝር: {str(e)[:200]}\n\n"
-                    "አረጋግጥ:\n• ቻናሉ public ሆኖ username-ው በትክክል መሆኑን (TARGET_CHANNEL)\n"
-                    "• ቦቱ የቻናሉ አድሚን መሆኑን እና 'Post Messages' ፈቃድ እንዳለው\n"
-                    "• /ai_status ለዝርዝር ምርመራ\nከዚያ በድጋሚ ✅ ን መንካት ትችላለህ።")
+            approve_and_publish(chat_id, msg_id, data.split(":", 1)[1])
 
         elif data.startswith("no:"):
             did = data.split(":", 1)[1]
@@ -1262,7 +1854,8 @@ def handle_text(message):
 def main():
     start_health_server()
     start_keepalive()
-    log.info("Starting Henok Assistant agent... target channel: %s", TARGET_CHANNEL)
+    log.info("Starting Henok Assistant agent... Telegram target: %s | Facebook: %s", TARGET_CHANNEL,
+             "on" if fb_enabled() else "off (no FB_PAGE_ACCESS_TOKEN)")
 
     if not TELEGRAM_BOT_TOKEN:
         log.error("TELEGRAM_BOT_TOKEN is missing. Set it in Render environment variables.")
@@ -1272,6 +1865,16 @@ def main():
         log.warning("OPENROUTER_API_KEY missing - Gemini will write everything (weaker Amharic).")
     if not GEMINI_API_KEY:
         log.warning("GEMINI_API_KEY missing - live research and audio/video analysis are disabled.")
+    if not PIL_OK:
+        log.warning("Pillow missing - cards will be sent without the baked headline (pip install Pillow).")
+
+    try:  # long voice notes / media downloads from Telegram
+        apihelper.READ_TIMEOUT = 90
+        apihelper.CONNECT_TIMEOUT = 15
+    except Exception:
+        pass
+    if PIL_OK:  # warm the font cache in the background so the first card is not slow
+        threading.Thread(target=find_ethiopic_font, daemon=True).start()
 
     try:
         bot.remove_webhook()
@@ -1279,9 +1882,10 @@ def main():
         log.warning("remove_webhook failed: %s", e)
     try:
         bot.set_my_commands([
-            types.BotCommand("news", "ወቅታዊ ዜና እና ትሬንድ"),
-            types.BotCommand("post", "ፖስት + Canva + AI ምስል"),
-            types.BotCommand("ai_status", "የ AI እና የቻናል ሁኔታ"),
+            types.BotCommand("news", "ወቅታዊ ዜና (ከታማኝ ምንጮች)"),
+            types.BotCommand("post", "የሰከላ ኒውስ ካርድ + ፖስት"),
+            types.BotCommand("analytics", "የ Facebook ገጽ ትንተና"),
+            types.BotCommand("ai_status", "የ AI፣ ቻናል እና Facebook ሁኔታ"),
             types.BotCommand("cancel", "ሰርዝ"),
             types.BotCommand("help", "እገዛ"),
         ], scope=types.BotCommandScopeAllPrivateChats())
