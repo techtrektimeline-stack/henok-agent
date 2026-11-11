@@ -12,7 +12,7 @@ Facebook : FB_PAGE_ACCESS_TOKEN  (Page access token with pages_manage_posts, pag
            FB_API_VERSION        (default v25.0)
 Optional : OWNER_ID              (default 511440586)
            TARGET_CHANNEL        (default @HenokGraphics)
-           OPENROUTER_MODELS     (comma list; default deepseek/deepseek-chat,openai/gpt-4o-mini,anthropic/claude-3.5-sonnet)
+           OPENROUTER_MODELS     (comma list; default deepseek/deepseek-chat,openai/gpt-4o-mini)
            FONT_PATH             (path to an Ethiopic .ttf; otherwise auto-detected / downloaded, see find_ethiopic_font)
            PORT                  (default 10000)
            RENDER_EXTERNAL_URL   (set automatically by Render; enables self keep-alive)
@@ -25,10 +25,16 @@ Pillow
 
 Architecture
 ------------
-* Writing (chat, news, posts, audio summaries, polishing): OpenRouter first (Claude -> DeepSeek -> GPT-4o-mini),
+* Writing (chat, news, posts, audio summaries, polishing): OpenRouter first (DeepSeek -> GPT-4o-mini),
   Gemini as fallback when OpenRouter is unreachable / out of credits.
-* Research: Gemini + Google Search grounding (English notes, preferring BBC Amharic, Reuters, AP, Fana, DW Amharic,
-  Al Ain...), which the writer turns into Amharic. No verified research -> no news post is drafted.
+* Research: Gemini + Google Search grounding (English notes from Reuters, AP, BBC Amharic, EBC, Fana, ENA, Al Ain,
+  DW Amharic, official government feeds, verified X publishers), retried once; the writer turns it into Amharic in the
+  strict 5-part Sekela News template. If search is down, a manual /post falls back to a clearly-labelled UNVERIFIED
+  editorial draft (second confirmation tap required); the breaking-news hunter never drafts unverified stories.
+* Breaking-news hunter: background thread scans every HUNT_INTERVAL_MIN (default 45) for major verified stories
+  (Gemini search + RSS headlines), drafts the card + copy and pushes it to the owner's DM with approve / cancel buttons.
+  Env: HUNTER_ENABLED=1, HUNT_INTERVAL_MIN=45, HUNT_MIN_IMPORTANCE=8, HUNT_MAX_PER_DAY=4, HUNT_QUIET=23-6 (Addis time),
+  NEWS_RSS_FEEDS="Name|url,Name|url".
 * Voice notes: Gemini only TRANSCRIBES (long-audio safe); the summary / action items are written by the OpenRouter
   writer straight from the transcript, so the Amharic is native and one failure cannot lose the transcript.
 * Sekela News card: AI background (Pollinations, no text) + headline, gradient and brand badge composed locally with
@@ -52,7 +58,9 @@ import tempfile
 import threading
 import time
 import uuid
+import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import quote, urlparse
 
@@ -100,7 +108,7 @@ TARGET_CHANNEL = normalize_channel(os.environ.get("TARGET_CHANNEL", "@HenokGraph
 
 OPENROUTER_MODELS = [m.strip() for m in os.environ.get(
     "OPENROUTER_MODELS",
-    "deepseek/deepseek-chat,openai/gpt-4o-mini,anthropic/claude-3.5-sonnet").split(",") if m.strip()]
+    "deepseek/deepseek-chat,openai/gpt-4o-mini").split(",") if m.strip()]
 OPENROUTER_URL = "https://openrouter.ai/api/v1"
 
 GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta"
@@ -208,19 +216,22 @@ GREET_PHRASES = {"good morning", "good afternoon", "good evening", "እንዴት
                  "ጤና ይስጥልኝ", "ሰላም ነው", "እንዴት ነው", "ደህና ነህ", "እንዴት አለህ"}
 THANKS_PHRASES = {"thanks", "thank you", "thx", "አመሰግናለሁ", "እናመሰግናለን", "ok", "okay", "እሺ", "ጥሩ"}
 
-# Top-tier outlets recognised for the mandatory "ምንጭ፡" line: (display name, regex)
+# Top-tier outlets recognised for the mandatory "📌 ምንጭ፡" line: (Amharic display name, regex)
 OUTLETS = [
-    ("BBC Amharic", r"bbc\s*amharic|bbc\.com/amharic|amharic\.bbc"),
-    ("BBC", r"\bbbc\b"),
-    ("Reuters", r"reuters"),
-    ("AP", r"\bap\b|associated press|apnews"),
-    ("Fana (ፋና)", r"\bfana\b|fanabc|ፋና|\bfbc\b"),
-    ("DW Amharic", r"dw\s*amharic|dw\.com/am"),
-    ("DW", r"\bdw\b|dw\.com|deutsche welle"),
-    ("Al Ain", r"al[\s\-]*ain"),
+    ("ቢቢሲ አማርኛ", r"bbc\s*amharic|bbc\.com/amharic|amharic\.bbc|ቢቢሲ\s*አማርኛ"),
+    ("ቢቢሲ", r"\bbbc\b|ቢቢሲ"),
+    ("ሮይተርስ", r"reuters|ሮይተርስ"),
+    ("AP", r"\bap\b|associated press|apnews|አሶሼትድ ፕሬስ"),
+    ("ፋና", r"\bfana\b|fanabc|ፋና"),
+    ("ኢቢሲ", r"\bebc\b|ethiopian broadcasting|ኢቢሲ"),
+    ("ኢዜአ", r"\bena\b|ethiopian news agency|ena\.et|ኢዜአ"),
+    ("ዶቼ ቬለ አማርኛ", r"dw\s*amharic|dw\.com/am|ዶቼ ቬለ አማርኛ"),
+    ("ዶቼ ቬለ", r"\bdw\b|dw\.com|deutsche welle|ዶቼ ቬለ"),
+    ("አል-አይን", r"al[\s\-]*ain|አል-?አይን"),
     ("AFP", r"\bafp\b"),
-    ("Bloomberg", r"bloomberg"),
-    ("Al Jazeera", r"al[\s\-]*jazeera"),
+    ("ብሎምበርግ", r"bloomberg|ብሎምበርግ"),
+    ("አልጀዚራ", r"al[\s\-]*jazeera|አልጀዚራ"),
+    ("ይፋዊ የመንግሥት መግለጫ", r"\[gov|prime minister'?s office|\bpmo\b|ethiopian government|የመንግሥት መግለጫ"),
 ]
 
 
@@ -509,27 +520,44 @@ def gemini_generate(contents, system=None, grounding=False, temperature=0.8, max
 
 RESEARCH_PROMPT = (
     "Topic: {topic}\n\n"
-    "Search the web and return concise ENGLISH research notes (max 320 words) with the most important, verified, "
-    "recent facts about this topic: concrete numbers, dates, names, what changed and why it matters. "
-    "Prefer reporting from top-tier outlets such as BBC Amharic, Reuters, AP, Fana, DW Amharic and Al Ain (or "
-    "equally reputable international/business media); ignore rumours, anonymous blogs and unverified social posts. "
-    "Bullet points only. After EACH fact put the outlet name in brackets, e.g. [Reuters]. Do not write Amharic. "
-    "Do not invent anything; if you cannot verify something, leave it out."
+    "Search the web and return concise ENGLISH research notes (max 380 words) for a newsroom: the verified facts "
+    "(who, what, when, where), concrete numbers, background and - importantly - any OFFICIAL statements or direct "
+    "quotes with the name/title of the speaker, reactions of authorities or parties, and announced next steps. "
+    "Use only verified top-tier reporting: Reuters, AP, BBC Amharic, EBC, Fana, ENA, Al Ain, DW Amharic, official "
+    "government statements/feeds, and verified news-publisher accounts on X. Ignore rumours, anonymous blogs and "
+    "unverified posts. Bullet points only; after EACH fact put the outlet in brackets, e.g. [Reuters], "
+    "[Gov: Ministry of Finance] or [X: @FanaBC]. Do not write Amharic. Do not invent anything; if something "
+    "cannot be verified, leave it out."
+)
+RESEARCH_LITE_PROMPT = (
+    "What are the latest verified facts about: {topic}? Answer in English bullet points (max 250 words), put the "
+    "outlet name in brackets after each fact, and include official statements and announced next steps if any. "
+    "No Amharic. Do not invent anything."
 )
 
 
-def research(topic):
+def research(topic, lite=False):
     """Live web facts via Gemini + Google Search. Returns (English notes, sources); ("", []) on failure."""
+    prompt = (RESEARCH_LITE_PROMPT if lite else RESEARCH_PROMPT).replace("{topic}", topic)
     try:
         text, sources, model = gemini_generate(
-            [{"role": "user", "parts": [{"text": RESEARCH_PROMPT.replace("{topic}", topic)}]}],
+            [{"role": "user", "parts": [{"text": prompt}]}],
             system="You are a precise news research assistant. Output plain-text English bullet notes only.",
             grounding=True, temperature=0.3, max_tokens=4096)
-        log.info("research done by Gemini %s (%d sources)", model, len(sources))
+        log.info("research done by Gemini %s (%d sources, lite=%s)", model, len(sources), lite)
         return clean_md(text), sources
     except Exception as e:
-        log.warning("research failed: %s", e)
+        log.warning("research failed (lite=%s): %s", lite, e)
         return "", []
+
+
+def research_for(topic):
+    """Research with one automatic second attempt (simpler prompt) if the first search comes back empty."""
+    facts, sources = research(topic)
+    if not facts:
+        time.sleep(3)
+        facts, sources = research(topic, lite=True)
+    return facts, sources
 
 
 def gemini_upload_file(data, mime, display_name):
@@ -732,72 +760,48 @@ def show_categories(chat_id, mode):
 
 
 # ----------------------------------------------------------------------------
-# News digest (for Henok to read; "make a post" turns it into a Sekela News card)
+# Newsroom engine: Amharic news template, sourcing, story discovery
 # ----------------------------------------------------------------------------
-def run_news(chat_id, label, topic):
-    start = time.time()
-    try:
-        with Typing(chat_id):
-            facts, sources = research(topic)
-            prompt = (
-                f"ዘርፍ/ርዕስ: {topic}\n\n"
-                "Write 4-5 punchy, verified insights for ሄኖክ based ONLY on the research notes below. Each insight: "
-                "an emoji + one-line headline, then 1-2 energetic sentences on why it matters to an Ethiopian "
-                "audience. Mention the outlet name inline. Finish with '🎯 ለዛሬ የሰከላ ኒውስ ሀሳብ:' and ONE concrete "
-                "story he can publish. Plain text.\n\n"
-            )
-            if facts:
-                prompt += "[RESEARCH NOTES]\n" + facts
-            else:
-                prompt += ("[Live search was unavailable. Give general insights from your own knowledge and say "
-                           "clearly that they may not be the latest and are unverified.]")
-            text, _ = llm_write(prompt)
-        if not text:
-            deliver(chat_id, None, BUSY_TEXT)
-            return
-        body = text
-        kb = None
-        if facts:  # only verified digests can become a publishable post
-            nid = uuid.uuid4().hex[:10]
-            with state_lock:
-                news_cache[nid] = {"label": label, "text": facts, "sources": sources, "ts": time.time()}
-            prune(news_cache)
-            kb = types.InlineKeyboardMarkup()
-            kb.add(types.InlineKeyboardButton("📰 የሰከላ ኒውስ ካርድ አዘጋጅልኝ", callback_data=f"mk:{nid}"))
-        src = format_sources(sources)
-        if src:
-            body += "\n\n" + src
-        body += "\n\n" + took(start)
-        deliver(chat_id, None, body, kb)
-    except Exception as e:
-        log.error("news failed: %s", e)
-        deliver(chat_id, None, "ሄኖክ፣ ዜናውን አሁን ማምጣት አልቻልኩም 😅 ጥቂት ቆይተህ እንደገና ሞክር።")
+CHANNEL_HANDLE = TARGET_CHANNEL if isinstance(TARGET_CHANNEL, str) else "@HenokGraphics"
+FOOTER = ("🔗 ፈጣን እና ታማኝ መረጃዎችን ለማግኘት የሰከላ ኒውስ ማህበረሰብን ይቀላቀሉ:\n"
+          f"Telegram: {CHANNEL_HANDLE} | Facebook: {FB_PAGE_NAME}")
+NO_OFFICIAL_LINE = "ጉዳዩን በተመለከተ ተጨማሪ መረጃዎች ሲገኙ ሰከላ ኒውስ ያሳውቃል።"
+UNVERIFIED_SOURCE = "ሰከላ ኒውስ ዴስክ (በማረጋገጥ ላይ)"
 
+NEWSROOM_SYSTEM = (
+    "You are the senior Amharic news editor of 'ሰከላ ኒውስ (Sekela News)', writing to the standard of professional "
+    "Ethiopian newsrooms such as Tikvah-ETH, Addis Insight and BBC Amharic.\n"
+    "RULES: pure native Addis Ababa journalistic Amharic in correct Ethiopic script; strict inverted pyramid; "
+    "neutral third person; NEVER address anyone (no አንተ/እናንተ/እኔ/እኛ, no questions, no greetings, never the name ሄኖክ); "
+    "zero conversational filler, no slang, no word-for-word translated idioms or English sentence structure; short, "
+    "factual sentences in news register (አስታወቀ, ገለጸ, ዘግቧል, እንደ ... ገለጻ); attribute every claim and quote to its "
+    "source (e.g. 'ሮይተርስ እንደዘገበው', 'የገንዘብ ሚኒስቴር አስታውቋል'); use ONLY facts, numbers, names and quotes present "
+    "in the research notes; never invent, embellish or speculate; spell names of people and places consistently; keep "
+    "widely used English terms (AI, Bitcoin, Whop) in Latin letters; plain text, no markdown, no emojis inside "
+    "paragraphs."
+)
 
-# ----------------------------------------------------------------------------
-# Sekela News copy: parsing, sourcing, branding
-# ----------------------------------------------------------------------------
-SEKELA_BRIEF = (
-    "You are the editor of 'ሰከላ ኒውስ (Sekela News)', an Amharic news brand for Facebook and Telegram mobile feeds. "
-    "Editorial style: sharp, fast, authoritative and easy to scan.\n"
-    "Topic: {topic}\n\n[RESEARCH NOTES]\n{facts}\n\n"
-    "Write ONE post using ONLY facts found in the research notes (no invented numbers, names or quotes).\n"
-    "Structure:\n"
-    "- Paragraph 1: an undeniable hook, 1-2 punchy sentences opening with the most striking verified fact "
-    "(one fitting emoji at the start is fine).\n"
-    "- Then 4-5 concise paragraphs, 1-2 short sentences each, separated by blank lines: what happened, the key "
-    "numbers/names, why it matters to Ethiopian readers (only if the notes support it), what comes next.\n"
-    "- Then ONE line: ምንጭ፡ <outlet name> using only outlets that appear in the notes (e.g. BBC Amharic, Reuters, AP, "
-    "Fana, DW Amharic, Al Ain).\n"
-    "- Last line: hashtags: #ሰከላ_ኒውስ #SekelaNews #HenokGraphics plus 2-4 specific story hashtags.\n"
-    "Voice: neutral, native Addis Ababa news Amharic; ONE consistent way of addressing readers; no opinion stated as "
-    "fact; no sensational claim the notes do not support. Keep English terms (AI, CapCut, Whop...) in Latin letters.\n\n"
-    "Return EXACTLY these three blocks and nothing else:\n"
-    "===HEADLINE===\n5-7 punchy Amharic words for the poster headline; no quotes, no emoji, no full stop.\n"
-    "===POST===\n(the post as specified above)\n"
+NEWS_BRIEF = (
+    "Write ONE Amharic news item in the strict 5-part inverted-pyramid format from the research notes.\n"
+    "Topic: {topic}\n\n[RESEARCH NOTES]\n{facts}\n\n{mode_note}"
+    "Return EXACTLY these blocks and nothing else:\n"
+    "===HEADLINE===\n5-8 words: a bold, factual, scroll-stopping news headline; no quotes, no emoji, no full stop.\n"
+    "===LEAD===\nThe hook: 1-2 short sentences giving the core of the story directly (who, what, when, where).\n"
+    "===CONTEXT===\n2-4 sentences: the key figures, data and circumstances in detail.\n"
+    "===OFFICIAL===\n2-3 sentences: official statements or direct quotes (attributed to the named official or body), "
+    "reactions of authorities or parties, and the next steps. If the notes contain no official statement or next "
+    "steps, write exactly: " + NO_OFFICIAL_LINE + "\n"
+    "===SOURCE===\nThe outlet names taken from the notes, separated by ' / ' (Amharic names where established: "
+    "ቢቢሲ አማርኛ, ሮይተርስ, ፋና, ኢቢሲ, ኢዜአ, አል-አይን, ዶቼ ቬለ አማርኛ; AP).\n"
+    "===TAG===\nONE specific story hashtag, e.g. #የነዳጅ_ዋጋ or #Bitcoin (no spaces).\n"
     "===IMAGE===\nOne English paragraph, 25-45 words: a symbolic, cinematic photojournalism scene that visualizes the "
     "story's theme (setting, subject matter, lighting, lens, mood, high-contrast colour grade). No identifiable real "
     "people, no text, no logos, no flags, no depiction of violence or casualties.\n"
+)
+UNVERIFIED_NOTE = (
+    "[NO LIVE RESEARCH WAS AVAILABLE] Write a careful editorial synthesis using ONLY well-established background "
+    "facts you are certain of. Do NOT state specific recent numbers, dates, quotes or events. In ===SOURCE=== write "
+    "exactly: " + UNVERIFIED_SOURCE + "\n\n"
 )
 
 IMAGE_STYLE = ("high-contrast cinematic news photography, dramatic lighting, shallow depth of field, ultra detailed, "
@@ -805,90 +809,184 @@ IMAGE_STYLE = ("high-contrast cinematic news photography, dramatic lighting, sha
 IMAGE_FALLBACK = ("a dramatic dusk skyline of a modern African capital with glowing city lights and a newsroom "
                   "feel, teal and orange colour grade")
 
+PKG_KEYS = ("headline", "lead", "context", "official", "source", "tag", "image")
+
 
 def parse_package(text):
-    """Split the writer output into {'headline','post','image'}. Tolerant to missing blocks."""
-    out = {"headline": "", "post": "", "image": ""}
-    parts = re.split(r"===(HEADLINE|POST|CANVA|IMAGE)===", text or "")
-    if len(parts) < 3:
-        out["post"] = (text or "").strip()
-        return out
+    """Split the writer output into its labelled blocks. Missing blocks stay empty."""
+    out = {k: "" for k in PKG_KEYS}
+    parts = re.split(r"===(HEADLINE|LEAD|CONTEXT|OFFICIAL|SOURCE|TAG|IMAGE)===", text or "")
     for i in range(1, len(parts) - 1, 2):
-        key = parts[i].lower()
-        if key in out:
-            out[key] = parts[i + 1].strip()
-    if not out["post"]:
-        out["post"] = (parts[0] or text).strip()
+        out[parts[i].lower()] = parts[i + 1].strip()
     return out
 
 
-def clean_headline(h, fallback_text=""):
-    """Max 7 words, no quotes / leading emoji / trailing full stop."""
-    def _tidy(s):
-        s = re.sub(r"[\"'“”‘’«»]", "", s or "").strip()
-        s = re.sub(r"^[^\wሀ-፿]+", "", s)
-        return s.rstrip(".።").strip()
+def _tidy_headline(s):
+    s = re.sub(r"[\"'“”‘’«»]", "", s or "").strip()
+    s = re.sub(r"^[^\wሀ-፿]+", "", s)  # leading emoji / bullets
+    return s.rstrip(".።").strip()
 
-    h = _tidy(h)
-    if not h:
-        first = next((ln for ln in (fallback_text or "").splitlines() if ln.strip()), "")
-        h = _tidy(first)
-    return " ".join(h.split()[:7])
+
+def clean_headline(h, fallback_text="", max_words=8):
+    """5-8 word headline: no quotes / leading emoji / trailing full stop; falls back to the lead's first words."""
+    h = _tidy_headline(h) or _tidy_headline(fallback_text)
+    return " ".join(h.split()[:max_words])
 
 
 def detect_outlets(text):
+    """Amharic display names of the recognised top-tier outlets mentioned in text."""
     low = (text or "").lower()
     found = [name for name, rx in OUTLETS if re.search(rx, low)]
-    if "BBC Amharic" in found and "BBC" in found:
-        found.remove("BBC")
-    if "DW Amharic" in found and "DW" in found:
-        found.remove("DW")
+    for generic, specific in (("ቢቢሲ", "ቢቢሲ አማርኛ"), ("ዶቼ ቬለ", "ዶቼ ቬለ አማርኛ")):
+        if generic in found and specific in found:
+            found.remove(generic)
     return found
 
 
-def derive_source(facts, sources):
-    blob = (facts or "") + " " + " ".join(f"{t} {u}" for t, u in (sources or []))
-    outlets = detect_outlets(blob)
-    if outlets:
-        return ", ".join(outlets[:3])
+def _blob(facts, sources):
+    return (facts or "") + " " + " ".join(f"{t} {u}" for t, u in (sources or []))
+
+
+def resolve_source(raw_src, facts, sources, unverified=False):
+    """Name the outlet(s) for the mandatory source line. Returns None when no source can be established."""
+    if unverified:
+        return UNVERIFIED_SOURCE
+    found = detect_outlets(raw_src or "") or detect_outlets(_blob(facts, sources))
+    if found:
+        return " / ".join(found[:3])
+    if (raw_src or "").strip():
+        return raw_src.strip()[:80]
     if sources:
-        title = sources[0][0]
-        return title or urlparse(sources[0][1]).netloc or None
+        return sources[0][0] or urlparse(sources[0][1]).netloc or None
     return None
 
 
-_HASHTAG_LINE = re.compile(r"^\s*(?:#\S+\s*)+$")
-_SOURCE_LINE = re.compile(r"^\s*(?:📰\s*|📌\s*)?ምንጭ\s*[:፡]\s*(.+?)\s*$")
+def story_tag(raw, headline):
+    t = (raw or "").strip().split()[0] if (raw or "").strip() else ""
+    t = re.sub(r"[^\wሀ-፿#]", "", t).rstrip("_")
+    if t and not t.startswith("#"):
+        t = "#" + t
+    if len(t) < 3 or t.lower() in {b.lower() for b in BRAND_TAGS}:
+        words = [re.sub(r"[^\wሀ-፿]", "", w) for w in headline.split()[:2]]
+        t = "#" + "_".join(w for w in words if w) if any(words) else "#ዜና"
+    return t
 
 
-def finalize_post(raw, facts="", sources=None):
-    """Normalize the writer's post into: body + 'ምንጭ፡ <outlet>' + hashtags (brand tags always first).
-    Returns None when no source can be established (a news post must never go out unsourced)."""
-    tags, src, body = [], None, []
-    for ln in (raw or "").strip().splitlines():
-        if _HASHTAG_LINE.match(ln):
-            tags += re.findall(r"#\S+", ln)
-            continue
-        m = _SOURCE_LINE.match(ln)
-        if m and src is None:
-            src = m.group(1).strip()
-            continue
-        body.append(ln)
-    body_text = re.sub(r"\n{3,}", "\n\n", "\n".join(body)).strip()
-    if not detect_outlets(src or ""):
-        derived = derive_source(facts, sources)
-        if derived and (detect_outlets(derived) or not src):
-            src = derived
-    if not src or not body_text:
+def _para(s):
+    s = clean_md(s or "")
+    s = re.sub(r"^[\s•\-\*]+", "", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def assemble_news_post(pkg, facts="", sources=None, unverified=False):
+    """Build the post in the exact 5-part Sekela News template. Returns (post, headline) or None if the writer's
+    output is unusable (missing lead / context / source)."""
+    lead, context = _para(pkg.get("lead")), _para(pkg.get("context"))
+    official = _para(pkg.get("official")) or NO_OFFICIAL_LINE
+    if not lead or not context:
         return None
-    seen = {t.lower() for t in BRAND_TAGS}
-    story = []
-    for t in tags:
-        t = t.rstrip(".,;")
-        if t and t.lower() not in seen:
-            seen.add(t.lower())
-            story.append(t)
-    return f"{body_text}\n\nምንጭ፡ {src}\n\n" + " ".join(BRAND_TAGS + story[:5])
+    headline = clean_headline(pkg.get("headline"), lead)
+    if not headline:
+        return None
+    src = resolve_source(pkg.get("source"), facts, sources, unverified)
+    if not src:
+        return None
+    tags = " ".join(BRAND_TAGS + [story_tag(pkg.get("tag"), headline)])
+    post = (f"🔴 {headline}\n\n{lead}\n\n{context}\n\n{official}\n\n"
+            f"📌 ምንጭ፡ {src}\n\n{FOOTER}\n\n{tags}")
+    return post, headline
+
+
+# --- story discovery (used by /news and by the breaking-news hunter) -------------------------------------------
+STORY_PROMPT = (
+    "Search the web NOW and find the most important news from the last {hours} hours about: {focus}\n"
+    "Use only verified top-tier reporting: Reuters, AP, BBC Amharic, EBC, Fana, ENA, Al Ain, DW Amharic, official "
+    "government statements/feeds and verified news-publisher accounts on X. Ignore rumours and unverified posts.\n"
+    "{feeds}"
+    "Return at most {n} stories, ONE per line, in EXACTLY this format (English):\n"
+    "STORY|<importance 1-10>|<headline, max 14 words>|<outlet names, comma separated>|<one sentence with the key fact>\n"
+    "Importance: 9-10 = major national or international breaking development, 7-8 = important, lower = routine. "
+    "If there is nothing significant, output exactly: NONE"
+)
+_STORY_RE = re.compile(r"^\s*STORY\s*\|\s*(\d+)\s*\|(.*?)\|(.*?)\|(.*)$")
+
+
+def parse_story_lines(text):
+    stories = []
+    for ln in (text or "").splitlines():
+        m = _STORY_RE.match(ln.strip())
+        if m:
+            stories.append({"importance": int(m.group(1)), "title": m.group(2).strip(),
+                            "outlets": m.group(3).strip(), "summary": m.group(4).strip()})
+    return sorted(stories, key=lambda s: -s["importance"])
+
+
+def scan_stories(focus, hours=24, n=4, feeds=""):
+    """Gemini + Google Search: top verified stories. Returns (stories, sources); ([], []) on failure."""
+    feed_block = ("RECENT HEADLINES FROM NEWS FEEDS (verify them with search before using):\n" + feeds + "\n\n"
+                  if feeds else "")
+    prompt = (STORY_PROMPT.replace("{hours}", str(hours)).replace("{focus}", focus)
+              .replace("{feeds}", feed_block).replace("{n}", str(n)))
+    try:
+        text, sources, _ = gemini_generate(
+            [{"role": "user", "parts": [{"text": prompt}]}],
+            system="You are a precise news monitoring assistant. Follow the output format exactly.",
+            grounding=True, temperature=0.2, max_tokens=4096)
+        return parse_story_lines(text), sources
+    except Exception as e:
+        log.warning("story scan failed: %s", e)
+        return [], []
+
+
+def amharic_story_lines(stories):
+    """Translate story headlines + summaries into Amharic news style. Returns {index: (headline, summary)}."""
+    if not stories:
+        return {}
+    listing = "\n".join(f"{i}|{s['title']}|{s['summary']}" for i, s in enumerate(stories, 1))
+    prompt = ("Translate these news items into Amharic news style: headline max 8 words, summary ONE sentence. "
+              "Output exactly one line per item in the format N|<headline>|<summary> and nothing else.\n" + listing)
+    text, _ = llm_write(prompt, system=NEWSROOM_SYSTEM, max_tokens=1500, temperature=0.3)
+    out = {}
+    for ln in (text or "").splitlines():
+        m = re.match(r"^\s*(\d+)\s*\|(.+?)\|(.+)$", ln)
+        if m:
+            out[int(m.group(1))] = (clean_headline(m.group(2)), _para(m.group(3)))
+    return out
+
+
+NUM_EMOJI = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣"]
+
+
+def run_news(chat_id, label, topic):
+    """/news: a clean numbered list of verified top stories; each has a button that builds the full card + post."""
+    start = time.time()
+    try:
+        with Typing(chat_id):
+            stories, sources = scan_stories(topic, hours=24, n=4)
+            am = amharic_story_lines(stories) if stories else {}
+        nid = uuid.uuid4().hex[:10]
+        with state_lock:
+            news_cache[nid] = {"label": label, "topic": topic, "stories": stories, "sources": sources,
+                               "ts": time.time()}
+        prune(news_cache)
+        kb = types.InlineKeyboardMarkup()
+        if not stories:
+            kb.add(types.InlineKeyboardButton("📝 ስለ ርዕሱ በቀጥታ ፖስት አዘጋጅ", callback_data=f"mk:{nid}"))
+            deliver(chat_id, None, f"ሄኖክ፣ ስለ «{label}» ከታማኝ ምንጮች አዲስ ትልቅ ዜና አሁን አልተገኘም። "
+                                   "ርዕሱን በቀጥታ ወደ ፖስት መቀየር ትችላለህ 👇\n\n" + took(start), kb)
+            return
+        lines = [f"📰 {label} — ዋና ዋና ዜናዎች (ባለፉት 24 ሰዓታት)", "━━━━━━━━━━━━"]
+        for i, s in enumerate(stories[:4], 1):
+            headline, summary = am.get(i, (clean_headline(s["title"]), s["summary"]))
+            src = " / ".join(detect_outlets(s["outlets"])[:3]) or s["outlets"] or "—"
+            lines.append(f"{NUM_EMOJI[i - 1]} 🔴 {headline}\n{summary}\n📌 ምንጭ፡ {src}")
+            kb.add(types.InlineKeyboardButton(f"{NUM_EMOJI[i - 1]} ካርድ + ፖስት አዘጋጅ", callback_data=f"st:{nid}:{i - 1}"))
+        kb.add(types.InlineKeyboardButton("📝 ሌላ ርዕስ በቀጥታ ፖስት አድርግ", callback_data=f"mk:{nid}"))
+        body = "\n\n".join(lines) + "\n\n" + took(start)
+        deliver(chat_id, None, body, kb)
+    except Exception as e:
+        log.error("news failed: %s", e)
+        deliver(chat_id, None, "ሄኖክ፣ ዜናውን አሁን ማምጣት አልቻልኩም 😅 ጥቂት ቆይተህ እንደገና ሞክር።")
 
 
 # ----------------------------------------------------------------------------
@@ -1180,144 +1278,176 @@ def fb_error_hint(e):
     return ""
 
 
-FB_INSIGHT_CANDIDATES = [
-    ("page_total_media_view_unique", "👀 Reach (ልዩ ተመልካቾች)"),
-    ("page_media_view", "📈 Views (እይታዎች)"),
-    ("page_post_engagements", "💬 Engagement (ተሳትፎ)"),
-    ("page_daily_follows", "➕ አዲስ ተከታዮች"),
+FB_INSIGHT_CANDIDATES = [  # (metric, label, how to aggregate the last 7 daily values)
+    ("page_total_media_view_unique", "👀 Reach (ልዩ ተመልካቾች)", "sum"),
+    ("page_media_view", "📈 Views (እይታዎች)", "sum"),
+    ("page_post_engagements", "💬 Engagement (ተሳትፎ)", "sum"),
+    ("page_daily_follows", "➕ አዲስ ተከታዮች", "sum"),
+    ("page_follows", "👥 ጠቅላላ ተከታዮች", "last"),
 ]
 
 
-def _sum_values(js):
-    total = 0
+def _insight_value(js, mode):
+    vals = []
     for item in js.get("data", [])[:1]:
         for v in item.get("values", []):
             val = v.get("value")
             if isinstance(val, (int, float)):
-                total += val
+                vals.append(val)
             elif isinstance(val, dict):
-                total += sum(x for x in val.values() if isinstance(x, (int, float)))
-    return int(total)
+                vals.append(sum(x for x in val.values() if isinstance(x, (int, float))))
+    if not vals:
+        return None
+    return int(vals[-1] if mode == "last" else sum(vals))
 
 
 def fb_analytics_text():
+    """Page name/id via `me?fields=name,id` (works with a Page token; `followers_count` is NOT requested - it caused
+    Graph error 100), 7-day insights (each metric optional) and the latest post counters."""
     if not fb_enabled():
         return "⚪ ፌስቡክ አልተዋቀረም — በ Render ላይ FB_PAGE_ACCESS_TOKEN ጨምር።"
     lines = [f"📊 {FB_PAGE_NAME} — Facebook Analytics", "━━━━━━━━━━━━"]
     try:
-        info = _fb_request("GET", "me", params={"fields": "name,id"}, timeout=40)
-        followers = info.get("followers_count", info.get("fan_count"))
-        lines.append(f"📄 ገጽ: {info.get('name', FB_PAGE_NAME)}")
-        lines.append(f"👥 ተከታዮች: {followers:,}" if isinstance(followers, int) else "👥 ተከታዮች: —")
+        me = _fb_request("GET", "me", params={"fields": "name,id"}, timeout=40)
+        lines.append(f"📄 ገጽ: {me.get('name', FB_PAGE_NAME)} (id {me.get('id', FB_PAGE_ID)})")
+        if me.get("id") and str(me["id"]) != str(FB_PAGE_ID):
+            lines.append("⚠️ ቶክኑ የሌላ ገጽ ነው — FB_PAGE_ID እና ቶክኑ አይዛመዱም።")
     except FBError as e:
         return "\n".join(lines + [f"❌ የገጹን መረጃ ማምጣት አልተቻለም: {short_reason(e)}", fb_error_hint(e)]).strip()
 
     now = int(time.time())
-    got, tried = [], 0
-    for metric, label in FB_INSIGHT_CANDIDATES:
-        tried += 1
+    got = []
+    for metric, label, mode in FB_INSIGHT_CANDIDATES:
         try:
             js = _fb_request("GET", f"{FB_PAGE_ID}/insights",
                              params={"metric": metric, "period": "day", "since": now - 7 * 86400, "until": now},
                              timeout=40)
-            got.append(f"{label}: {_sum_values(js):,}")
+            val = _insight_value(js, mode)
+            if val is not None:
+                got.append(f"{label}: {val:,}")
         except FBError as e:
             log.info("insight %s unavailable: %s", metric, e)
     lines.append("\n🗓 ባለፉት 7 ቀናት:")
     lines += got if got else ["• Insights ማግኘት አልተቻለም (read_insights ፈቃድ ወይም የ Meta metric ለውጥ ሊሆን ይችላል)።"]
 
     lines.append("\n📰 የቅርብ ጊዜ ፖስቶች:")
-    try:
-        posts = _fb_request(
-            "GET", f"{FB_PAGE_ID}/posts",
-            params={"fields": "message,created_time,permalink_url,reactions.summary(total_count).limit(0),"
-                              "comments.summary(total_count).limit(0),shares", "limit": 5}, timeout=40).get("data", [])
-        if not posts:
-            lines.append("• ፖስት አልተገኘም")
-        for p in posts:
-            msg = re.sub(r"\s+", " ", p.get("message", "") or "(ያለ ጽሑፍ)")[:55]
+    rich = ("message,created_time,permalink_url,reactions.summary(total_count).limit(0),"
+            "comments.summary(total_count).limit(0),shares")
+    posts = None
+    for fields in (rich, "message,created_time,permalink_url"):
+        try:
+            posts = _fb_request("GET", f"{FB_PAGE_ID}/posts", params={"fields": fields, "limit": 5},
+                                timeout=40).get("data", [])
+            break
+        except FBError as e:
+            log.info("posts query (%s) failed: %s", fields[:20], e)
+    if posts is None:
+        lines.append("• ማምጣት አልተቻለም (pages_read_engagement ፈቃድ ያስፈልጋል)")
+    elif not posts:
+        lines.append("• ፖስት አልተገኘም")
+    for p in posts or []:
+        msg = re.sub(r"\s+", " ", p.get("message", "") or "(ያለ ጽሑፍ)")[:55]
+        row = f"• {p.get('created_time', '')[:10]} — {msg}"
+        if "reactions" in p or "comments" in p:
             react = ((p.get("reactions") or {}).get("summary") or {}).get("total_count", 0)
             comm = ((p.get("comments") or {}).get("summary") or {}).get("total_count", 0)
             shares = (p.get("shares") or {}).get("count", 0)
-            lines.append(f"• {p.get('created_time', '')[:10]} — {msg}\n   ❤️ {react} · 💬 {comm} · 🔁 {shares}")
-    except FBError as e:
-        lines.append(f"• ማምጣት አልተቻለም: {short_reason(e)}")
+            row += f"\n   ❤️ {react} · 💬 {comm} · 🔁 {shares}"
+        lines.append(row)
     return "\n".join(lines)
 
 
 # ----------------------------------------------------------------------------
 # Post package: Sekela News card + copy -> preview -> approval -> Telegram + Facebook
 # ----------------------------------------------------------------------------
+def build_draft(topic, facts=None, sources=None, allow_fallback=True):
+    """Research -> Amharic news copy (template) -> AI background -> Sekela card. No Telegram I/O.
+    Returns a draft dict or None. With allow_fallback=False (the autonomous hunter) an unverifiable story is dropped;
+    with allow_fallback=True (manual /post) an editorial synthesis is drafted but flagged `unverified`."""
+    sources = list(sources or [])
+    if not facts:
+        facts, sources = research_for(topic)
+    unverified = not facts
+    if unverified and not allow_fallback:
+        return None
+    built, pkg = None, {}
+    for attempt in range(2):
+        brief = (NEWS_BRIEF.replace("{topic}", topic)
+                 .replace("{facts}", facts or "(none)")
+                 .replace("{mode_note}", UNVERIFIED_NOTE if unverified else ""))
+        text, _ = llm_write(brief, system=NEWSROOM_SYSTEM, max_tokens=2600, temperature=0.6 if attempt == 0 else 0.4)
+        if not text:
+            continue
+        pkg = parse_package(text)
+        built = assemble_news_post(pkg, facts or "", sources, unverified)
+        if built:
+            break
+    if not built:
+        return None
+    post, headline = built
+    bg = fetch_image(build_image_prompt(pkg.get("image")))
+    card = compose_card(bg, headline) if bg else None
+    return {"post": post, "headline": headline, "image": card or bg, "card": bool(card),
+            "sources": sources, "unverified": unverified}
+
+
+def present_draft(chat_id, label, d, header, start=None):
+    """Send the card preview + details with the approval buttons, and register the draft for publishing."""
+    post, headline, image = d["post"], d["headline"], d.get("image")
+    caption_fits = len(post) <= CAPTION_LIMIT
+    file_id = None
+    if image:
+        try:
+            sent = bot.send_photo(chat_id, _as_photo(image), caption=post if caption_fits else f"🔴 {headline}")
+            file_id = sent.photo[-1].file_id
+        except Exception as e:
+            log.error("sending preview photo failed: %s", e)
+
+    did = uuid.uuid4().hex[:10]
+    with state_lock:
+        drafts[did] = {"post": post, "file_id": file_id, "image": image, "headline": headline,
+                       "unverified": d.get("unverified", False), "confirmed": False,
+                       "tg": False, "fb": False, "busy": False, "ts": time.time()}
+    prune(drafts)
+
+    details = [header]
+    if not (file_id and caption_fits):
+        details.append("━━━━━━━━━━━━\n" + post)
+    if d.get("unverified"):
+        details.append("⚠️ ቀጥታ የዜና ፍለጋ አልተሳካም — ይህ ረቂቅ በታወቁ እውነታዎች ላይ ብቻ የተመሠረተ ነው፤ ምንጩ አልተረጋገጠም። "
+                       "ከመለጠፍህ በፊት አረጋግጥ (ሲያጸድቅ ሁለተኛ ማረጋገጫ ይጠየቃል)።")
+    if not image:
+        details.append("⚠️ ምስሉ በዚህ ጊዜ አልተሳካም — ያለ ምስል መለጠፍ ወይም ሰርዘህ እንደገና መጠየቅ ትችላለህ።")
+    elif not d.get("card"):
+        details.append("⚠️ ርዕሱን በምስሉ ላይ ማተም አልተቻለም (Ethiopic font የለም) — ርዕሱ በፖስቱ ጽሑፍ ውስጥ አለ። "
+                       "NotoSansEthiopic-Bold.ttf ን ከ agent.py ጎን ኮሚት አድርግ።")
+    src = format_sources(d.get("sources"), limit=4)
+    if src:
+        details.append(src)
+    targets = [str(TARGET_CHANNEL)] + ([FB_PAGE_NAME + " (Facebook)"] if fb_enabled() else [])
+    details.append("━━━━━━━━━━━━\n🔒 ✅ ከነካህ ብቻ ይለጠፋል → " + " + ".join(targets) +
+                   "\nበፌስቡክ ኮመንቶች ላይ ቦቱ ፈጽሞ አይመልስም።")
+    if start:
+        details.append(took(start))
+    kb = types.InlineKeyboardMarkup()
+    kb.add(
+        types.InlineKeyboardButton("✅ አጽድቅና ፖስት አድርግ", callback_data=f"ok:{did}"),
+        types.InlineKeyboardButton("❌ ሰርዝ", callback_data=f"no:{did}"),
+    )
+    deliver(chat_id, None, "\n\n".join(details), kb)
+    return did
+
+
 def run_post(chat_id, label, topic, context_text=None, context_sources=None):
     start = time.time()
     ack_id = send_progress(
         chat_id, "⏳ ሄኖክ፣ ጥናቱን አድርጌ የሰከላ ኒውስ ፖስቱን እና AI ምስሉን እያዘጋጀሁ ነው (ከ20-40 ሰከንድ ይወስዳል)...")
     try:
-        if context_text:
-            facts, sources = context_text, context_sources or []
-        else:
-            facts, sources = research(topic)
-        if not facts:
-            facts = f"Major verified industry news, updates and strategic developments concerning {topic}."
-            if not sources:
-                sources = [("ሰከላ ኒውስ (Sekela News)", "https://facebook.com/1252817724577069")]
-        brief = SEKELA_BRIEF.replace("{topic}", topic).replace("{facts}", facts)
-        text, _ = llm_write(brief, max_tokens=2600)
-        if not text:
-            deliver(chat_id, ack_id, BUSY_TEXT)
+        d = build_draft(topic, facts=context_text, sources=context_sources, allow_fallback=True)
+        if not d:
+            deliver(chat_id, ack_id, "ሄኖክ፣ ዜናውን አሁን ማዘጋጀት አልቻልኩም 😕 ጥቂት ቆይተህ ደግመህ ሞክር።")
             return
-        pkg = parse_package(text)
-        final = finalize_post(pkg["post"] or text, facts, sources)
-        if not final:
-            deliver(chat_id, ack_id, "ሄኖክ፣ ለፖስቱ ምንጭ ማረጋገጥ አልቻልኩም 😕 ያለ ምንጭ አልለጥፍም — እንደገና ሞክር።")
-            return
-        headline = clean_headline(pkg["headline"], final)
-        bg = fetch_image(build_image_prompt(pkg["image"]))
-        card = compose_card(bg, headline) if bg else None
-        image = card or bg
-        post = final if (card or not bg) else f"📰 {headline}\n\n{final}"
-
-        # --- preview to Henok: the card (+ caption if it fits), then details + approval buttons
-        file_id = None
-        caption_fits = len(post) <= CAPTION_LIMIT
-        if image:
-            try:
-                sent = bot.send_photo(chat_id, _as_photo(image),
-                                      caption=post if caption_fits else f"📰 {headline}")
-                file_id = sent.photo[-1].file_id
-            except Exception as e:
-                log.error("sending preview photo failed: %s", e)
-
-        did = uuid.uuid4().hex[:10]
-        with state_lock:
-            drafts[did] = {"post": post, "file_id": file_id, "image": image, "headline": headline,
-                           "tg": False, "fb": False, "busy": False, "ts": time.time()}
-        prune(drafts)
-
-        details = []
-        if not (file_id and caption_fits):
-            details.append(f"📝 ረቂቅ — {label}\n━━━━━━━━━━━━\n{post}")
-        else:
-            details.append(f"📝 የሰከላ ኒውስ ረቂቅ ዝግጁ ነው — {label}")
-        details.append(f"📰 የካርዱ ርዕስ: {headline}")
-        if not image:
-            details.append("⚠️ ምስሉ በዚህ ጊዜ አልተሳካም — ያለ ምስል መለጠፍ ወይም ሰርዘህ እንደገና መጠየቅ ትችላለህ።")
-        elif not card:
-            details.append("⚠️ ርዕሱን በምስሉ ላይ ማተም አልተቻለም (Ethiopic font የለም) — ርዕሱ በፖስቱ ጽሑፍ ውስጥ ገብቷል። "
-                           "NotoSansEthiopic-Bold.ttf ን ከ agent.py ጎን ኮሚት አድርግ።")
-        src = format_sources(sources)
-        if src:
-            details.append(src)
-        targets = [str(TARGET_CHANNEL)] + ([FB_PAGE_NAME + " (Facebook)"] if fb_enabled() else [])
-        details.append("━━━━━━━━━━━━\n🔒 ✅ ከነካህ ብቻ ይለጠፋል → " + " + ".join(targets) +
-                       "\nበፌስቡክ ኮመንቶች ላይ ቦቱ ፈጽሞ አይመልስም።")
-        details.append(took(start))
-        kb = types.InlineKeyboardMarkup()
-        kb.add(
-            types.InlineKeyboardButton("✅ አጽድቅና ፖስት አድርግ", callback_data=f"ok:{did}"),
-            types.InlineKeyboardButton("❌ ሰርዝ", callback_data=f"no:{did}"),
-        )
-        deliver(chat_id, None, "\n\n".join(details), kb)
+        present_draft(chat_id, label, d, f"📝 የሰከላ ኒውስ ረቂቅ ዝግጁ ነው — {label}", start)
         drop_message(chat_id, ack_id)
     except Exception as e:
         log.error("post failed: %s", e)
@@ -1405,6 +1535,138 @@ def approve_and_publish(chat_id, msg_id, did):
                      "መሆኑን አረጋግጥ — /ai_status ያሳይሃል።")
         bot.edit_message_text(f"⚠️ በከፊል ተሳክቷል\n{tg_line}\n{fb_line}{extra}\n\nየተሳካው እንደገና አይለጠፍም።",
                               chat_id, msg_id, reply_markup=retry_keyboard(did))
+
+
+# ----------------------------------------------------------------------------
+# Proactive breaking-news hunter (background thread -> push to Henok's private DM)
+# ----------------------------------------------------------------------------
+HUNT_HEADER = "🔔 ሄኖክ፣ አዲስ ሰበር ዜና አዘጋጅቼልሃለሁ! ይሄንን ለሰከላ ኒውስ ፖስት እናድርገው?"
+HUNT_FOCUS = ("Ethiopia (top priority: government and politics, economy and prices, diplomacy, security developments as "
+              "reported by official or verified outlets, infrastructure, major events in Addis Ababa) and major "
+              "international developments that matter to Ethiopians (Horn of Africa, African Union, global economy, "
+              "AI/tech, crypto markets)")
+
+hunt_lock = threading.Lock()
+hunt_seen = []                               # [(token_set, timestamp)] stories already offered (last 24h)
+hunt_daily = {"date": "", "count": 0}
+
+
+def _title_tokens(title):
+    return {w for w in re.findall(r"[a-z0-9]+", (title or "").lower()) if len(w) > 3}
+
+
+def _is_seen(title):
+    now, tokens = time.time(), _title_tokens(title)
+    hunt_seen[:] = [(t, ts) for t, ts in hunt_seen if now - ts < 86400]
+    for t, _ in hunt_seen:
+        if len(tokens) >= 2 and len(t) >= 2 and len(tokens & t) / min(len(tokens), len(t)) >= 0.6:
+            return True
+    return False
+
+
+def _mark_seen(title):
+    hunt_seen.append((_title_tokens(title), time.time()))
+
+
+def in_quiet_hours(hour=None):
+    """HUNT_QUIET like '23-6' (Addis Ababa time): no scans / pushes during those hours. '' disables."""
+    spec = os.environ.get("HUNT_QUIET", "23-6").strip()
+    m = re.fullmatch(r"(\d{1,2})-(\d{1,2})", spec)
+    if not m:
+        return False
+    a, b = int(m.group(1)), int(m.group(2))
+    h = addis_now().hour if hour is None else hour
+    return (h >= a or h < b) if a > b else (a <= h < b)
+
+
+def fetch_feed_headlines(max_age_hours=8, per_feed=6):
+    """Recent headlines from configured RSS feeds (best effort; a dead feed is simply skipped)."""
+    spec = os.environ.get("NEWS_RSS_FEEDS",
+                          "BBC Amharic|https://feeds.bbci.co.uk/amharic/rss.xml,Fana|https://www.fanabc.com/feed/")
+    lines = []
+    for item in [s for s in spec.split(",") if "|" in s]:
+        name, url = [x.strip() for x in item.split("|", 1)]
+        try:
+            r = requests.get(url, timeout=12, headers={"User-Agent": "Mozilla/5.0 SekelaNewsBot"})
+            if r.status_code != 200:
+                continue
+            root = ET.fromstring(r.content)
+            n = 0
+            for it in root.iter("item"):
+                title = (it.findtext("title") or "").strip()
+                pub = it.findtext("pubDate")
+                if pub:
+                    try:
+                        dt = parsedate_to_datetime(pub)
+                        if dt.tzinfo and (datetime.now(timezone.utc) - dt).total_seconds() > max_age_hours * 3600:
+                            continue
+                    except Exception:
+                        pass
+                if title:
+                    lines.append(f"- [{name}] {title}")
+                    n += 1
+                if n >= per_feed:
+                    break
+        except Exception as e:
+            log.info("feed %s unavailable: %s", name, e)
+    return "\n".join(lines)
+
+
+def hunt_once(manual=False, min_importance=None):
+    """One scan. Finds a major, not-yet-offered, VERIFIED story, drafts the card + copy and pushes it to Henok with
+    the approve/cancel buttons. Returns a status string: sent | none | unverified | failed | busy | cap | nokey."""
+    if not hunt_lock.acquire(blocking=False):
+        return "busy"
+    try:
+        if not GEMINI_API_KEY:
+            return "nokey"
+        today = addis_now().strftime("%Y-%m-%d")
+        if hunt_daily["date"] != today:
+            hunt_daily.update(date=today, count=0)
+        if not manual and hunt_daily["count"] >= int(os.environ.get("HUNT_MAX_PER_DAY", "4")):
+            return "cap"
+        threshold = min_importance if min_importance is not None else int(os.environ.get("HUNT_MIN_IMPORTANCE", "8"))
+        stories, _ = scan_stories(HUNT_FOCUS, hours=3, n=3, feeds=fetch_feed_headlines())
+        fresh = [s for s in stories if s["importance"] >= threshold and not _is_seen(s["title"])]
+        if not fresh:
+            return "none"
+        story = fresh[0]
+        _mark_seen(story["title"])
+        start = time.time()
+        topic = f"{story['title']}. {story['summary']}"
+        facts, sources = research_for(topic)
+        if not facts:
+            return "unverified"  # the hunter never drafts what it cannot verify
+        d = build_draft(topic, facts=facts, sources=sources, allow_fallback=False)
+        if not d:
+            return "failed"
+        present_draft(OWNER_ID, "ሰበር ዜና", d, HUNT_HEADER, start)
+        hunt_daily["count"] += 1
+        return "sent"
+    except Exception as e:
+        log.error("hunt failed: %s", e)
+        return "failed"
+    finally:
+        hunt_lock.release()
+
+
+def hunter_loop():
+    time.sleep(180)
+    while True:
+        try:
+            if not in_quiet_hours():
+                log.info("breaking-news hunt: %s", hunt_once())
+        except Exception as e:
+            log.error("hunter loop error: %s", e)
+        time.sleep(max(5, int(os.environ.get("HUNT_INTERVAL_MIN", "45"))) * 60)
+
+
+def start_hunter():
+    if os.environ.get("HUNTER_ENABLED", "1") == "0" or not GEMINI_API_KEY:
+        return
+    threading.Thread(target=hunter_loop, daemon=True, name="hunter").start()
+    log.info("Breaking-news hunter started (every %s min, quiet hours %s Addis time)",
+             os.environ.get("HUNT_INTERVAL_MIN", "45"), os.environ.get("HUNT_QUIET", "23-6") or "off")
 
 
 # ----------------------------------------------------------------------------
@@ -1562,7 +1824,8 @@ def handle_media(message):
 HELP_TEXT = (
     "ሰላም ሄኖክ! 👋🔥 እኔ የአንተ የግል ረዳት ነኝ — 24/7 ዝግጁ።\n\n"
     "ምን ላደርግልህ እችላለሁ:\n"
-    "📰 /news — ወቅታዊ ዜና (ከታማኝ ምንጮች) በቁልፍ ምረጥ\n"
+    "📰 /news — ዋና ዋና ዜናዎች (ከታማኝ ምንጮች) → ቁልፍ ስትነካ ካርድ + ፖስት\n"
+    "🔔 /breaking — ሰበር ዜና አሁን ፈልግ (ቦቱ በራሱም ይፈትሻል እና ያሳውቅሃል)\n"
     "📝 /post — የሰከላ ኒውስ ካርድ + ፖስት → ✅ ስትነካ ወደ Telegram እና Facebook\n"
     "📊 /analytics — የ ሰከላ Facebook ገጽ ተከታዮች፣ reach እና ፖስቶች\n"
     "🎙 ድምፅ ላክልኝ (እስከ 5 ደቂቃ) — ትራንስክሪፕት + ማጠቃለያ + Action Items\n"
@@ -1608,6 +1871,27 @@ def cmd_analytics(message):
     with Typing(chat_id):
         text = fb_analytics_text()
     deliver(chat_id, None, text + "\n\n" + took(start))
+
+
+@bot.message_handler(commands=["breaking", "hunt"])
+@private_owner_only
+def cmd_breaking(message):
+    start = time.time()
+    chat_id = message.chat.id
+    ack_id = send_progress(chat_id, "⏳ ሄኖክ፣ ሰበር ዜናዎችን እየፈተሽኩ ነው (ከ40-70 ሰከንድ ይወስዳል)...")
+    status = hunt_once(manual=True, min_importance=7)
+    if status == "sent":
+        drop_message(chat_id, ack_id)
+        return
+    msgs = {
+        "none": "ሄኖክ፣ አሁን ለሰከላ ኒውስ የሚሆን አዲስ ትልቅ ሰበር ዜና አልተገኘም። ሲገኝ በራሴ አሳውቅሃለሁ 🔔",
+        "unverified": "ሄኖክ፣ አንድ ዜና አገኘሁ ግን ከታማኝ ምንጭ ማረጋገጥ አልቻልኩም — ያልተረጋገጠ ዜና አላዘጋጅም።",
+        "failed": "ሄኖክ፣ ዜናውን አሁን ማዘጋጀት አልቻልኩም 😅 ጥቂት ቆይተህ እንደገና ሞክር።",
+        "busy": "ሄኖክ፣ ፍተሻው አሁን እየተካሄደ ነው — ጥቂት ቆይተህ ሞክር።",
+        "nokey": "GEMINI_API_KEY አልተሞላም — ሰበር ዜና መፈለግ አልችልም።",
+        "cap": "የዛሬው የሰበር ዜና ገደብ ደርሷል።",
+    }
+    deliver(chat_id, ack_id, msgs.get(status, msgs["failed"]) + "\n\n" + took(start))
 
 
 def _gemini_status_lines():
@@ -1691,8 +1975,10 @@ def _fb_status_lines():
     if not FB_PAGE_ACCESS_TOKEN:
         return lines + ["  ⚪ FB_PAGE_ACCESS_TOKEN አልተሞላም — ወደ ፌስቡክ አይለጠፍም"]
     try:
-        info = _fb_request("GET", "me", params={"fields": "name,id"}, timeout=30)
-        lines.append(f"  ✅ ተገናኝቷል: {info.get('name')} (id: {info.get('id')})")
+        me = _fb_request("GET", "me", params={"fields": "name,id"}, timeout=30)
+        lines.append(f"  ✅ ተገናኝቷል: {me.get('name')} (id {me.get('id')})")
+        if me.get("id") and str(me["id"]) != str(FB_PAGE_ID):
+            lines.append("  ⚠️ ቶክኑ የሌላ ገጽ ነው — FB_PAGE_ID እና ቶክኑ አይዛመዱም")
     except FBError as e:
         lines.append(f"  ❌ {short_reason(e, 140)}")
         if fb_error_hint(e):
@@ -1767,15 +2053,41 @@ def on_callback(call):
             if not item:
                 bot.send_message(chat_id, "ሄኖክ፣ ይህ መረጃ ጊዜው አልፏል — /news ብለህ እንደገና ጠይቀኝ 🙏")
                 return
-            try:
-                bot.edit_message_reply_markup(chat_id, msg_id, reply_markup=None)
-            except Exception:
-                pass
-            run_post(chat_id, item["label"], item["label"], context_text=item["text"],
-                     context_sources=item.get("sources"))
+            run_post(chat_id, item["label"], item["topic"])
+
+        elif data.startswith("st:"):
+            _, nid, idx = data.split(":", 2)
+            with state_lock:
+                item = news_cache.get(nid)
+            if not item or not item["stories"] or int(idx) >= len(item["stories"]):
+                bot.send_message(chat_id, "ሄኖክ፣ ይህ መረጃ ጊዜው አልፏል — /news ብለህ እንደገና ጠይቀኝ 🙏")
+                return
+            s = item["stories"][int(idx)]
+            run_post(chat_id, item["label"], f"{s['title']}. {s['summary']}")
 
         elif data.startswith("ok:"):
-            approve_and_publish(chat_id, msg_id, data.split(":", 1)[1])
+            did = data.split(":", 1)[1]
+            with state_lock:
+                d = drafts.get(did)
+            if d is not None and d.get("unverified") and not d.get("confirmed"):
+                bot.send_message(chat_id, "⚠️ ይህ ረቂቅ ያልተረጋገጠ ነው (ቀጥታ ምንጭ አልተገኘም)። ወደ ህዝብ ከመውጣቱ በፊት "
+                                          "በእርግጥ ማጽደቅ ትፈልጋለህ?")
+                kb = types.InlineKeyboardMarkup()
+                kb.add(types.InlineKeyboardButton("⚠️ አዎ፣ ያልተረጋገጠ መሆኑን አውቄ ፖስት አድርግ", callback_data=f"okc:{did}"))
+                kb.add(types.InlineKeyboardButton("❌ ሰርዝ", callback_data=f"no:{did}"))
+                try:
+                    bot.edit_message_reply_markup(chat_id, msg_id, reply_markup=kb)
+                except Exception:
+                    pass
+                return
+            approve_and_publish(chat_id, msg_id, did)
+
+        elif data.startswith("okc:"):
+            did = data.split(":", 1)[1]
+            with state_lock:
+                if did in drafts:
+                    drafts[did]["confirmed"] = True
+            approve_and_publish(chat_id, msg_id, did)
 
         elif data.startswith("no:"):
             did = data.split(":", 1)[1]
@@ -1874,6 +2186,7 @@ def main():
         pass
     if PIL_OK:  # warm the font cache in the background so the first card is not slow
         threading.Thread(target=find_ethiopic_font, daemon=True).start()
+    start_hunter()  # proactive breaking-news hunter
 
     try:
         bot.remove_webhook()
@@ -1881,7 +2194,8 @@ def main():
         log.warning("remove_webhook failed: %s", e)
     try:
         bot.set_my_commands([
-            types.BotCommand("news", "ወቅታዊ ዜና (ከታማኝ ምንጮች)"),
+            types.BotCommand("news", "ዋና ዋና ዜናዎች (ከታማኝ ምንጮች)"),
+            types.BotCommand("breaking", "ሰበር ዜና አሁን ፈልግ"),
             types.BotCommand("post", "የሰከላ ኒውስ ካርድ + ፖስት"),
             types.BotCommand("analytics", "የ Facebook ገጽ ትንተና"),
             types.BotCommand("ai_status", "የ AI፣ ቻናል እና Facebook ሁኔታ"),
