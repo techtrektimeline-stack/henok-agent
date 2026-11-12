@@ -7,41 +7,43 @@ Runs 24/7 on Render (Python 3 + pyTelegramBotAPI). Single file.
 Environment variables
 ---------------------
 Required : TELEGRAM_BOT_TOKEN, OPENROUTER_API_KEY, GEMINI_API_KEY
-Facebook : FB_PAGE_ACCESS_TOKEN  (Page access token with pages_manage_posts, pages_read_engagement, read_insights)
+Facebook : FB_PAGE_ACCESS_TOKEN  (NEVER-EXPIRING Page access token: pages_manage_posts, pages_read_engagement, read_insights)
            FB_PAGE_ID            (default 1252817724577069)
            FB_API_VERSION        (default v25.0)
+YouTube  : YOUTUBE_CLIENT_ID, YOUTUBE_CLIENT_SECRET, YOUTUBE_REFRESH_TOKEN
+           YT_PRIVACY            (public | unlisted | private; default public - upload happens ONLY after approval tap)
 Optional : OWNER_ID              (default 511440586)
            TARGET_CHANNEL        (default @HenokGraphics)
            OPENROUTER_MODELS     (comma list; default deepseek/deepseek-chat,openai/gpt-4o-mini)
-           FONT_PATH             (path to an Ethiopic .ttf; otherwise auto-detected / downloaded, see find_ethiopic_font)
-           PORT                  (default 10000)
-           RENDER_EXTERNAL_URL   (set automatically by Render; enables self keep-alive)
+           OPENROUTER_AUTO_EXTRA (default 1: auto-add a verified Claude Haiku / Grok mini slug taken from OpenRouter's
+                                  live /api/v1/models list as extra fallback; 0 disables)
+           FONT_PATH, PORT (default 10000), RENDER_EXTERNAL_URL
+           HUNTER_ENABLED=1, HUNT_INTERVAL_MIN=45, HUNT_MIN_IMPORTANCE=5, HUNT_MAX_PER_DAY=20, HUNT_QUIET=23-6,
+           NEWS_RSS_FEEDS="Name|url,Name|url"
+           ALERTS_ENABLED=1, ALERT_INTERVAL_MIN=240, ALERT_SUBS_DELTA=3, ALERT_VIEWS_DELTA=1000, ALERT_TG_DELTA=10,
+           ALERT_FB_DELTA=5
 
 requirements.txt
 ----------------
 pyTelegramBotAPI
 requests
 Pillow
+imageio-ffmpeg
+yt-dlp
 
 Architecture
 ------------
-* Writing (chat, news, posts, audio summaries, polishing): OpenRouter first (DeepSeek -> GPT-4o-mini),
-  Gemini as fallback when OpenRouter is unreachable / out of credits.
-* Research: Gemini + Google Search grounding (English notes from Reuters, AP, BBC Amharic, EBC, Fana, ENA, Al Ain,
-  DW Amharic, official government feeds, verified X publishers), retried once; the writer turns it into Amharic in the
-  strict 5-part Sekela News template. If search is down, a manual /post falls back to a clearly-labelled UNVERIFIED
-  editorial draft (second confirmation tap required); the breaking-news hunter never drafts unverified stories.
-* Breaking-news hunter: background thread scans every HUNT_INTERVAL_MIN (default 45) for major verified stories
-  (Gemini search + RSS headlines), drafts the card + copy and pushes it to the owner's DM with approve / cancel buttons.
-  Env: HUNTER_ENABLED=1, HUNT_INTERVAL_MIN=45, HUNT_MIN_IMPORTANCE=8, HUNT_MAX_PER_DAY=4, HUNT_QUIET=23-6 (Addis time),
-  NEWS_RSS_FEEDS="Name|url,Name|url".
-* Voice notes: Gemini only TRANSCRIBES (long-audio safe); the summary / action items are written by the OpenRouter
-  writer straight from the transcript, so the Amharic is native and one failure cannot lose the transcript.
-* Sekela News card: AI background (Pollinations, no text) + headline, gradient and brand badge composed locally with
-  Pillow, because image generators cannot render Amharic lettering reliably.
-* Publishing: ONLY after Henok taps the approval button -> Telegram channel, then the Facebook Page.
+* Writing (chat, news, posts, audio summaries, polishing): OpenRouter first (DeepSeek -> GPT-4o-mini -> verified
+  Claude/Grok slug if available), Gemini as fallback when OpenRouter is unreachable / out of credits.
+* Research: Gemini + Google Search grounding (BBC Amharic, Fana, EBC, ENA, VOA/DW Amharic, Addis Standard, Reuters, AP,
+  verified X accounts); the writer turns it into Amharic in the strict 5-part Sekela News template.
+* Breaking-news hunter: scans 12h (automatic 24h fallback, then RSS fallback) with importance >= 5 and pushes a draft
+  to the owner's DM with approve / cancel buttons. Nothing is posted without the approval tap.
+* YouTube: channel analytics (Data API), long video -> 9:16 Shorts clipper (Gemini picks segments, ffmpeg cuts),
+  upload ONLY after the owner taps approve.
+* /analytics: branded PNG dashboard (Telegram + YouTube + Facebook) + proactive alerts on notable changes.
 * STRICT NO-COMMENTING POLICY: the Facebook layer can only POST to /photos and /feed and READ page info, insights and
-  post counters. Any path containing "comment" is refused in code (see _fb_request). The bot never replies to comments.
+  post counters. Any path containing "comment" is refused in code (see _fb_request).
 * The bot talks ONLY in a private chat with the owner; in groups/channels it is silent.
 """
 
@@ -50,9 +52,12 @@ import copy
 import functools
 import glob
 import io
+import json
 import logging
 import os
 import re
+import shutil
+import subprocess
 import sys
 import tempfile
 import threading
@@ -91,6 +96,13 @@ FB_API_VERSION = os.environ.get("FB_API_VERSION", "v25.0").strip()
 FB_GRAPH = f"https://graph.facebook.com/{FB_API_VERSION}"
 FB_PAGE_NAME = "ሰከላ Sekela"
 
+YT_CLIENT_ID = os.environ.get("YOUTUBE_CLIENT_ID", "").strip()
+YT_CLIENT_SECRET = os.environ.get("YOUTUBE_CLIENT_SECRET", "").strip()
+YT_REFRESH_TOKEN = os.environ.get("YOUTUBE_REFRESH_TOKEN", "").strip()
+YT_PRIVACY = os.environ.get("YT_PRIVACY", "public").strip().lower()
+if YT_PRIVACY not in ("public", "unlisted", "private"):
+    YT_PRIVACY = "public"
+
 
 def normalize_channel(value):
     """'@HenokGraphics' / 'HenokGraphics' / 't.me/HenokGraphics' -> '@HenokGraphics'; numeric ids -> int."""
@@ -106,9 +118,11 @@ def normalize_channel(value):
 
 TARGET_CHANNEL = normalize_channel(os.environ.get("TARGET_CHANNEL", "@HenokGraphics"))
 
-OPENROUTER_MODELS = [m.strip() for m in os.environ.get(
-    "OPENROUTER_MODELS",
-    "deepseek/deepseek-chat,openai/gpt-4o-mini,anthropic/claude-3.5-haiku,x-ai/grok-3-mini").split(",") if m.strip()]
+# Base models are only the two that /ai_status confirmed. The Claude / Grok slugs are NOT hardcoded any more:
+# get_openrouter_models() looks them up in OpenRouter's live model list so a wrong slug can never show a red X.
+OPENROUTER_BASE_MODELS = [m.strip() for m in os.environ.get(
+    "OPENROUTER_MODELS", "deepseek/deepseek-chat,openai/gpt-4o-mini").split(",") if m.strip()]
+OPENROUTER_EXTRA_RULES = (("anthropic/claude", "haiku"), ("x-ai/grok", "mini"))
 OPENROUTER_URL = "https://openrouter.ai/api/v1"
 
 GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta"
@@ -193,9 +207,12 @@ bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN or "000000:MISSING", parse_mode=None, t
 
 state_lock = threading.Lock()
 histories = {}        # user_id -> [(role, text)]
-awaiting_topic = {}   # user_id -> "news" | "post"
-drafts = {}           # draft_id -> draft dict (see run_post)
+awaiting_topic = {}   # user_id -> "news" | "post" | "shorts"
+drafts = {}           # draft_id -> draft dict (see present_draft)
 news_cache = {}       # news_id -> {"label","text","sources","ts"}
+video_cache = {}      # video_id -> {"data": bytes, "ts": float}  (for the Shorts clipper button)
+shorts_drafts = {}    # short_id -> {"path","title","description","tags","busy","ts"}
+bot_stats = {"drafts": 0, "tg_posts": 0, "fb_posts": 0, "yt_uploads": 0, "breaking": 0}
 
 CATEGORIES = {
     "ai": ("🤖 AI እና ቴክኖሎጂ", "AI & Technology"),
@@ -227,6 +244,8 @@ OUTLETS = [
     ("ኢዜአ", r"\bena\b|ethiopian news agency|ena\.et|ኢዜአ"),
     ("ዶቼ ቬለ አማርኛ", r"dw\s*amharic|dw\.com/am|ዶቼ ቬለ አማርኛ"),
     ("ዶቼ ቬለ", r"\bdw\b|dw\.com|deutsche welle|ዶቼ ቬለ"),
+    ("የአሜሪካ ድምጽ አማርኛ", r"voa\s*amharic|voanews|amharic\.voanews|የአሜሪካ ድምጽ"),
+    ("አዲስ ስታንዳርድ", r"addis\s*standard|addisstandard|አዲስ ስታንዳርድ"),
     ("አል-አይን", r"al[\s\-]*ain|አል-?አይን"),
     ("AFP", r"\bafp\b"),
     ("ብሎምበርግ", r"bloomberg|ብሎምበርግ"),
@@ -344,7 +363,7 @@ def greeting_reply():
         g = "እንደምን ዋልክ ሄኖክ! 👋"
     else:
         g = "እንደምን አመሸህ ሄኖክ! 🌙"
-    return g + "\nዛሬ ምን ላግዝህ? 📰 /news · 📝 /post · 📊 /analytics ወይም ማንኛውንም ነገር ጻፍልኝ።"
+    return g + "\nዛሬ ምን ላግዝህ? 📰 /news · 📝 /post · 📊 /analytics · ✂️ /shorts ወይም ማንኛውንም ነገር ጻፍልኝ።"
 
 
 def format_sources(sources, limit=6):
@@ -398,7 +417,8 @@ def drop_message(chat_id, message_id):
 
 def short_reason(e, limit=140):
     s = re.sub(r"\s+", " ", str(e))
-    for secret in (FB_PAGE_ACCESS_TOKEN, GEMINI_API_KEY, OPENROUTER_API_KEY, TELEGRAM_BOT_TOKEN):
+    for secret in (FB_PAGE_ACCESS_TOKEN, GEMINI_API_KEY, OPENROUTER_API_KEY, TELEGRAM_BOT_TOKEN,
+                   YT_CLIENT_SECRET, YT_REFRESH_TOKEN):
         if secret:
             s = s.replace(secret, "***")
     return s[:limit]
@@ -523,11 +543,11 @@ RESEARCH_PROMPT = (
     "Search the web and return concise ENGLISH research notes (max 380 words) for a newsroom: the verified facts "
     "(who, what, when, where), concrete numbers, background and - importantly - any OFFICIAL statements or direct "
     "quotes with the name/title of the speaker, reactions of authorities or parties, and announced next steps. "
-    "Use only verified top-tier reporting: Reuters, AP, BBC Amharic, EBC, Fana, ENA, Al Ain, DW Amharic, official "
-    "government statements/feeds, and verified news-publisher accounts on X. Ignore rumours, anonymous blogs and "
-    "unverified posts. Bullet points only; after EACH fact put the outlet in brackets, e.g. [Reuters], "
-    "[Gov: Ministry of Finance] or [X: @FanaBC]. Do not write Amharic. Do not invent anything; if something "
-    "cannot be verified, leave it out."
+    "Use only verified top-tier reporting: Reuters, AP, BBC Amharic, EBC, Fana, ENA, Al Ain, DW Amharic, VOA Amharic, "
+    "Addis Standard, official government statements/feeds, and verified news-publisher accounts on X. Ignore rumours, "
+    "anonymous blogs and unverified posts. Bullet points only; after EACH fact put the outlet in brackets, e.g. "
+    "[Reuters], [Gov: Ministry of Finance] or [X: @FanaBC]. Do not write Amharic. Do not invent anything; if "
+    "something cannot be verified, leave it out."
 )
 RESEARCH_LITE_PROMPT = (
     "What are the latest verified facts about: {topic}? Answer in English bullet points (max 250 words), put the "
@@ -632,14 +652,55 @@ def multimodal_generate(parts, temperature=0.4, max_tokens=24000, thinking_budge
 
 
 # ----------------------------------------------------------------------------
-# OpenRouter (primary writer) with Gemini fallback
+# OpenRouter (primary writer) with Gemini fallback + live model-slug verification
 # ----------------------------------------------------------------------------
+_or_lock = threading.Lock()
+_or_cache = {"ts": 0.0, "models": None, "ids": None}
+
+
+def fetch_openrouter_ids():
+    """Set of every model id OpenRouter currently lists (public endpoint), or None when unreachable."""
+    try:
+        r = requests.get(f"{OPENROUTER_URL}/models", timeout=25)
+        if r.status_code == 200:
+            return {m.get("id") for m in r.json().get("data", []) if m.get("id")}
+    except Exception as e:
+        log.info("OpenRouter model list unavailable: %s", e)
+    return None
+
+
+def get_openrouter_models(force=False):
+    """Verified model list for the writer: the configured base models that really exist on OpenRouter, plus (optional)
+    one Claude Haiku and one Grok mini slug picked from the live list, so a bad slug can never appear.
+    Cached for 6 hours; if the list cannot be fetched the configured base models are used and retried in ~10 min."""
+    now = time.time()
+    with _or_lock:
+        if not force and _or_cache["models"] and now - _or_cache["ts"] < 21600:
+            return list(_or_cache["models"])
+    ids = fetch_openrouter_ids()
+    if ids is None:
+        with _or_lock:
+            _or_cache.update(ts=now - 21000, models=list(OPENROUTER_BASE_MODELS), ids=None)
+        return list(OPENROUTER_BASE_MODELS)
+    models = [m for m in OPENROUTER_BASE_MODELS if m in ids] or list(OPENROUTER_BASE_MODELS)
+    if os.environ.get("OPENROUTER_AUTO_EXTRA", "1") != "0":
+        for prefix, keyword in OPENROUTER_EXTRA_RULES:
+            cands = sorted(i for i in ids if i.startswith(prefix) and keyword in i and ":" not in i
+                           and "preview" not in i and "beta" not in i)
+            if cands and cands[-1] not in models:
+                models.append(cands[-1])
+    with _or_lock:
+        _or_cache.update(ts=now, models=list(models), ids=ids)
+    log.info("OpenRouter models verified: %s", models)
+    return list(models)
+
+
 def openrouter_chat(messages, max_tokens=1800, temperature=0.8):
-    """Try each OpenRouter model in order. Returns (text, model) or (None, None).
+    """Try each verified OpenRouter model in order. Returns (text, model) or (None, None).
     401/402 (bad key / out of credits) abort the whole provider immediately."""
     if not OPENROUTER_API_KEY:
         return None, None
-    for model in OPENROUTER_MODELS:
+    for model in get_openrouter_models():
         try:
             r = requests.post(
                 f"{OPENROUTER_URL}/chat/completions",
@@ -787,7 +848,7 @@ NEWS_BRIEF = (
     "Return EXACTLY these blocks and nothing else:\n"
     "===HEADLINE===\n5-8 words: a bold, factual, scroll-stopping news headline; no quotes, no emoji, no full stop.\n"
     "===LEAD===\nThe hook: 1-2 short sentences giving the core of the story directly (who, what, when, where).\n"
-    "===CONTEXT===\n2-4 sentences: the key figures, data and circumstances in detail.\n"
+    "===CONTEXT===\n3-5 sentences: the detailed body - key figures, data, background and circumstances.\n"
     "===OFFICIAL===\n2-3 sentences: official statements or direct quotes (attributed to the named official or body), "
     "reactions of authorities or parties, and the next steps. If the notes contain no official statement or next "
     "steps, write exactly: " + NO_OFFICIAL_LINE + "\n"
@@ -900,14 +961,16 @@ def assemble_news_post(pkg, facts="", sources=None, unverified=False):
 # --- story discovery (used by /news and by the breaking-news hunter) -------------------------------------------
 STORY_PROMPT = (
     "Search the web NOW and find the most important and timely news from the last {hours} hours about: {focus}\n"
-    "Include verified reporting from: BBC Amharic, Fana BC, EBC, ENA, VOA Amharic, DW Amharic, Al Ain Amharic, "
-    "Addis Standard, Reuters, AP, official Ethiopian government statements, and verified news accounts on X (Twitter). "
-    "Cover diplomacy, PM/ministry updates, economy, Addis Ababa developments, Horn of Africa, and major global/tech news.\n"
+    "Use verified reporting from: BBC Amharic, Fana BC, EBC, ENA, VOA Amharic, DW Amharic, Al Ain Amharic, "
+    "Addis Standard, Reuters, AP, official Ethiopian government statements, and verified news accounts on X (Twitter) "
+    "such as @PMEthiopia, @FanaBC, @ENA_Amharic, @BBCAmharic, @addisstandard, @VOAAmharic, @dwamharic. "
+    "Cover diplomacy and the Prime Minister's visits/meetings, ministry updates, economy and prices, Addis Ababa "
+    "developments, Horn of Africa, and major global/tech news.\n"
     "{feeds}"
     "Return {n} top stories, ONE per line, in EXACTLY this format (English):\n"
     "STORY|<importance 1-10>|<headline, max 14 words>|<outlet names, comma separated>|<one sentence with the key fact>\n"
     "Importance: 8-10 = major national/diplomatic/breaking news, 5-7 = important daily news. "
-    "Always return the top available verified news stories."
+    "Always return the top available verified news stories - there is almost always important daily news."
 )
 _STORY_RE = re.compile(r"^\s*STORY\s*\|\s*(\d+)\s*\|(.*?)\|(.*?)\|(.*)$")
 
@@ -1271,7 +1334,8 @@ def fb_publish(post, image_bytes=None):
 def fb_error_hint(e):
     code = getattr(e, "code", None)
     if code == 190:
-        return "ቶክኑ ጊዜው አልፏል ወይም ልክ አይደለም — አዲስ Page Access Token ፍጠር።"
+        return ("ቶክኑ ጊዜው አልፏል ወይም ልክ አይደለም — ቋሚ (never-expiring) Page Access Token ፍጠር፣ "
+                "ከዚያ በ Render ላይ FB_PAGE_ACCESS_TOKEN ቀይር።")
     if code in (10, 200, 299):
         return "ፈቃድ ይጎድላል — Page token በ pages_manage_posts ፈቃድ መፈጠሩን አረጋግጥ።"
     if code == 100:
@@ -1279,12 +1343,12 @@ def fb_error_hint(e):
     return ""
 
 
-FB_INSIGHT_CANDIDATES = [  # (metric, label, how to aggregate the last 7 daily values)
-    ("page_total_media_view_unique", "👀 Reach (ልዩ ተመልካቾች)", "sum"),
-    ("page_media_view", "📈 Views (እይታዎች)", "sum"),
-    ("page_post_engagements", "💬 Engagement (ተሳትፎ)", "sum"),
-    ("page_daily_follows", "➕ አዲስ ተከታዮች", "sum"),
-    ("page_follows", "👥 ጠቅላላ ተከታዮች", "last"),
+FB_INSIGHT_CANDIDATES = [  # (metric, label, how to aggregate the last 7 daily values, key for the dashboard)
+    ("page_total_media_view_unique", "👀 Reach (ልዩ ተመልካቾች)", "sum", "reach"),
+    ("page_media_view", "📈 Views (እይታዎች)", "sum", "views"),
+    ("page_post_engagements", "💬 Engagement (ተሳትፎ)", "sum", "engagement"),
+    ("page_daily_follows", "➕ አዲስ ተከታዮች", "sum", "new_follows"),
+    ("page_follows", "👥 ጠቅላላ ተከታዮች", "last", "followers"),
 ]
 
 
@@ -1302,23 +1366,28 @@ def _insight_value(js, mode):
     return int(vals[-1] if mode == "last" else sum(vals))
 
 
-def fb_analytics_text():
-    """Page name/id via `me?fields=name,id` (works with a Page token; `followers_count` is NOT requested - it caused
-    Graph error 100), 7-day insights (each metric optional) and the latest post counters."""
+def fb_analytics_text(metrics=None):
+    """Page name/id via `me?fields=name,id`, 7-day insights (each metric optional) and the latest post counters.
+    If a dict is passed as `metrics` it is filled with the numbers (reach, views, engagement, new_follows, followers)
+    plus `_ok` / `_err` so the dashboard image can use them."""
+    metrics = metrics if metrics is not None else {}
     if not fb_enabled():
+        metrics.update(_ok=False, _err="no token")
         return "⚪ ፌስቡክ አልተዋቀረም — በ Render ላይ FB_PAGE_ACCESS_TOKEN ጨምር።"
     lines = [f"📊 {FB_PAGE_NAME} — Facebook Analytics", "━━━━━━━━━━━━"]
     try:
         me = _fb_request("GET", "me", params={"fields": "name,id"}, timeout=40)
+        metrics["_ok"] = True
         lines.append(f"📄 ገጽ: {me.get('name', FB_PAGE_NAME)} (id {me.get('id', FB_PAGE_ID)})")
         if me.get("id") and str(me["id"]) != str(FB_PAGE_ID):
             lines.append("⚠️ ቶክኑ የሌላ ገጽ ነው — FB_PAGE_ID እና ቶክኑ አይዛመዱም።")
     except FBError as e:
+        metrics.update(_ok=False, _err=short_reason(e, 90))
         return "\n".join(lines + [f"❌ የገጹን መረጃ ማምጣት አልተቻለም: {short_reason(e)}", fb_error_hint(e)]).strip()
 
     now = int(time.time())
     got = []
-    for metric, label, mode in FB_INSIGHT_CANDIDATES:
+    for metric, label, mode, key in FB_INSIGHT_CANDIDATES:
         try:
             js = _fb_request("GET", f"{FB_PAGE_ID}/insights",
                              params={"metric": metric, "period": "day", "since": now - 7 * 86400, "until": now},
@@ -1326,6 +1395,7 @@ def fb_analytics_text():
             val = _insight_value(js, mode)
             if val is not None:
                 got.append(f"{label}: {val:,}")
+                metrics[key] = val
         except FBError as e:
             log.info("insight %s unavailable: %s", metric, e)
     lines.append("\n🗓 ባለፉት 7 ቀናት:")
@@ -1363,8 +1433,8 @@ def fb_analytics_text():
 # ----------------------------------------------------------------------------
 def build_draft(topic, facts=None, sources=None, allow_fallback=True):
     """Research -> Amharic news copy (template) -> AI background -> Sekela card. No Telegram I/O.
-    Returns a draft dict or None. With allow_fallback=False (the autonomous hunter) an unverifiable story is dropped;
-    with allow_fallback=True (manual /post) an editorial synthesis is drafted but flagged `unverified`."""
+    Returns a draft dict or None. With allow_fallback=False an unverifiable story is dropped;
+    with allow_fallback=True an editorial synthesis is drafted but flagged `unverified` when no facts exist."""
     sources = list(sources or [])
     if not facts:
         facts, sources = research_for(topic)
@@ -1388,6 +1458,7 @@ def build_draft(topic, facts=None, sources=None, allow_fallback=True):
     post, headline = built
     bg = fetch_image(build_image_prompt(pkg.get("image")))
     card = compose_card(bg, headline) if bg else None
+    bot_stats["drafts"] += 1
     return {"post": post, "headline": headline, "image": card or bg, "card": bool(card),
             "sources": sources, "unverified": unverified}
 
@@ -1503,6 +1574,7 @@ def approve_and_publish(chat_id, msg_id, did):
             try:
                 publish_telegram(d)
                 d["tg"] = True
+                bot_stats["tg_posts"] += 1
             except Exception as e:
                 log.error("telegram publish failed: %s", e)
                 tg_err = short_reason(e, 200)
@@ -1510,6 +1582,7 @@ def approve_and_publish(chat_id, msg_id, did):
             try:
                 fb_publish(d["post"], d.get("image"))
                 d["fb"] = True
+                bot_stats["fb_posts"] += 1
             except FBError as e:
                 log.error("facebook publish failed: %s", e)
                 fb_err = short_reason(e, 200) + (" — " + fb_error_hint(e) if fb_error_hint(e) else "")
@@ -1542,15 +1615,23 @@ def approve_and_publish(chat_id, msg_id, did):
 # Proactive breaking-news hunter (background thread -> push to Henok's private DM)
 # ----------------------------------------------------------------------------
 HUNT_HEADER = "🔔 ሄኖክ፣ አዲስ ሰበር ዜና አዘጋጅቼልሃለሁ! ይሄንን ለሰከላ ኒውስ ፖስት እናድርገው?"
-HUNT_FOCUS = ("Ethiopia (top priority: government and politics, economy and prices, diplomacy, security developments as "
-              "reported by official or verified outlets, infrastructure, major events in Addis Ababa) and major "
-              "international developments that matter to Ethiopians (Horn of Africa, African Union, global economy, "
-              "AI/tech, crypto markets)")
+HUNT_FOCUS = ("Ethiopia (top priority: government and politics, Prime Minister Abiy Ahmed's activities and diplomatic "
+              "visits, economy and prices, diplomacy, security developments as reported by official or verified "
+              "outlets, infrastructure, major events in Addis Ababa) and major international developments that matter "
+              "to Ethiopians (Horn of Africa, African Union, global economy, AI/tech, crypto markets)")
 
 hunt_lock = threading.Lock()
 hunt_seen = []                               # [(token_set, timestamp)] stories already offered (last 24h)
 hunt_daily = {"date": "", "count": 0}
-bot_stats = {"drafts": 0, "tg_posts": 0, "fb_posts": 0, "breaking": 0}
+
+DEFAULT_FEEDS = (
+    "BBC Amharic|https://feeds.bbci.co.uk/amharic/rss.xml,"
+    "Fana BC|https://www.fanabc.com/feed/,"
+    "VOA Amharic|https://amharic.voanews.com/api/z$pqveymop,"
+    "DW Amharic|https://rss.dw.com/xml/rss-am-all,"
+    "Addis Standard|https://addisstandard.com/feed/,"
+    "ENA|https://www.ena.et/feed"
+)
 
 
 def _title_tokens(title):
@@ -1558,16 +1639,27 @@ def _title_tokens(title):
 
 
 def _is_seen(title):
-    now, tokens = time.time(), _title_tokens(title)
+    now = time.time()
     hunt_seen[:] = [(t, ts) for t, ts in hunt_seen if now - ts < 86400]
+    tokens = _title_tokens(title)
+    if len(tokens) < 2:  # non-Latin (Amharic) title: compare the raw string
+        raw = (title or "").strip()
+        return any(raw and raw == r for r in _raw_seen)
     for t, _ in hunt_seen:
-        if len(tokens) >= 2 and len(t) >= 2 and len(tokens & t) / min(len(tokens), len(t)) >= 0.6:
+        if len(t) >= 2 and len(tokens & t) / min(len(tokens), len(t)) >= 0.6:
             return True
     return False
 
 
+_raw_seen = []
+
+
 def _mark_seen(title):
     hunt_seen.append((_title_tokens(title), time.time()))
+    raw = (title or "").strip()
+    if raw:
+        _raw_seen.append(raw)
+        del _raw_seen[:-200]
 
 
 def in_quiet_hours(hour=None):
@@ -1581,16 +1673,11 @@ def in_quiet_hours(hour=None):
     return (h >= a or h < b) if a > b else (a <= h < b)
 
 
-def fetch_feed_headlines(max_age_hours=24, per_feed=8):
-    """Recent headlines from configured RSS feeds (best effort; a dead feed is simply skipped)."""
-    spec = os.environ.get(
-        "NEWS_RSS_FEEDS",
-        "BBC Amharic|https://feeds.bbci.co.uk/amharic/rss.xml,"
-        "Fana|https://www.fanabc.com/feed/,"
-        "VOA Amharic|https://amharic.voanews.com/api/z$pqveymop,"
-        "Addis Standard|https://addisstandard.com/feed/"
-    )
-    lines = []
+def fetch_feed_items(max_age_hours=24, per_feed=8):
+    """Recent items from configured RSS/Atom feeds as [{"source","title"}] (best effort; a dead feed is skipped)."""
+    spec = os.environ.get("NEWS_RSS_FEEDS", DEFAULT_FEEDS)
+    atom = "{http://www.w3.org/2005/Atom}"
+    out = []
     for item in [s for s in spec.split(",") if "|" in s]:
         name, url = [x.strip() for x in item.split("|", 1)]
         try:
@@ -1598,30 +1685,46 @@ def fetch_feed_headlines(max_age_hours=24, per_feed=8):
             if r.status_code != 200:
                 continue
             root = ET.fromstring(r.content)
+            entries = list(root.iter("item")) or list(root.iter(atom + "entry"))
             n = 0
-            for it in root.iter("item"):
-                title = (it.findtext("title") or "").strip()
-                pub = it.findtext("pubDate")
+            for it in entries:
+                title = (it.findtext("title") or it.findtext(atom + "title") or "").strip()
+                pub = it.findtext("pubDate") or it.findtext(atom + "updated") or it.findtext(atom + "published")
                 if pub:
                     try:
                         dt = parsedate_to_datetime(pub)
-                        if dt.tzinfo and (datetime.now(timezone.utc) - dt).total_seconds() > max_age_hours * 3600:
-                            continue
                     except Exception:
-                        pass
+                        try:
+                            dt = datetime.fromisoformat(pub.replace("Z", "+00:00"))
+                        except Exception:
+                            dt = None
+                    if dt is not None and dt.tzinfo and (datetime.now(timezone.utc) - dt).total_seconds() > max_age_hours * 3600:
+                        continue
                 if title:
-                    lines.append(f"- [{name}] {title}")
+                    out.append({"source": name, "title": title})
                     n += 1
                 if n >= per_feed:
                     break
         except Exception as e:
             log.info("feed %s unavailable: %s", name, e)
-    return "\n".join(lines)
+    return out
+
+
+def feed_items_text(items):
+    return "\n".join(f"- [{i['source']}] {i['title']}" for i in items)
+
+
+def stories_from_feeds(items, n=6):
+    """Last-resort story list built straight from RSS headlines of recognised outlets (importance 6)."""
+    return [{"importance": 6, "title": i["title"], "outlets": i["source"],
+             "summary": i["title"]} for i in items[:n]]
 
 
 def hunt_once(manual=False, min_importance=None):
-    """One scan. Finds a timely, not-yet-offered, VERIFIED story, drafts the card + copy and pushes it to Henok with
-    the approve/cancel buttons. Returns a status string: sent | none | unverified | failed | busy | cap | nokey."""
+    """One scan. Searches the last 12h (automatic 24h fallback, then RSS fallback) for a timely, not-yet-offered story
+    with importance >= threshold (default 5), drafts the card + copy and pushes it to Henok with the approve/cancel
+    buttons. A story that came from a recognised outlet is never dropped as 'unverified'.
+    Returns: sent | none | failed | busy | cap | nokey."""
     if not hunt_lock.acquire(blocking=False):
         return "busy"
     try:
@@ -1630,27 +1733,35 @@ def hunt_once(manual=False, min_importance=None):
         today = addis_now().strftime("%Y-%m-%d")
         if hunt_daily["date"] != today:
             hunt_daily.update(date=today, count=0)
-        if not manual and hunt_daily["count"] >= int(os.environ.get("HUNT_MAX_PER_DAY", "15")):
+        if not manual and hunt_daily["count"] >= int(os.environ.get("HUNT_MAX_PER_DAY", "20")):
             return "cap"
         threshold = min_importance if min_importance is not None else int(os.environ.get("HUNT_MIN_IMPORTANCE", "5"))
-        feeds_txt = fetch_feed_headlines(max_age_hours=24, per_feed=8)
-        stories, scan_sources = scan_stories(HUNT_FOCUS, hours=12, n=5, feeds=feeds_txt)
+        feed_items = fetch_feed_items(max_age_hours=24, per_feed=8)
+        feeds_txt = feed_items_text(feed_items)
+
+        stories, scan_sources = scan_stories(HUNT_FOCUS, hours=12, n=6, feeds=feeds_txt)
         fresh = [s for s in stories if s["importance"] >= threshold and not _is_seen(s["title"])]
-        if not fresh:
-            stories2, scan_sources2 = scan_stories(HUNT_FOCUS, hours=24, n=5, feeds=feeds_txt)
-            fresh = [s for s in stories2 if not _is_seen(s["title"])]
-            if scan_sources2:
-                scan_sources = scan_sources2
-        if not fresh and stories:
-            fresh = stories  # manual or fallback: pick top story if all seen
+        if not fresh:  # 24h fallback
+            stories24, src24 = scan_stories(HUNT_FOCUS, hours=24, n=6, feeds=feeds_txt)
+            if src24:
+                scan_sources = src24
+            stories = stories or stories24
+            fresh = [s for s in stories24 if s["importance"] >= threshold and not _is_seen(s["title"])]
+            if not fresh:
+                fresh = [s for s in stories24 if not _is_seen(s["title"])]
+        if not fresh:  # RSS fallback: recognised outlets' own headlines
+            fresh = [s for s in stories_from_feeds(feed_items) if not _is_seen(s["title"])]
+        if not fresh and manual and stories:
+            fresh = stories  # manual request: show the top story even if it was offered before
         if not fresh:
             return "none"
+
         story = fresh[0]
         _mark_seen(story["title"])
         start = time.time()
         topic = f"{story['title']}. {story['summary']}"
         facts, sources = research_for(topic)
-        if not facts:
+        if not facts:  # a story from a recognised outlet is still usable: build on the scan's own facts
             facts = f"{story['title']}. {story['summary']} (Reported by: {story['outlets']})"
             sources = scan_sources or [(story['outlets'] or "Sekela News Desk", "https://t.me/HenokGraphics")]
         d = build_draft(topic, facts=facts, sources=sources, allow_fallback=True)
@@ -1684,6 +1795,613 @@ def start_hunter():
     threading.Thread(target=hunter_loop, daemon=True, name="hunter").start()
     log.info("Breaking-news hunter started (every %s min, quiet hours %s Addis time)",
              os.environ.get("HUNT_INTERVAL_MIN", "45"), os.environ.get("HUNT_QUIET", "23-6") or "off")
+
+
+# ----------------------------------------------------------------------------
+# YouTube module: analytics (Data API) + approval-gated upload
+# ----------------------------------------------------------------------------
+class YTError(Exception):
+    pass
+
+
+_yt_token = {"token": "", "exp": 0.0}
+_yt_lock = threading.Lock()
+
+
+def yt_enabled():
+    return bool(YT_CLIENT_ID and YT_CLIENT_SECRET and YT_REFRESH_TOKEN)
+
+
+def yt_access_token():
+    """Short-lived access token from the stored refresh token (cached until ~1 min before expiry)."""
+    if not yt_enabled():
+        raise YTError("YOUTUBE_CLIENT_ID / YOUTUBE_CLIENT_SECRET / YOUTUBE_REFRESH_TOKEN አልተሞሉም")
+    with _yt_lock:
+        if _yt_token["token"] and time.time() < _yt_token["exp"] - 60:
+            return _yt_token["token"]
+        try:
+            r = requests.post("https://oauth2.googleapis.com/token", data={
+                "client_id": YT_CLIENT_ID, "client_secret": YT_CLIENT_SECRET,
+                "refresh_token": YT_REFRESH_TOKEN, "grant_type": "refresh_token"}, timeout=30)
+        except requests.RequestException as e:
+            raise YTError(f"network error: {short_reason(e, 100)}")
+        if r.status_code != 200:
+            raise YTError(f"token HTTP {r.status_code}: {short_reason(r.text, 150)}")
+        js = r.json()
+        _yt_token.update(token=js.get("access_token", ""), exp=time.time() + int(js.get("expires_in", 3000)))
+        if not _yt_token["token"]:
+            raise YTError("no access_token returned")
+        return _yt_token["token"]
+
+
+def _yt_get(path, params):
+    token = yt_access_token()
+    try:
+        r = requests.get(f"https://www.googleapis.com/youtube/v3/{path}", params=params,
+                         headers={"Authorization": f"Bearer {token}"}, timeout=40)
+    except requests.RequestException as e:
+        raise YTError(f"network error: {short_reason(e, 100)}")
+    if r.status_code != 200:
+        try:
+            msg = r.json().get("error", {}).get("message", "")
+        except Exception:
+            msg = r.text
+        raise YTError(f"{path} HTTP {r.status_code}: {short_reason(msg, 140)}")
+    return r.json()
+
+
+def yt_channel_stats():
+    """Channel totals + the latest uploads with their view/like/comment counters."""
+    js = _yt_get("channels", {"part": "snippet,statistics,contentDetails", "mine": "true"})
+    items = js.get("items") or []
+    if not items:
+        raise YTError("ለዚህ ቶክን ቻናል አልተገኘም (ትክክለኛውን ቻናል/Brand account መርጠህ ቶክኑን ፍጠር)")
+    ch = items[0]
+    st = ch.get("statistics", {})
+    out = {"title": (ch.get("snippet") or {}).get("title", "?"),
+           "subs": int(st.get("subscriberCount", 0)), "views": int(st.get("viewCount", 0)),
+           "videos": int(st.get("videoCount", 0)), "hidden_subs": bool(st.get("hiddenSubscriberCount")),
+           "recent": []}
+    uploads = ((ch.get("contentDetails") or {}).get("relatedPlaylists") or {}).get("uploads")
+    if uploads:
+        try:
+            pl = _yt_get("playlistItems", {"part": "contentDetails", "playlistId": uploads, "maxResults": 8})
+            ids = [i["contentDetails"]["videoId"] for i in pl.get("items", []) if i.get("contentDetails")]
+            if ids:
+                vs = _yt_get("videos", {"part": "snippet,statistics", "id": ",".join(ids)})
+                byid = {v["id"]: v for v in vs.get("items", [])}
+                for vid in ids:
+                    v = byid.get(vid)
+                    if not v:
+                        continue
+                    s = v.get("statistics", {})
+                    out["recent"].append({"id": vid, "title": (v.get("snippet") or {}).get("title", ""),
+                                          "published": ((v.get("snippet") or {}).get("publishedAt") or "")[:10],
+                                          "views": int(s.get("viewCount", 0)), "likes": int(s.get("likeCount", 0)),
+                                          "comments": int(s.get("commentCount", 0))})
+        except YTError as e:
+            log.info("recent uploads unavailable: %s", e)
+    return out
+
+
+def yt_analytics_text(yt):
+    if not yt:
+        return "⚪ YouTube አልተዋቀረም — YOUTUBE_CLIENT_ID / SECRET / REFRESH_TOKEN ጨምር።"
+    if yt.get("error"):
+        return f"▶️ YouTube\n❌ ማምጣት አልተቻለም: {yt['error']}"
+    subs = "ተደብቋል" if yt["hidden_subs"] else f"{yt['subs']:,}"
+    lines = [f"▶️ YouTube — {yt['title']}", "━━━━━━━━━━━━",
+             f"👥 Subscribers: {subs}", f"👁 ጠቅላላ Views: {yt['views']:,}", f"🎞 ቪዲዮዎች: {yt['videos']:,}"]
+    if yt["recent"]:
+        lines.append("\n🆕 የቅርብ ጊዜ ቪዲዮዎች:")
+        for v in yt["recent"][:5]:
+            lines.append(f"• {v['published']} — {re.sub(chr(10), ' ', v['title'])[:48]}\n"
+                         f"   👁 {v['views']:,} · 👍 {v['likes']:,} · 💬 {v['comments']:,}")
+    return "\n".join(lines)
+
+
+def yt_upload_short(path, title, description, tags):
+    """Resumable upload of a finished clip. Called ONLY from the approval callback."""
+    token = yt_access_token()
+    size = os.path.getsize(path)
+    meta = {"snippet": {"title": title[:100], "description": description[:4900], "tags": tags[:15],
+                        "categoryId": "22"},
+            "status": {"privacyStatus": YT_PRIVACY, "selfDeclaredMadeForKids": False}}
+    init = requests.post("https://www.googleapis.com/upload/youtube/v3/videos?uploadType=resumable&part=snippet,status",
+                         headers={"Authorization": f"Bearer {token}",
+                                  "Content-Type": "application/json; charset=UTF-8",
+                                  "X-Upload-Content-Length": str(size), "X-Upload-Content-Type": "video/mp4"},
+                         json=meta, timeout=60)
+    if init.status_code != 200 or not init.headers.get("Location"):
+        raise YTError(f"upload init HTTP {init.status_code}: {short_reason(init.text, 160)}")
+    with open(path, "rb") as f:
+        up = requests.put(init.headers["Location"], data=f,
+                          headers={"Content-Type": "video/mp4", "Content-Length": str(size)}, timeout=900)
+    if up.status_code not in (200, 201):
+        raise YTError(f"upload HTTP {up.status_code}: {short_reason(up.text, 160)}")
+    return up.json().get("id")
+
+
+# ----------------------------------------------------------------------------
+# Long video -> 9:16 Shorts clipper (Gemini picks the segments, ffmpeg cuts them)
+# ----------------------------------------------------------------------------
+CLIP_PROMPT = (
+    "You are a viral Shorts editor. Watch this video and choose the {n} best self-contained segments for YouTube "
+    "Shorts / TikTok / Reels: each 25-55 seconds long, starting on a strong hook and ending on a complete thought. "
+    "Return ONLY a JSON array (no markdown, no comments) of objects with exactly these keys: "
+    "\"start\" (MM:SS), \"end\" (MM:SS), \"title\" (max 70 characters, curiosity-driven, no hashtags), "
+    "\"description\" (2-3 short lines), \"hashtags\" (array of 4-6 hashtags starting with #), "
+    "\"score\" (virality 1-10). Write title and description in natural Amharic when the video is in Amharic, "
+    "otherwise in the video's own language. Only use moments that really exist in the video; timestamps must be "
+    "accurate. Rank best first."
+)
+
+
+def _ts_seconds(v):
+    s = str(v).strip()
+    if re.fullmatch(r"\d+(\.\d+)?", s):
+        return float(s)
+    try:
+        secs = 0.0
+        for part in s.split(":"):
+            secs = secs * 60 + float(part)
+        return secs
+    except Exception:
+        return None
+
+
+def parse_clips(text, max_clips=3):
+    """Parse Gemini's JSON clip list into validated dicts: start, end (seconds), title, description, tags."""
+    raw = (text or "").strip()
+    a, b = raw.find("["), raw.rfind("]")
+    if a < 0 or b <= a:
+        return []
+    try:
+        arr = json.loads(raw[a:b + 1])
+    except Exception:
+        return []
+    clips = []
+    for c in arr if isinstance(arr, list) else []:
+        if not isinstance(c, dict):
+            continue
+        s, e = _ts_seconds(c.get("start")), _ts_seconds(c.get("end"))
+        if s is None or e is None or e <= s:
+            continue
+        if e - s < 8:
+            continue
+        if e - s > 59:
+            e = s + 59
+        tags = [t if str(t).startswith("#") else "#" + str(t) for t in (c.get("hashtags") or []) if str(t).strip()]
+        clips.append({"start": s, "end": e, "title": _para(str(c.get("title", "")))[:100] or "Short",
+                      "description": _para(str(c.get("description", ""))), "tags": tags[:8],
+                      "score": c.get("score", "")})
+    return clips[:max_clips]
+
+
+def get_ffmpeg():
+    """System ffmpeg if present, otherwise the static binary shipped by the `imageio-ffmpeg` pip package
+    (so no Dockerfile is needed on Render)."""
+    p = shutil.which("ffmpeg")
+    if p:
+        return p
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return None
+
+
+def cut_vertical_clip(ffmpeg, src, start, end, out):
+    """Centre-crop to 9:16, scale to 1080x1920, H.264 + AAC. Raises RuntimeError on failure."""
+    cmd = [ffmpeg, "-y", "-ss", f"{start:.2f}", "-i", src, "-t", f"{end - start:.2f}",
+           "-vf", "crop='min(iw,ih*9/16)':ih,scale=1080:1920:flags=lanczos,setsar=1",
+           "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p",
+           "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", out]
+    r = subprocess.run(cmd, capture_output=True, timeout=420)
+    if r.returncode != 0 or not os.path.isfile(out) or os.path.getsize(out) < 5000:
+        raise RuntimeError("ffmpeg failed: " + r.stderr.decode("utf-8", "ignore")[-200:])
+
+
+def download_youtube(url, outdir):
+    """Download a public YouTube video (<=720p, single file) with yt-dlp. Returns (path, error)."""
+    try:
+        import yt_dlp
+        from yt_dlp.utils import match_filter_func
+    except Exception:
+        return None, "yt-dlp አልተጫነም (requirements.txt ላይ yt-dlp ጨምር)"
+    opts = {"outtmpl": os.path.join(outdir, "src.%(ext)s"),
+            "format": "best[height<=720][ext=mp4]/best[height<=720]/best",
+            "quiet": True, "no_warnings": True, "noplaylist": True, "socket_timeout": 30,
+            "max_filesize": 400 * 1024 * 1024, "match_filter": match_filter_func("duration < 10800")}
+    try:
+        with yt_dlp.YoutubeDL(opts) as y:
+            info = y.extract_info(url, download=True)
+            path = y.prepare_filename(info)
+        if path and os.path.isfile(path):
+            return path, None
+        return None, "ፋይሉ አልወረደም"
+    except Exception as e:
+        return None, short_reason(e, 160)
+
+
+def prune_shorts(max_age=3 * 3600):
+    now = time.time()
+    with state_lock:
+        old = [k for k, v in shorts_drafts.items() if now - v.get("ts", 0) > max_age]
+        items = [shorts_drafts.pop(k) for k in old]
+    for v in items:
+        shutil.rmtree(os.path.dirname(v.get("path", "")), ignore_errors=True)
+
+
+def is_youtube_url(url):
+    try:
+        host = (urlparse(url).netloc or "").lower()
+    except Exception:
+        return False
+    return host.endswith("youtube.com") or host == "youtu.be"
+
+
+def run_shorts(chat_id, data=None, url=None):
+    """Long video (bytes from Telegram, or a YouTube URL) -> up to 3 vertical Shorts previews in the DM, each with
+    approve / cancel buttons. NOTHING is uploaded to YouTube until the approve button is tapped."""
+    start = time.time()
+    ack_id = send_progress(chat_id, "✂️ ሄኖክ፣ ምርጥ ክፍሎችን እየመረጥኩ እና ወደ 9:16 Shorts እየቆረጥኩ ነው (ከ1-3 ደቂቃ ይወስዳል)...")
+    workdir = tempfile.mkdtemp(prefix="shorts-")
+    keep = False
+    try:
+        ffmpeg = get_ffmpeg()
+        if not ffmpeg:
+            deliver(chat_id, ack_id, "ሄኖክ፣ ffmpeg አልተገኘም 😕 requirements.txt ላይ imageio-ffmpeg ጨምር (Dockerfile አያስፈልግም)፤ "
+                                     "Render እንደገና deploy ሲያደርግ ይሰራል።")
+            return
+        if url:
+            part = {"fileData": {"fileUri": url}}
+        else:
+            part = _media_part(data, "video/mp4", "video")
+        raw = multimodal_generate([{"text": CLIP_PROMPT.replace("{n}", "3")}, part],
+                                  temperature=0.3, max_tokens=8000, thinking_budget=1024)
+        clips = parse_clips(raw)
+        if not clips:
+            deliver(chat_id, ack_id, "ሄኖክ፣ ለ Shorts የሚሆኑ ክፍሎችን መምረጥ አልቻልኩም 😕 ሌላ ቪዲዮ ሞክር ወይም ደግመህ ላክ።")
+            return
+        if url:
+            src, err = download_youtube(url, workdir)
+            if not src:
+                plan = "\n".join(f"{i}. {int(c['start']) // 60:02d}:{int(c['start']) % 60:02d}-"
+                                 f"{int(c['end']) // 60:02d}:{int(c['end']) % 60:02d} — {c['title']}"
+                                 for i, c in enumerate(clips, 1))
+                deliver(chat_id, ack_id, f"ሄኖክ፣ ቪዲዮውን ማውረድ አልተቻለም ({err})። YouTube አንዳንዴ የ server ማውረድን ይከለክላል።\n"
+                                         "የተመረጡት ክፍሎች ይህ ናቸው — ቪዲዮውን እዚህ ቴሌግራም ላይ (እስከ 18MB) ከላክክልኝ ቆርጬ አዘጋጃለሁ:\n" + plan)
+                return
+        else:
+            src = os.path.join(workdir, "src.mp4")
+            with open(src, "wb") as f:
+                f.write(data)
+        prune_shorts()
+        made = 0
+        for i, c in enumerate(clips, 1):
+            out = os.path.join(workdir, f"short{i}.mp4")
+            try:
+                cut_vertical_clip(ffmpeg, src, c["start"], c["end"], out)
+            except Exception as e:
+                log.error("clip %d failed: %s", i, e)
+                continue
+            tags = c["tags"] or []
+            hashtags = " ".join(tags + ["#Shorts"]) if "#shorts" not in " ".join(tags).lower() else " ".join(tags)
+            desc = (c["description"] + "\n\n" + hashtags).strip()
+            sid = uuid.uuid4().hex[:10]
+            with state_lock:
+                shorts_drafts[sid] = {"path": out, "title": c["title"], "description": desc,
+                                      "tags": [t.lstrip("#") for t in tags] + ["Shorts"], "busy": False,
+                                      "ts": time.time()}
+            keep = True
+            kb = types.InlineKeyboardMarkup()
+            kb.add(types.InlineKeyboardButton("✅ አጽድቅና YouTube ላይ ጫን", callback_data=f"yk:{sid}"),
+                   types.InlineKeyboardButton("❌ ሰርዝ", callback_data=f"yn:{sid}"))
+            caption = (f"✂️ Short {i}/{len(clips)} — ⭐ {c.get('score', '?')}/10\n🎬 {c['title']}\n\n{desc}\n\n"
+                       f"🔒 ✅ ካልነካህ YouTube ላይ አይጫንም ({YT_PRIVACY})")[:1020]
+            try:
+                with open(out, "rb") as vf:
+                    bot.send_video(chat_id, vf, caption=caption, reply_markup=kb, supports_streaming=True,
+                                   width=1080, height=1920, timeout=180)
+                made += 1
+            except Exception as e:
+                log.error("sending short preview failed: %s", e)
+        drop_message(chat_id, ack_id)
+        if made == 0:
+            bot.send_message(chat_id, "ሄኖክ፣ ክሊፖቹን መቁረጥ አልተሳካም 😕 ሌላ ቪዲዮ ሞክር።")
+        else:
+            bot.send_message(chat_id, f"✅ {made} Shorts ተዘጋጅተዋል — የምትወደውን አጽድቅ፤ አለበለዚያ ሰርዝ።\n" + took(start))
+    except Exception as e:
+        log.error("shorts failed: %s", e)
+        deliver(chat_id, ack_id, f"ሄኖክ፣ Shorts ማዘጋጀት አልተሳካም 😅\n(ምክንያት: {short_reason(e)})")
+    finally:
+        if not keep:
+            shutil.rmtree(workdir, ignore_errors=True)
+
+
+def approve_short_upload(chat_id, msg_id, sid):
+    """Approval gate for YouTube: runs ONLY from the owner's tap on the approve button."""
+    with state_lock:
+        d = shorts_drafts.get(sid)
+        if d is None:
+            expired = True
+        else:
+            expired = False
+            if d["busy"]:
+                return
+            d["busy"] = True
+    if expired:
+        try:
+            bot.edit_message_caption("⚠️ ይህ ክሊፕ ጊዜው አልፏል ወይም ቀድሞ ተስተናግዷል።", chat_id, msg_id)
+        except Exception:
+            bot.send_message(chat_id, "⚠️ ይህ ክሊፕ ጊዜው አልፏል ወይም ቀድሞ ተስተናግዷል።")
+        return
+    try:
+        bot.edit_message_caption("⏳ YouTube ላይ እየጫንኩ ነው...", chat_id, msg_id)
+    except Exception:
+        pass
+    try:
+        vid = yt_upload_short(d["path"], d["title"], d["description"], d["tags"])
+        bot_stats["yt_uploads"] += 1
+        with state_lock:
+            shorts_drafts.pop(sid, None)
+        shutil.rmtree(os.path.dirname(d["path"]), ignore_errors=True)
+        text = f"✅ YouTube ላይ ተጭኗል ({YT_PRIVACY}) 🚀\nhttps://youtube.com/shorts/{vid}"
+        try:
+            bot.edit_message_caption(text, chat_id, msg_id)
+        except Exception:
+            bot.send_message(chat_id, text)
+    except Exception as e:
+        log.error("youtube upload failed: %s", e)
+        d["busy"] = False
+        kb = types.InlineKeyboardMarkup()
+        kb.add(types.InlineKeyboardButton("🔁 እንደገና ሞክር", callback_data=f"yk:{sid}"),
+               types.InlineKeyboardButton("❌ ሰርዝ", callback_data=f"yn:{sid}"))
+        hint = ""
+        if "403" in str(e) or "scope" in str(e).lower():
+            hint = "\n💡 YOUTUBE_REFRESH_TOKEN የ youtube.upload ፈቃድ ላይኖረው ይችላል።"
+        try:
+            bot.edit_message_caption(f"❌ መጫን አልተሳካም: {short_reason(e, 200)}{hint}", chat_id, msg_id, reply_markup=kb)
+        except Exception:
+            bot.send_message(chat_id, f"❌ መጫን አልተሳካም: {short_reason(e, 200)}{hint}", reply_markup=kb)
+
+
+# ----------------------------------------------------------------------------
+# Analytics: collection, branded PNG dashboard, proactive alerts
+# ----------------------------------------------------------------------------
+def tg_member_count():
+    fn = getattr(bot, "get_chat_member_count", None) or getattr(bot, "get_chat_members_count", None)
+    try:
+        return int(fn(TARGET_CHANNEL)) if fn else None
+    except Exception as e:
+        log.info("telegram member count unavailable: %s", e)
+        return None
+
+
+def collect_analytics():
+    """One structured snapshot of Telegram + YouTube + Facebook (each part fails independently)."""
+    data = {"tg": tg_member_count(), "yt": None, "fb": {}, "fb_text": ""}
+    if yt_enabled():
+        try:
+            data["yt"] = yt_channel_stats()
+        except Exception as e:
+            data["yt"] = {"error": short_reason(e, 150)}
+    data["fb_text"] = fb_analytics_text(data["fb"])
+    return data
+
+
+def _fmt(n):
+    return f"{n:,}" if isinstance(n, (int, float)) else "—"
+
+
+def render_analytics_card(data):
+    """Branded 1080x1340 dark-navy & gold Sekela Media dashboard (Telegram, YouTube, Facebook, bot activity) as JPEG
+    bytes. Ethiopic text uses the Ethiopic font, Latin/numbers use a Latin font. Returns None if Pillow is missing."""
+    if not PIL_OK:
+        return None
+    try:
+        W, H = 1080, 1340
+        NAVY, PANEL, LINE = (14, 18, 28), (24, 31, 48), (45, 55, 80)
+        GOLD, TXT, MUTED, RED = (235, 180, 45), (230, 235, 245), (160, 170, 190), (255, 110, 110)
+        BLUE, GREEN, PURPLE, ORANGE = (40, 165, 255), (80, 210, 130), (180, 120, 255), (255, 140, 90)
+        img = Image.new("RGB", (W, H), NAVY)
+        d = ImageDraw.Draw(img)
+        d.rectangle([0, 0, W, 10], fill=GOLD)
+        eth = find_ethiopic_font()
+
+        def put(x, y, text, size, fill, max_w=None):
+            f_lat = _latin_font(size)
+            f_eth = ImageFont.truetype(eth, size) if eth else f_lat
+            text = str(text)
+            if max_w:
+                orig = text
+                while len(text) > 1 and _measure(text, f_eth, f_lat) > max_w:
+                    text = text[:-1]
+                if text != orig:
+                    text = text.rstrip() + "…"
+            _draw_mixed(d, x, y + size, text, f_eth, f_lat, fill)
+
+        def panel(y, h, title, color):
+            d.rounded_rectangle([40, y, W - 40, y + h], radius=18, fill=PANEL, outline=LINE, width=2)
+            d.ellipse([64, y + 24, 80, y + 40], fill=color)
+            put(96, y + 16, title, 28, TXT, max_w=W - 200)
+
+        def kpi(x, y, label, value, color, size=46):
+            put(x, y, label, 20, MUTED)
+            put(x, y + 28, value, size, color)
+
+        def bar_rows(x, y, rows, color, row_h, label_w=330, bar_w=470):
+            top = max([v for _, v in rows] + [1])
+            for i, (label, val) in enumerate(rows):
+                yy = y + i * row_h
+                put(x, yy, label, 20, TXT, max_w=label_w - 12)
+                w = max(8, int(bar_w * val / top))
+                d.rounded_rectangle([x + label_w, yy + 2, x + label_w + w, yy + 26], radius=7, fill=color)
+                put(x + label_w + w + 10, yy, _fmt(val), 20, MUTED)
+
+        put(48, 30, "SEKELA MEDIA — ANALYTICS", 40, GOLD)
+        put(48, 86, addis_now().strftime("%Y-%m-%d %H:%M") + " (Addis Ababa)", 22, MUTED)
+
+        # Telegram
+        panel(140, 150, f"Telegram — {TARGET_CHANNEL}", BLUE)
+        kpi(76, 196, "Members", _fmt(data.get("tg")), BLUE if data.get("tg") is not None else RED)
+
+        # YouTube
+        yt = data.get("yt")
+        yt_title = (yt or {}).get("title") if yt and not yt.get("error") else "not connected"
+        panel(310, 470, f"YouTube — {yt_title}", RED if not yt or yt.get("error") else (255, 70, 70))
+        if yt and not yt.get("error"):
+            kpi(76, 366, "Subscribers", "hidden" if yt["hidden_subs"] else _fmt(yt["subs"]), GOLD)
+            kpi(396, 366, "Total views", _fmt(yt["views"]), GREEN)
+            kpi(736, 366, "Videos", _fmt(yt["videos"]), BLUE)
+            put(76, 460, "Recent videos — views", 22, TXT)
+            rows = [(v["title"].replace("\n", " "), v["views"]) for v in yt["recent"][:6]]
+            if rows:
+                bar_rows(76, 500, rows, (255, 70, 70), 44)
+            else:
+                put(76, 500, "No recent uploads found", 20, MUTED)
+        else:
+            put(76, 380, (yt or {}).get("error") or "Add YOUTUBE_* variables on Render", 22, RED, max_w=W - 160)
+
+        # Facebook
+        fb = data.get("fb") or {}
+        panel(800, 340, f"Facebook — {FB_PAGE_NAME}", PURPLE)
+        if fb.get("_ok"):
+            kpi(76, 856, "Followers", _fmt(fb.get("followers")), GOLD)
+            kpi(396, 856, "Reach (7d)", _fmt(fb.get("reach")), GREEN)
+            kpi(736, 856, "Engagement (7d)", _fmt(fb.get("engagement")), BLUE)
+            rows = [(lbl, fb[k]) for lbl, k in (("Views (7d)", "views"), ("Reach (7d)", "reach"),
+                                                ("Engagement (7d)", "engagement"), ("New followers (7d)", "new_follows"))
+                    if isinstance(fb.get(k), (int, float))]
+            if rows:
+                bar_rows(76, 972, rows, PURPLE, 44)
+        else:
+            put(76, 870, "Token needed: " + (fb.get("_err") or "FB_PAGE_ACCESS_TOKEN"), 22, RED, max_w=W - 160)
+            put(76, 912, "Create a never-expiring Page Access Token", 20, MUTED)
+
+        # Bot activity
+        panel(1160, 150, "Sekela bot activity (since last restart)", GOLD)
+        for i, (lbl, key, col) in enumerate((("Drafts", "drafts", GOLD), ("TG posts", "tg_posts", BLUE),
+                                              ("FB posts", "fb_posts", PURPLE), ("YT uploads", "yt_uploads", RED),
+                                              ("Breaking", "breaking", GREEN))):
+            kpi(76 + i * 195, 1214, lbl, str(bot_stats.get(key, 0)), col, size=38)
+
+        out = io.BytesIO()
+        img.save(out, format="JPEG", quality=92)
+        return out.getvalue()
+    except Exception as e:
+        log.warning("analytics card render failed: %s", e)
+        return None
+
+
+def analytics_summary_text(data):
+    parts = ["📣 Telegram — " + str(TARGET_CHANNEL) + "\n" +
+             (f"👥 Members: {data['tg']:,}" if data.get("tg") is not None else "⚠️ ቁጥሩን ማምጣት አልተቻለም (ቦቱ አድሚን መሆን አለበት)"),
+             yt_analytics_text(data.get("yt")) if (data.get("yt") or yt_enabled()) else yt_analytics_text(None),
+             data.get("fb_text", ""),
+             ("🤖 የቦት እንቅስቃሴ: ድራፍቶች {drafts} · TG ፖስቶች {tg_posts} · FB ፖስቶች {fb_posts} · "
+              "YT uploads {yt_uploads} · ሰበር ዜና {breaking}").format(**bot_stats)]
+    return "\n\n".join(p for p in parts if p)
+
+
+MILESTONES = [1000, 5000, 10000, 25000, 50000, 100000, 250000, 500000, 1000000]
+analytics_prev = {}
+
+
+def make_snapshot(data):
+    snap = {"tg": data.get("tg"), "yt": None, "fb": None}
+    yt = data.get("yt")
+    if yt and not yt.get("error"):
+        snap["yt"] = {"subs": yt["subs"], "views": yt["views"],
+                      "videos": {v["id"]: {"title": v["title"], "views": v["views"]} for v in yt["recent"]}}
+    fb = data.get("fb") or {}
+    if fb.get("_ok"):
+        snap["fb"] = {"followers": fb.get("followers"), "reach": fb.get("reach")}
+    return snap
+
+
+def analytics_changes(prev, cur):
+    """Human-readable notes for notable changes between two snapshots (empty list = nothing worth a ping)."""
+    notes = []
+    tg_d = int(os.environ.get("ALERT_TG_DELTA", "10"))
+    subs_d = int(os.environ.get("ALERT_SUBS_DELTA", "3"))
+    views_d = int(os.environ.get("ALERT_VIEWS_DELTA", "1000"))
+    fb_d = int(os.environ.get("ALERT_FB_DELTA", "5"))
+    if prev.get("tg") is not None and cur.get("tg") is not None:
+        delta = cur["tg"] - prev["tg"]
+        if abs(delta) >= tg_d:
+            notes.append(f"📣 Telegram ተመዝጋቢዎች {'+' if delta > 0 else ''}{delta} → {cur['tg']:,}")
+    py, cy = prev.get("yt"), cur.get("yt")
+    if py and cy:
+        ds = cy["subs"] - py["subs"]
+        if ds >= subs_d or ds <= -5:
+            notes.append(f"▶️ YouTube subscribers {'+' if ds > 0 else ''}{ds} → {cy['subs']:,}")
+        dv = cy["views"] - py["views"]
+        if dv >= views_d:
+            notes.append(f"👁 YouTube views +{dv:,} ከባለፈው ፍተሻ ወዲህ (ጠቅላላ {cy['views']:,})")
+        for vid, v in cy["videos"].items():
+            old = py["videos"].get(vid)
+            if old is None:
+                notes.append(f"🎬 አዲስ ቪዲዮ ተለቋል: {v['title'][:50]}")
+                continue
+            for m in MILESTONES:
+                if old["views"] < m <= v["views"]:
+                    notes.append(f"🔥 «{v['title'][:45]}» {m:,} views አልፏል! ({v['views']:,})")
+    pf, cf = prev.get("fb"), cur.get("fb")
+    if pf and cf:
+        if isinstance(pf.get("followers"), int) and isinstance(cf.get("followers"), int):
+            df = cf["followers"] - pf["followers"]
+            if abs(df) >= fb_d:
+                notes.append(f"📘 Facebook ተከታዮች {'+' if df > 0 else ''}{df} → {cf['followers']:,}")
+        if isinstance(pf.get("reach"), int) and isinstance(cf.get("reach"), int):
+            if cf["reach"] >= 200 and cf["reach"] >= pf["reach"] * 1.5:
+                notes.append(f"📈 Facebook reach ጨምሯል: {pf['reach']:,} → {cf['reach']:,} (7 ቀን)")
+    return notes
+
+
+def analytics_alert_once():
+    """Collect a snapshot, compare with the previous one and push a summary card to Henok's DM if notable.
+    The first run after a restart only stores the baseline. Returns the number of notes sent."""
+    data = collect_analytics()
+    cur = make_snapshot(data)
+    prev = dict(analytics_prev)
+    analytics_prev.clear()
+    analytics_prev.update(cur)
+    if not prev:
+        return 0
+    notes = analytics_changes(prev, cur)
+    if not notes:
+        return 0
+    card = render_analytics_card(data)
+    caption = ("📊 ሄኖክ፣ ጠቃሚ የ analytics ለውጥ አለ!\n\n" + "\n".join(notes))[:1020]
+    if card:
+        try:
+            bot.send_photo(OWNER_ID, io.BytesIO(card), caption=caption)
+            return len(notes)
+        except Exception as e:
+            log.warning("alert photo failed: %s", e)
+    bot.send_message(OWNER_ID, caption)
+    return len(notes)
+
+
+def alerts_loop():
+    time.sleep(300)
+    while True:
+        try:
+            if not in_quiet_hours():
+                n = analytics_alert_once()
+                log.info("analytics alert check: %d notes", n)
+        except Exception as e:
+            log.error("alerts loop error: %s", e)
+        time.sleep(max(10, int(os.environ.get("ALERT_INTERVAL_MIN", "240"))) * 60)
+
+
+def start_alerts():
+    if os.environ.get("ALERTS_ENABLED", "1") == "0":
+        return
+    threading.Thread(target=alerts_loop, daemon=True, name="alerts").start()
+    log.info("Analytics alerts started (every %s min)", os.environ.get("ALERT_INTERVAL_MIN", "240"))
 
 
 # ----------------------------------------------------------------------------
@@ -1801,13 +2519,14 @@ def handle_media(message):
     kind, file_id, mime, size, duration = info
     if size and size > MAX_MEDIA_BYTES:
         bot.send_message(chat_id, f"ሄኖክ፣ ፋይሉ {size / 1048576:.1f}MB ነው — እስከ 18MB ብቻ ነው የምተነትነው። "
-                                  "አሳጥረህ ወይም compress አድርገህ ላክልኝ 🎞")
+                                  "አሳጥረህ ወይም compress አድርገህ ላክልኝ 🎞 (ረጅም ቪዲዮ ከሆነ የ YouTube ሊንክ ከ /shorts ጋር ላክ)")
         return
     ack_id = None
     if kind in ("audio", "video"):
         what = "ድምፁን" if kind == "audio" else "ቪዲዮውን"
         ack_id = send_progress(chat_id, f"⏳ ሄኖክ፣ {what} እየተነተንኩ ነው ({media_eta(kind, size, duration)} ይወስዳል)...")
     try:
+        markup = None
         with Typing(chat_id):
             fobj = bot.get_file(file_id)
             data = bot.download_file(fobj.file_path)
@@ -1826,7 +2545,14 @@ def handle_media(message):
                 raw = multimodal_generate([{"text": prompt}, _media_part(data, mime, kind)],
                                           temperature=0.5, max_tokens=16000, thinking_budget=1024)
                 result = polish_amharic(clean_md(raw))
-        deliver(chat_id, ack_id, result + "\n\n" + took(start))
+                if kind == "video":
+                    vid = uuid.uuid4().hex[:10]
+                    with state_lock:
+                        video_cache[vid] = {"data": data, "ts": time.time()}
+                    prune(video_cache, 2)  # keep memory small on the free tier
+                    markup = types.InlineKeyboardMarkup()
+                    markup.add(types.InlineKeyboardButton("✂️ ክሊፖቹን ቆርጠህ 9:16 Shorts አዘጋጅ", callback_data=f"vc:{vid}"))
+        deliver(chat_id, ack_id, result + "\n\n" + took(start), markup)
     except Exception as e:
         log.error("media handling failed: %s", e)
         what = {"audio": "ድምፁን", "video": "ቪዲዮውን", "photo": "ፎቶውን"}.get(kind, "ፋይሉን")
@@ -1844,12 +2570,13 @@ HELP_TEXT = (
     "📰 /news — ዋና ዋና ዜናዎች (ከታማኝ ምንጮች) → ቁልፍ ስትነካ ካርድ + ፖስት\n"
     "🔔 /breaking — ሰበር ዜና አሁን ፈልግ (ቦቱ በራሱም ይፈትሻል እና ያሳውቅሃል)\n"
     "📝 /post — የሰከላ ኒውስ ካርድ + ፖስት → ✅ ስትነካ ወደ Telegram እና Facebook\n"
-    "📊 /analytics — የ ሰከላ Facebook ገጽ ተከታዮች፣ reach እና ፖስቶች\n"
+    "📊 /analytics — Telegram + YouTube + Facebook ዳሽቦርድ (ምስል) — ጠቃሚ ለውጥ ሲኖር በራሴ አሳውቅሃለሁ\n"
+    "✂️ /shorts — ረጅም ቪዲዮ (YouTube ሊንክ ወይም ፋይል) → 9:16 Shorts → ✅ ስትነካ YouTube ላይ\n"
     "🎙 ድምፅ ላክልኝ (እስከ 5 ደቂቃ) — ትራንስክሪፕት + ማጠቃለያ + Action Items\n"
-    "🎬 ቪዲዮ (እስከ 18MB) — ትንታኔ + 3 ቫይራል ክሊፖች\n"
+    "🎬 ቪዲዮ (እስከ 18MB) — ትንታኔ + 3 ቫይራል ክሊፖች + ✂️ መቁረጫ ቁልፍ\n"
     "🖼 ፎቶ — የ Canva ዲዛይን አስተያየት\n"
     "💬 ወይም ማንኛውንም ነገር ጻፍልኝ — ስክሪፕት፣ ሀሳብ፣ ጥናት\n"
-    "🩺 /ai_status — የ AI፣ የቻናል እና የ Facebook ሁኔታ\n\n"
+    "🩺 /ai_status — የ AI፣ የቻናል፣ YouTube እና Facebook ሁኔታ\n\n"
     "🔒 ያለ አንተ ፈቃድ ምንም አልለጥፍም፤ በፌስቡክ ኮመንቶች ላይም ፈጽሞ አልመልስም።"
 )
 
@@ -1880,95 +2607,47 @@ def cmd_cancel(message):
     bot.send_message(message.chat.id, "እሺ ሄኖክ፣ ተሰርዟል ✅")
 
 
-def render_analytics_card(fb_ok=False, fb_reach=0, fb_engaged=0, fb_posts_count=0):
-    """Generates a sleek 1080x720 dark-navy & gold Sekela Media Analytics Dashboard PNG using Pillow."""
-    if not PIL_OK:
-        return None
-    try:
-        W, H = 1080, 720
-        img = Image.new("RGB", (W, H), (14, 18, 28))
-        draw = ImageDraw.Draw(img)
-
-        # Gold top accent bar
-        draw.rectangle([0, 0, W, 10], fill=(235, 180, 45))
-
-        font_path = find_ethiopic_font()
-        f_title = ImageFont.truetype(font_path, 38) if font_path else ImageFont.load_default()
-        f_sub = ImageFont.truetype(font_path, 22) if font_path else ImageFont.load_default()
-        f_kpi = ImageFont.truetype(font_path, 44) if font_path else ImageFont.load_default()
-        f_lbl = ImageFont.truetype(font_path, 20) if font_path else ImageFont.load_default()
-
-        draw.text((48, 36), "SEKELA MEDIA — ANALYTICS", fill=(235, 180, 45), font=f_title)
-        now_str = addis_now().strftime("%Y-%m-%d %H:%M (Addis Ababa)")
-        draw.text((48, 88), now_str, fill=(160, 170, 190), font=f_sub)
-
-        # 4 KPI Cards
-        kpis = [
-            ("Telegram Channel", "@HenokGraphics", (40, 165, 255)),
-            ("Drafts Built", str(bot_stats["drafts"]), (235, 180, 45)),
-            ("Breaking Hunts", str(bot_stats["breaking"]), (80, 210, 130)),
-            ("FB Reach (7d)", str(fb_reach) if fb_ok else "Token Needed", (255, 110, 110) if not fb_ok else (80, 210, 130)),
-        ]
-        card_w, card_h = 228, 150
-        for i, (lbl, val, col) in enumerate(kpis):
-            x0 = 48 + i * (card_w + 24)
-            y0 = 150
-            draw.rounded_rectangle([x0, y0, x0 + card_w, y0 + card_h], radius=16, fill=(24, 31, 48), outline=(45, 55, 80), width=2)
-            draw.text((x0 + 18, y0 + 22), lbl, fill=(170, 180, 200), font=f_lbl)
-            draw.text((x0 + 18, y0 + 68), val[:16], fill=col, font=f_kpi if len(val) <= 8 else f_sub)
-
-        # Bar Chart Section
-        draw.rounded_rectangle([48, 335, W - 48, H - 45], radius=18, fill=(22, 28, 43), outline=(45, 55, 80), width=2)
-        draw.text((76, 355), "AI Newsroom & Channel Activity Overview", fill=(230, 235, 245), font=f_sub)
-
-        bars = [
-            ("Drafts", max(1, bot_stats["drafts"]), (235, 180, 45)),
-            ("Breaking", max(1, bot_stats["breaking"]), (80, 210, 130)),
-            ("TG Posts", max(1, bot_stats["tg_posts"]), (40, 165, 255)),
-            ("FB Reach", max(1, min(fb_reach, 100)) if fb_ok else 1, (180, 120, 255)),
-            ("FB Engaged", max(1, min(fb_engaged, 100)) if fb_ok else 1, (255, 140, 90)),
-        ]
-        max_v = max(v for _, v, _ in bars) or 1
-        base_y = H - 95
-        max_bar_h = 200
-        for i, (blbl, bval, bcol) in enumerate(bars):
-            bx = 105 + i * 185
-            bh = int((bval / max_v) * max_bar_h)
-            draw.rounded_rectangle([bx, base_y - bh, bx + 90, base_y], radius=8, fill=bcol)
-            draw.text((bx, base_y + 12), blbl, fill=(185, 195, 215), font=f_lbl)
-
-        out = io.BytesIO()
-        img.save(out, format="JPEG", quality=92)
-        return out.getvalue()
-    except Exception as e:
-        log.warning("analytics card render failed: %s", e)
-        return None
-
-
-@bot.message_handler(commands=["analytics", "fb_status"])
+@bot.message_handler(commands=["analytics", "fb_status", "youtube"])
 @private_owner_only
 def cmd_analytics(message):
     start = time.time()
     chat_id = message.chat.id
-    with Typing(chat_id):
-        text = fb_analytics_text()
-        fb_ok = "❌" not in text and "⚪" not in text
-        card = render_analytics_card(fb_ok=fb_ok)
-        summary = (
-            f"{text}\n\n"
-            f"📣 Telegram (@HenokGraphics) & ቦት እንቅስቃሴ:\n"
-            f"• የተዘጋጁ ድራፍቶች: {bot_stats['drafts']}\n"
-            f"• ሰበር ዜና ፍተሻዎች: {bot_stats['breaking']}\n"
-            f"• ወደ ቴሌግራም የተለጠፉ: {bot_stats['tg_posts']}\n\n"
-            + took(start)
-        )
+    ack_id = send_progress(chat_id, "📊 ሄኖክ፣ የ Telegram፣ YouTube እና Facebook መረጃ እየሰበሰብኩ ነው...")
+    try:
+        data = collect_analytics()
+        analytics_prev.clear()
+        analytics_prev.update(make_snapshot(data))  # a manual check also refreshes the alert baseline
+        card = render_analytics_card(data)
+        summary = analytics_summary_text(data) + "\n\n" + took(start)
+    except Exception as e:
+        log.error("analytics failed: %s", e)
+        deliver(chat_id, ack_id, f"ሄኖክ፣ analytics ማምጣት አልተሳካም 😅 ({short_reason(e)})")
+        return
+    drop_message(chat_id, ack_id)
     if card:
         try:
-            bot.send_photo(chat_id, io.BytesIO(card), caption=summary[:1020])
-            return
+            bot.send_photo(chat_id, io.BytesIO(card), caption="📊 ሰከላ ሚዲያ — Analytics Dashboard")
         except Exception as e:
             log.warning("analytics photo send failed: %s", e)
     deliver(chat_id, None, summary)
+
+
+@bot.message_handler(commands=["shorts", "clips"])
+@private_owner_only
+def cmd_shorts(message):
+    chat_id, uid = message.chat.id, message.from_user.id
+    m = re.search(r"https?://\S+", message.text or "")
+    if m:
+        url = m.group(0)
+        if not is_youtube_url(url):
+            bot.send_message(chat_id, "ሄኖክ፣ ለአሁን የ YouTube ሊንክ ብቻ ነው የምቀበለው 🙏 ወይም ቪዲዮውን እዚህ ላክልኝ።")
+            return
+        run_shorts(chat_id, url=url)
+        return
+    with state_lock:
+        awaiting_topic[uid] = "shorts"
+    bot.send_message(chat_id, "እሺ ሄኖክ ✂️ የረጅሙን ቪዲዮ የ YouTube ሊንክ ላክልኝ፤ ወይም ቪዲዮውን ፋይል (እስከ 18MB) ላክልኝ → "
+                              "ከትንታኔው በታች ✂️ ቁልፍ ይመጣል። (ለመሰረዝ /cancel)")
 
 
 @bot.message_handler(commands=["breaking", "hunt"])
@@ -1976,14 +2655,13 @@ def cmd_analytics(message):
 def cmd_breaking(message):
     start = time.time()
     chat_id = message.chat.id
-    ack_id = send_progress(chat_id, "⏳ ሄኖክ፣ ሰበር ዜናዎችን እየፈተሽኩ ነው (ከ40-70 ሰከንድ ይወስዳል)...")
+    ack_id = send_progress(chat_id, "⏳ ሄኖክ፣ ሰበር ዜናዎችን እየፈተሽኩ ነው (ባለፉት 12 ሰዓታት፣ አስፈላጊ ከሆነ 24 ሰዓት) — ከ40-90 ሰከንድ ይወስዳል...")
     status = hunt_once(manual=True, min_importance=5)
     if status == "sent":
         drop_message(chat_id, ack_id)
         return
     msgs = {
-        "none": "ሄኖክ፣ አሁን ለሰከላ ኒውስ የሚሆን አዲስ ትልቅ ሰበር ዜና አልተገኘም። ሲገኝ በራሴ አሳውቅሃለሁ 🔔",
-        "unverified": "ሄኖክ፣ አንድ ዜና አገኘሁ ግን ከታማኝ ምንጭ ማረጋገጥ አልቻልኩም — ያልተረጋገጠ ዜና አላዘጋጅም።",
+        "none": "ሄኖክ፣ አሁን አዲስ ያልቀረበ ዜና አልተገኘም — ቀደም ብለው የተላኩልህን ዜናዎች ደግሜ አልልክም። ሲገኝ በራሴ አሳውቅሃለሁ 🔔",
         "failed": "ሄኖክ፣ ዜናውን አሁን ማዘጋጀት አልቻልኩም 😅 ጥቂት ቆይተህ እንደገና ሞክር።",
         "busy": "ሄኖክ፣ ፍተሻው አሁን እየተካሄደ ነው — ጥቂት ቆይተህ ሞክር።",
         "nokey": "GEMINI_API_KEY አልተሞላም — ሰበር ዜና መፈለግ አልችልም።",
@@ -2034,19 +2712,20 @@ def _openrouter_status_lines():
             lines.append(f"⚠️ OpenRouter ቁልፍ: HTTP {r.status_code} (ቁልፍ ወይም credit ችግር ሊሆን ይችላል)")
     except Exception as e:
         lines.append(f"⚠️ OpenRouter: ግንኙነት አልተሳካም ({short_reason(e, 60)})")
-    try:
-        r = requests.get(f"{OPENROUTER_URL}/models", timeout=25)
-        ids = {m.get("id") for m in r.json().get("data", [])} if r.status_code == 200 else None
-    except Exception:
-        ids = None
-    for i, m in enumerate(OPENROUTER_MODELS):
+    active = get_openrouter_models(force=True)
+    with _or_lock:
+        ids = _or_cache.get("ids")
+    for i, m in enumerate(OPENROUTER_BASE_MODELS):
         role = "ዋና" if i == 0 else f"ተጠባባቂ {i}"
         if ids is None:
             lines.append(f"  • {m} ({role})")
         elif m in ids:
             lines.append(f"  ✅ {m} ({role})")
         else:
-            lines.append(f"  ❌ {m} ({role}) — በ OpenRouter ዝርዝር ውስጥ የለም (ተወግዷል?)፤ OPENROUTER_MODELS ቀይር")
+            lines.append(f"  ❌ {m} ({role}) — በ OpenRouter ዝርዝር ውስጥ የለም፤ OPENROUTER_MODELS ቀይር")
+    for m in active:
+        if m not in OPENROUTER_BASE_MODELS:
+            lines.append(f"  ✅ {m} (በራሱ የተረጋገጠ ተጨማሪ ተጠባባቂ)")
     return lines
 
 
@@ -2084,6 +2763,22 @@ def _fb_status_lines():
     return lines
 
 
+def _yt_status_lines():
+    lines = ["▶️ YouTube:"]
+    if not yt_enabled():
+        lines.append("  ⚪ YOUTUBE_CLIENT_ID / SECRET / REFRESH_TOKEN አልተሞሉም")
+    else:
+        try:
+            _yt_get("channels", {"part": "id", "mine": "true"})
+            s = yt_channel_stats()
+            lines.append(f"  ✅ ተገናኝቷል: {s['title']} ({s['subs']:,} subs · {s['videos']:,} videos)")
+        except Exception as e:
+            lines.append(f"  ❌ {short_reason(e, 160)}")
+    lines.append("  ✅ ffmpeg ዝግጁ (Shorts መቁረጥ ይሰራል)" if get_ffmpeg()
+                 else "  ❌ ffmpeg የለም — requirements.txt ላይ imageio-ffmpeg ጨምር")
+    return lines
+
+
 @bot.message_handler(commands=["ai_status"])
 @private_owner_only
 def cmd_ai_status(message):
@@ -2098,6 +2793,8 @@ def cmd_ai_status(message):
         lines += _channel_status_lines()
         lines.append("")
         lines += _fb_status_lines()
+        lines.append("")
+        lines += _yt_status_lines()
         font = find_ethiopic_font() if PIL_OK else None
         lines.append("\n🖼 የካርድ ርዕስ ፊደል (Ethiopic font): " + ("✅ ተገኝቷል" if font else "❌ የለም — NotoSansEthiopic-Bold.ttf ኮሚት አድርግ"))
         lines.append(f"👤 Owner ID: {OWNER_ID}")
@@ -2107,7 +2804,7 @@ def cmd_ai_status(message):
 
 
 # ----------------------------------------------------------------------------
-# Callbacks (categories + approval gate) - private chat with owner only
+# Callbacks (categories + approval gates) - private chat with owner only
 # ----------------------------------------------------------------------------
 @bot.callback_query_handler(func=lambda c: True)
 def on_callback(call):
@@ -2193,6 +2890,33 @@ def on_callback(call):
                 drafts.pop(did, None)
             bot.edit_message_text("❌ ተሰርዟል — ምንም አልተለጠፈም።", chat_id, msg_id)
 
+        elif data.startswith("vc:"):  # cut Shorts from a video that was just analysed
+            vid = data.split(":", 1)[1]
+            with state_lock:
+                item = video_cache.pop(vid, None)
+            if not item:
+                bot.send_message(chat_id, "ሄኖክ፣ ቪዲዮው ከማህደረ ትውስታ ተሰርዟል — እንደገና ላክልኝ 🙏")
+                return
+            try:
+                bot.edit_message_reply_markup(chat_id, msg_id, reply_markup=None)
+            except Exception:
+                pass
+            run_shorts(chat_id, data=item["data"])
+
+        elif data.startswith("yk:"):  # APPROVAL: upload a Short to YouTube
+            approve_short_upload(chat_id, msg_id, data.split(":", 1)[1])
+
+        elif data.startswith("yn:"):
+            sid = data.split(":", 1)[1]
+            with state_lock:
+                d = shorts_drafts.pop(sid, None)
+            if d:
+                shutil.rmtree(os.path.dirname(d["path"]), ignore_errors=True)
+            try:
+                bot.edit_message_caption("❌ ተሰርዟል — YouTube ላይ ምንም አልተጫነም።", chat_id, msg_id)
+            except Exception:
+                bot.send_message(chat_id, "❌ ተሰርዟል — YouTube ላይ ምንም አልተጫነም።")
+
     except Exception as e:
         log.error("callback error: %s", e)
         try:
@@ -2212,9 +2936,16 @@ def handle_text(message):
         return
     uid, chat_id = message.from_user.id, message.chat.id
 
-    # Topic typed after tapping "write my own topic"
+    # Topic typed after tapping "write my own topic" (or a link after /shorts)
     with state_lock:
         pending_mode = awaiting_topic.pop(uid, None)
+    if pending_mode == "shorts":
+        m = re.search(r"https?://\S+", text)
+        if not m or not is_youtube_url(m.group(0)):
+            bot.send_message(chat_id, "ሄኖክ፣ ትክክለኛ የ YouTube ሊንክ አላገኘሁም 🙏 /shorts ብለህ እንደገና ሞክር።")
+            return
+        run_shorts(chat_id, url=m.group(0))
+        return
     if pending_mode:
         label = f"✍️ {text[:40]}"
         (run_news if pending_mode == "news" else run_post)(chat_id, label, text)
@@ -2263,8 +2994,8 @@ def handle_text(message):
 def main():
     start_health_server()
     start_keepalive()
-    log.info("Starting Henok Assistant agent... Telegram target: %s | Facebook: %s", TARGET_CHANNEL,
-             "on" if fb_enabled() else "off (no FB_PAGE_ACCESS_TOKEN)")
+    log.info("Starting Henok Assistant agent... Telegram target: %s | Facebook: %s | YouTube: %s", TARGET_CHANNEL,
+             "on" if fb_enabled() else "off (no FB_PAGE_ACCESS_TOKEN)", "on" if yt_enabled() else "off")
 
     if not TELEGRAM_BOT_TOKEN:
         log.error("TELEGRAM_BOT_TOKEN is missing. Set it in Render environment variables.")
@@ -2284,7 +3015,10 @@ def main():
         pass
     if PIL_OK:  # warm the font cache in the background so the first card is not slow
         threading.Thread(target=find_ethiopic_font, daemon=True).start()
-    start_hunter()  # proactive breaking-news hunter
+    if OPENROUTER_API_KEY:  # verify model slugs once at startup (also warms the cache)
+        threading.Thread(target=get_openrouter_models, daemon=True).start()
+    start_hunter()   # proactive breaking-news hunter
+    start_alerts()   # proactive analytics alerts
 
     try:
         bot.remove_webhook()
@@ -2295,8 +3029,9 @@ def main():
             types.BotCommand("news", "ዋና ዋና ዜናዎች (ከታማኝ ምንጮች)"),
             types.BotCommand("breaking", "ሰበር ዜና አሁን ፈልግ"),
             types.BotCommand("post", "የሰከላ ኒውስ ካርድ + ፖስት"),
-            types.BotCommand("analytics", "የ Facebook ገጽ ትንተና"),
-            types.BotCommand("ai_status", "የ AI፣ ቻናል እና Facebook ሁኔታ"),
+            types.BotCommand("analytics", "Telegram + YouTube + Facebook ዳሽቦርድ"),
+            types.BotCommand("shorts", "ረጅም ቪዲዮ → 9:16 Shorts"),
+            types.BotCommand("ai_status", "የ AI፣ ቻናል፣ YouTube እና Facebook ሁኔታ"),
             types.BotCommand("cancel", "ሰርዝ"),
             types.BotCommand("help", "እገዛ"),
         ], scope=types.BotCommandScopeAllPrivateChats())
