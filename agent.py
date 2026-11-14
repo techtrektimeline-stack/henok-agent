@@ -10,10 +10,16 @@ Required : TELEGRAM_BOT_TOKEN, OPENROUTER_API_KEY, GEMINI_API_KEY
 Facebook : FB_PAGE_ACCESS_TOKEN  (NEVER-EXPIRING Page access token: pages_manage_posts, pages_read_engagement, read_insights)
            FB_PAGE_ID            (default 1252817724577069)
            FB_API_VERSION        (default v25.0)
+           FB_SPORT_PAGE_ID      (Sekela Sport page, default 61566927555462)
+           FB_SPORT_ACCESS_TOKEN (Sekela Sport Page access token)
 YouTube  : YOUTUBE_CLIENT_ID, YOUTUBE_CLIENT_SECRET, YOUTUBE_REFRESH_TOKEN
            YT_PRIVACY            (public | unlisted | private; default public - upload happens ONLY after approval tap)
 Optional : OWNER_ID              (default 511440586)
-           TARGET_CHANNEL        (default @HenokGraphics)
+           TARGET_CHANNEL        (ሰከላ ሚዲያ channel, default @sekelamediaET)
+           SPORT_CHANNEL         (ሰከላ ስፖርት channel, default @SekelaSportET)
+           SEEN_FILE             (48h story-dedup JSON file, default in the temp dir)
+           HUNT_SPORT_INTERVAL_MIN (default 30), HUNT_SPORT_MAX_PER_DAY (default 25), HUNTER_SPORT_ENABLED=1
+           SPORT_RSS_FEEDS="Name|url,Name|url"
            OPENROUTER_MODELS     (comma list; default deepseek/deepseek-chat,openai/gpt-4o-mini)
            OPENROUTER_AUTO_EXTRA (default 1: auto-add a verified Claude Haiku / Grok mini slug taken from OpenRouter's
                                   live /api/v1/models list as extra fallback; 0 disables)
@@ -52,9 +58,11 @@ import copy
 import functools
 import glob
 import io
+import html as html_lib
 import json
 import logging
 import os
+import random
 import re
 import shutil
 import subprocess
@@ -67,7 +75,7 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, urljoin, urlparse
 
 import requests
 import telebot
@@ -105,10 +113,10 @@ if YT_PRIVACY not in ("public", "unlisted", "private"):
 
 
 def normalize_channel(value):
-    """'@HenokGraphics' / 'HenokGraphics' / 't.me/HenokGraphics' -> '@HenokGraphics'; numeric ids -> int."""
+    """'@name' / 'name' / 't.me/name' -> '@name'; numeric ids -> int."""
     v = (value or "").strip()
     if not v:
-        return "@HenokGraphics"
+        return "@sekelamediaET"
     if re.fullmatch(r"-?\d+", v):
         return int(v)
     if "t.me/" in v:
@@ -116,7 +124,63 @@ def normalize_channel(value):
     return v if v.startswith("@") else "@" + v
 
 
-TARGET_CHANNEL = normalize_channel(os.environ.get("TARGET_CHANNEL", "@HenokGraphics"))
+TARGET_CHANNEL = normalize_channel(os.environ.get("TARGET_CHANNEL", "@sekelamediaET"))
+SPORT_CHANNEL = normalize_channel(os.environ.get("SPORT_CHANNEL", "@SekelaSportET"))
+FB_SPORT_PAGE_ID = os.environ.get("FB_SPORT_PAGE_ID", "61566927555462").strip()
+FB_SPORT_ACCESS_TOKEN = os.environ.get("FB_SPORT_ACCESS_TOKEN", "").strip()
+
+
+def _tg_link(channel, fallback):
+    if isinstance(channel, str) and channel.startswith("@"):
+        return "https://t.me/" + channel[1:]
+    return fallback
+
+
+# Two publishing pipelines. Every draft is routed to ONE brand: Telegram channel + Facebook Page (own token).
+BRANDS = {
+    "media": {
+        "key": "media", "emoji": "📰", "name_am": "ሰከላ ሚዲያ", "name_en": "Sekela Media",
+        "badge": "ሰከላ ሚዲያ | Sekela Media",
+        "tg": TARGET_CHANNEL, "tg_link": _tg_link(TARGET_CHANNEL, "https://t.me/sekelamediaET"),
+        "fb_id": FB_PAGE_ID, "fb_token": FB_PAGE_ACCESS_TOKEN, "fb_name": FB_PAGE_NAME,
+        "fb_link": f"https://www.facebook.com/{FB_PAGE_ID}",
+        "tags": ["#ሰከላ_ሚዲያ", "#SekelaMedia", "#ሰከላ_ኒውስ", "#SekelaNews"],
+        "brief_note": "This is a general news story (Ethiopia, Africa, world, economy, tech/AI, culture, trends) "
+                      "for ሰከላ ሚዲያ.",
+    },
+    "sport": {
+        "key": "sport", "emoji": "⚽", "name_am": "ሰከላ ስፖርት", "name_en": "Sekela Sport",
+        "badge": "ሰከላ ስፖርት | Sekela Sport",
+        "tg": SPORT_CHANNEL, "tg_link": _tg_link(SPORT_CHANNEL, "https://t.me/SekelaSportET"),
+        "fb_id": FB_SPORT_PAGE_ID, "fb_token": FB_SPORT_ACCESS_TOKEN, "fb_name": "ሰከላ ስፖርት",
+        "fb_link": "https://www.facebook.com/SekelaSportET",
+        "tags": ["#ሰከላ_ስፖርት", "#SekelaSport", "#ሰከላ_ሚዲያ", "#SekelaMedia"],
+        "brief_note": "This is a SPORT story for ሰከላ ስፖርት: use football/sport vocabulary. For a goal give the scorer, "
+                      "the minute and the scoreline; for a transfer give the player, the clubs and the fee ONLY if they "
+                      "are in the notes.",
+    },
+}
+ALL_BRAND_TAGS = {t.lower() for b in BRANDS.values() for t in b["tags"]}
+
+
+def other_brand(brand):
+    return "sport" if brand == "media" else "media"
+
+
+def brand_label(brand):
+    b = BRANDS[brand]
+    return f"{b['emoji']} {b['name_am']}"
+
+
+def fb_enabled(brand="media"):
+    b = BRANDS[brand]
+    return bool(b["fb_id"] and b["fb_token"])
+
+
+def brand_footer(brand):
+    b = BRANDS[brand]
+    return ("🔗 ፈጣን እና ታማኝ መረጃ ለማግኘት ይቀላቀሉን:\n"
+            f"Telegram: {b['tg_link']}\nFacebook: {b['fb_link']}")
 
 # Base models are only the two that /ai_status confirmed. The Claude / Grok slugs are NOT hardcoded any more:
 # get_openrouter_models() looks them up in OpenRouter's live model list so a wrong slug can never show a red X.
@@ -136,7 +200,6 @@ INLINE_LIMIT_BYTES = 12 * 1024 * 1024
 MAX_HISTORY_TURNS = 8
 CAPTION_LIMIT = 1024  # Telegram photo-caption hard limit
 
-BRAND_TAGS = ["#ሰከላ_ኒውስ", "#SekelaNews", "#HenokGraphics"]
 BRAND_RED = (214, 40, 40)
 AI_LABEL = True  # small "AI illustration" tag on cards (the background is generated, not a real photo)
 
@@ -212,6 +275,7 @@ drafts = {}           # draft_id -> draft dict (see present_draft)
 news_cache = {}       # news_id -> {"label","text","sources","ts"}
 video_cache = {}      # video_id -> {"data": bytes, "ts": float}  (for the Shorts clipper button)
 shorts_drafts = {}    # short_id -> {"path","title","description","tags","busy","ts"}
+published = {}        # pub_id -> channel post info (for the Pin / Edit buttons)
 bot_stats = {"drafts": 0, "tg_posts": 0, "fb_posts": 0, "yt_uploads": 0, "breaking": 0}
 
 CATEGORIES = {
@@ -219,9 +283,14 @@ CATEGORIES = {
     "crypto": ("🪙 Crypto እና ገበያ", "Crypto & Markets"),
     "biz": ("💼 ኢኮኖሚና ቢዝነስ", "Economy & Business"),
     "creator": ("🎬 ፈጣሪዎችና ሶሻል ሚዲያ", "Creators, Video Creation, Editing & Social Media"),
+    "sport": ("⚽ ስፖርት (እግር ኳስ)", "Football and sports: Ethiopian Premier League, English Premier League, Champions League, European leagues, transfers (ዝውውሮች), Olympics, live goals"),
 }
 CUSTOM_LABEL = "✍️ የራሴን ርዕስ እጽፋለሁ"
 
+SPORT_WORDS = ["ስፖርት", "እግር ኳስ", "ኳስ", "ጎል", "ዝውውር", "ፕሪሚየር ሊግ", "ሻምፒየንስ ሊግ", "ኦሎምፒክ", "ቅዱስ ጊዮርጊስ",
+               "football", "soccer", "premier league", "champions league", "la liga", "serie a", "bundesliga",
+               "goal", "goals", "transfer", "arsenal", "chelsea", "liverpool", "man utd", "manchester united",
+               "manchester city", "tottenham", "barcelona", "real madrid", "olympic", "olympics", "match", "fixture"]
 NEWS_WORDS = ["ዜና", "ትሬንድ", "ወቅታዊ", "አዲስ ነገር", "news", "trend", "trends", "latest", "trending"]
 POST_WORDS = ["ፖስት", "ካፕሽን", "ለቻናል", "ለማህበረሰብ", "post", "caption"]
 REALTIME_WORDS = ["ዛሬ", "አሁን", "ዋጋ", "ምንዛሬ", "ዜና", "ትሬንድ", "ወቅታዊ", "ቅርብ ጊዜ",
@@ -236,6 +305,12 @@ THANKS_PHRASES = {"thanks", "thank you", "thx", "አመሰግናለሁ", "እና
 # Top-tier outlets recognised for the mandatory "📌 ምንጭ፡" line: (Amharic display name, regex)
 OUTLETS = [
     ("ቢቢሲ አማርኛ", r"bbc\s*amharic|bbc\.com/amharic|amharic\.bbc|ቢቢሲ\s*አማርኛ"),
+    ("ቢቢሲ ስፖርት", r"bbc\s*sport"),
+    ("ስካይ ስፖርትስ", r"sky\s*sports"),
+    ("ዋልታ", r"walta|waltainfo|ዋልታ"),
+    ("ቦርከና", r"borkena"),
+    ("ፋብሪዚዮ ሮማኖ", r"fabrizio|romano"),
+    ("ዘ ጋርዲያን", r"guardian"),
     ("ቢቢሲ", r"\bbbc\b|ቢቢሲ"),
     ("ሮይተርስ", r"reuters|ሮይተርስ"),
     ("AP", r"\bap\b|associated press|apnews|አሶሼትድ ፕሬስ"),
@@ -267,8 +342,8 @@ def system_prompt():
         "You are the personal AI chief-of-staff of ሄኖክ (Henok Habtamu), a digital marketer, video producer "
         "and creator in Addis Ababa, Ethiopia. You live inside his private Telegram bot.\n"
         f"Current Addis Ababa time: {t}.\n\n"
-        "BRAND CONTEXT: news brand 'ሰከላ ኒውስ (Sekela News)' on Facebook (ሰከላ Sekela page) and Telegram; YouTube "
-        "'Henok Travel'; community 'Henok Graphics' (@HenokGraphics: video editors, motion designers, creators); "
+        "BRAND CONTEXT: media brand 'ሰከላ ሚዲያ (Sekela Media / Sekela News)' on Facebook (ሰከላ Sekela page) and Telegram (@sekelamediaET); sports brand 'ሰከላ ስፖርት (Sekela Sport)' on Facebook and Telegram (@SekelaSportET); YouTube "
+        "'Henok Travel'; "
         "commerce: Whop viral clipping campaigns, Amazon KDP, Ye-buna (የቡና), Sekela Marketing. Content pillars: AI & "
         "Tech, Crypto & Markets, Economy & Business, Video Creation & Editing.\n\n"
         "AMHARIC QUALITY GUARDRAIL (strict, highest priority):\n"
@@ -384,17 +459,21 @@ def prune(store, max_items=25):
 
 def deliver(chat_id, ack_id, text, markup=None):
     """Edit the progress message (if any) with the first chunk, send the rest as new messages.
-    The keyboard, if any, goes on the last chunk."""
+    The keyboard, if any, goes on the last chunk. Returns the id of the last message used."""
     chunks = split_text(text)
+    last_id = ack_id
     for i, chunk in enumerate(chunks):
         mk = markup if i == len(chunks) - 1 else None
         if i == 0 and ack_id:
             try:
                 bot.edit_message_text(chunk, chat_id, ack_id, reply_markup=mk, disable_web_page_preview=True)
+                last_id = ack_id
                 continue
             except Exception as e:
                 log.warning("edit failed, sending new message: %s", e)
-        bot.send_message(chat_id, chunk, reply_markup=mk, disable_web_page_preview=True)
+        sent = bot.send_message(chat_id, chunk, reply_markup=mk, disable_web_page_preview=True)
+        last_id = getattr(sent, "message_id", last_id)
+    return last_id
 
 
 def send_progress(chat_id, text):
@@ -418,7 +497,7 @@ def drop_message(chat_id, message_id):
 def short_reason(e, limit=140):
     s = re.sub(r"\s+", " ", str(e))
     for secret in (FB_PAGE_ACCESS_TOKEN, GEMINI_API_KEY, OPENROUTER_API_KEY, TELEGRAM_BOT_TOKEN,
-                   YT_CLIENT_SECRET, YT_REFRESH_TOKEN):
+                   YT_CLIENT_SECRET, YT_REFRESH_TOKEN, FB_SPORT_ACCESS_TOKEN):
         if secret:
             s = s.replace(secret, "***")
     return s[:limit]
@@ -517,6 +596,56 @@ def _extract(data):
     return text, sources
 
 
+_gm_lock = threading.Lock()
+_gm_cache = {"ts": 0.0, "models": None}
+_gm_bad = set()   # models that answered HTTP 404 for this key (skipped from then on)
+GEMINI_PREFERRED = ["gemini-flash-latest", "gemini-2.5-flash", "gemini-2.5-pro", "gemini-pro-latest"]
+
+
+def get_gemini_models(force=False):
+    """Active generateContent models for this API key (GET /models, cached 6h), preferred ones first.
+    404 models are skipped. If the list cannot be fetched the built-in names are used."""
+    now = time.time()
+    with _gm_lock:
+        if not force and _gm_cache["models"] and now - _gm_cache["ts"] < 21600:
+            return [m for m in _gm_cache["models"] if m not in _gm_bad] or list(GEMINI_PREFERRED)
+    names = None
+    try:
+        names, token = set(), None
+        for _ in range(6):
+            params = {"pageSize": 1000}
+            if token:
+                params["pageToken"] = token
+            r = requests.get(f"{GEMINI_BASE}/models", headers={"x-goog-api-key": GEMINI_API_KEY},
+                             params=params, timeout=25)
+            if r.status_code != 200:
+                names = None
+                break
+            js = r.json()
+            for m in js.get("models", []):
+                if "generateContent" in (m.get("supportedGenerationMethods") or []):
+                    names.add((m.get("name") or "").split("/", 1)[-1])
+            token = js.get("nextPageToken")
+            if not token:
+                break
+    except Exception as e:
+        log.info("Gemini model list unavailable: %s", e)
+        names = None
+    if names:
+        models = [m for m in GEMINI_PREFERRED if m in names]
+        extra = sorted(m for m in names if "flash" in m and m not in models and not re.search(
+            r"image|tts|live|audio|embed|thinking|exp|preview|lite|8b|robotics", m))
+        models += extra[-2:]
+        if not models:
+            models = list(GEMINI_PREFERRED)
+        log.info("Gemini active models: %s", models)
+    else:
+        models = list(GEMINI_PREFERRED)
+    with _gm_lock:
+        _gm_cache.update(ts=now if names else now - 21000, models=list(models))
+    return [m for m in models if m not in _gm_bad] or models
+
+
 def gemini_generate(contents, system=None, grounding=False, temperature=0.8, max_tokens=8192):
     if not GEMINI_API_KEY:
         raise GeminiError("GEMINI_API_KEY missing")
@@ -528,13 +657,15 @@ def gemini_generate(contents, system=None, grounding=False, temperature=0.8, max
     if grounding:
         payload["tools"] = [{"google_search": {}}]
     last_err = None
-    for model in GEMINI_MODELS:
+    for model in get_gemini_models():
         try:
             text, sources = _extract(_gemini_call(model, payload))
             return text, sources, model
         except Exception as e:
             last_err = e
             log.warning("Gemini model failed: %s", e)
+            if "HTTP 404" in str(e):
+                _gm_bad.add(model)
     raise GeminiError(f"all Gemini models failed: {last_err}")
 
 
@@ -622,9 +753,8 @@ def gemini_upload_file(data, mime, display_name):
 
 
 def multimodal_generate(parts, temperature=0.4, max_tokens=24000, thinking_budget=None):
-    """Audio/video/image analysis. Large output budget (long Amharic transcripts need many tokens) and an optional
-    thinking budget so 'thinking' cannot eat the whole output. If a model rejects the thinking config (HTTP 400),
-    that model is retried once without it."""
+    """Audio/video/image analysis. Every ACTIVE model (404 models are skipped) is tried with three variants before the
+    next model: (thinkingConfig + max_tokens) -> (no thinkingConfig + max_tokens) -> (no thinkingConfig + 8192)."""
     if not GEMINI_API_KEY:
         raise GeminiError("GEMINI_API_KEY missing")
     base = {
@@ -632,23 +762,30 @@ def multimodal_generate(parts, temperature=0.4, max_tokens=24000, thinking_budge
         "contents": [{"role": "user", "parts": parts}],
         "generationConfig": {"temperature": temperature, "maxOutputTokens": max_tokens},
     }
-    last_err = None
-    for model in GEMINI_MODELS:
-        variants = [True, False] if thinking_budget is not None else [False]
-        for with_thinking in variants:
+    variants = []
+    if thinking_budget is not None:
+        variants.append((thinking_budget, max_tokens))
+    variants.append((None, max_tokens))
+    if max_tokens > 8192:
+        variants.append((None, 8192))
+    last_err, tried = None, []
+    for model in get_gemini_models():
+        tried.append(model)
+        for tb, mt in variants:
             payload = copy.deepcopy(base)
-            if with_thinking:
-                payload["generationConfig"]["thinkingConfig"] = {"thinkingBudget": thinking_budget}
+            payload["generationConfig"]["maxOutputTokens"] = mt
+            if tb is not None:
+                payload["generationConfig"]["thinkingConfig"] = {"thinkingBudget": tb}
             try:
                 text, _ = _extract(_gemini_call(model, payload))
                 return text
             except Exception as e:
                 last_err = e
-                log.warning("Multimodal %s (thinking=%s) failed: %s", model, with_thinking, e)
-                if with_thinking and "HTTP 400" in str(e):
-                    continue  # model does not accept this thinking config -> retry same model without it
-                break
-    raise GeminiError(f"all models failed for media: {last_err}")
+                log.warning("Multimodal %s (thinking=%s, max=%s) failed: %s", model, tb, mt, e)
+                if "HTTP 404" in str(e):
+                    _gm_bad.add(model)
+                    break  # this model does not exist for the key: next model
+    raise GeminiError(f"all models failed for media ({', '.join(tried)}): {last_err}")
 
 
 # ----------------------------------------------------------------------------
@@ -810,6 +947,7 @@ def category_keyboard(mode):
         types.InlineKeyboardButton(CATEGORIES["biz"][0], callback_data=f"cat:{mode}:biz"),
         types.InlineKeyboardButton(CATEGORIES["creator"][0], callback_data=f"cat:{mode}:creator"),
     )
+    kb.add(types.InlineKeyboardButton(CATEGORIES["sport"][0], callback_data=f"cat:{mode}:sport"))
     kb.add(types.InlineKeyboardButton(CUSTOM_LABEL, callback_data=f"cat:{mode}:custom"))
     return kb
 
@@ -823,38 +961,44 @@ def show_categories(chat_id, mode):
 # ----------------------------------------------------------------------------
 # Newsroom engine: Amharic news template, sourcing, story discovery
 # ----------------------------------------------------------------------------
-CHANNEL_HANDLE = TARGET_CHANNEL if isinstance(TARGET_CHANNEL, str) else "@HenokGraphics"
-FOOTER = ("🔗 ፈጣን እና ታማኝ መረጃዎችን ለማግኘት የሰከላ ኒውስ ማህበረሰብን ይቀላቀሉ:\n"
-          f"Telegram: {CHANNEL_HANDLE} | Facebook: {FB_PAGE_NAME}")
-NO_OFFICIAL_LINE = "ጉዳዩን በተመለከተ ተጨማሪ መረጃዎች ሲገኙ ሰከላ ኒውስ ያሳውቃል።"
-UNVERIFIED_SOURCE = "ሰከላ ኒውስ ዴስክ (በማረጋገጥ ላይ)"
+UNVERIFIED_SOURCE = "ሰከላ ሚዲያ ዴስክ (በማረጋገጥ ላይ)"
 
 NEWSROOM_SYSTEM = (
-    "You are the senior Amharic news editor of 'ሰከላ ኒውስ (Sekela News)', writing to the standard of professional "
-    "Ethiopian newsrooms such as Tikvah-ETH, Addis Insight and BBC Amharic.\n"
-    "RULES: pure native Addis Ababa journalistic Amharic in correct Ethiopic script; strict inverted pyramid; "
-    "neutral third person; NEVER address anyone (no አንተ/እናንተ/እኔ/እኛ, no questions, no greetings, never the name ሄኖክ); "
-    "zero conversational filler, no slang, no word-for-word translated idioms or English sentence structure; short, "
-    "factual sentences in news register (አስታወቀ, ገለጸ, ዘግቧል, እንደ ... ገለጻ); attribute every claim and quote to its "
-    "source (e.g. 'ሮይተርስ እንደዘገበው', 'የገንዘብ ሚኒስቴር አስታውቋል'); use ONLY facts, numbers, names and quotes present "
-    "in the research notes; never invent, embellish or speculate; spell names of people and places consistently; keep "
-    "widely used English terms (AI, Bitcoin, Whop) in Latin letters; plain text, no markdown, no emojis inside "
-    "paragraphs."
+    "You are the senior Amharic news editor of 'ሰከላ ሚዲያ (Sekela Media)' and 'ሰከላ ስፖርት (Sekela Sport)', writing in "
+    "the style of Addis Ababa newsrooms such as Tikvah-Ethiopia, Getu Temesgen and Gursha.\n"
+    "WRITING RULES (highest priority):\n"
+    "- Crystal-clear, everyday Addis Ababa journalistic Amharic that any reader understands at first read.\n"
+    "- EVERY sentence is 10-18 words, never more. One idea per sentence. Subject first, active voice. If a sentence "
+    "needs more than 18 words, split it into two sentences.\n"
+    "- No tangled clauses, no chains of 'እና ... እና ...', no word-for-word English structure, no rare or old-fashioned "
+    "words, no machine-translated idioms. If unsure of an Amharic word, use the common English term in Latin letters.\n"
+    "- Neutral third person; NEVER address anyone (no አንተ/እናንተ/እኔ/እኛ, no questions, no greetings, never the name ሄኖክ).\n"
+    "- News register verbs: አስታወቀ, ገለጸ, ዘግቧል, እንደ ... ገለጻ. Attribute every claim and quote to its source "
+    "(e.g. 'ሮይተርስ እንደዘገበው', 'የገንዘብ ሚኒስቴር አስታውቋል').\n"
+    "- Use ONLY facts, numbers, names and quotes present in the research notes. Never invent, embellish or speculate. "
+    "Never mix facts of different events. Spell names of people and places the same way everywhere.\n"
+    "- Plain text, no markdown, no emojis inside paragraphs; keep widely used English terms (AI, Bitcoin, TikTok) in "
+    "Latin letters."
 )
 
 NEWS_BRIEF = (
-    "Write ONE Amharic news item in the strict 5-part inverted-pyramid format from the research notes.\n"
-    "Topic: {topic}\n\n[RESEARCH NOTES]\n{facts}\n\n{mode_note}"
+    "Write ONE Amharic news item from the research notes in this exact structure: bold headline -> hook -> detail "
+    "sentences -> sources.\n"
+    "Topic: {topic}\n{brand_note}\n\n[RESEARCH NOTES]\n{facts}\n\n{mode_note}"
+    "SEO: the headline and the hook must naturally contain the main high-search keyword of the story (the key name, "
+    "place, club or topic, in Amharic; add the common English spelling when people search for it that way).\n"
+    "Every sentence must be 10-18 words.\n"
     "Return EXACTLY these blocks and nothing else:\n"
-    "===HEADLINE===\n5-8 words: a bold, factual, scroll-stopping news headline; no quotes, no emoji, no full stop.\n"
-    "===LEAD===\nThe hook: 1-2 short sentences giving the core of the story directly (who, what, when, where).\n"
-    "===CONTEXT===\n3-5 sentences: the detailed body - key figures, data, background and circumstances.\n"
-    "===OFFICIAL===\n2-3 sentences: official statements or direct quotes (attributed to the named official or body), "
-    "reactions of authorities or parties, and the next steps. If the notes contain no official statement or next "
-    "steps, write exactly: " + NO_OFFICIAL_LINE + "\n"
+    "===HEADLINE===\n5-7 words: a bold, factual, scroll-stopping headline; no quotes, no emoji, no full stop.\n"
+    "===LEAD===\nThe hook: 1-2 short sentences with the core of the story (who, what, when, where).\n"
+    "===CONTEXT===\n2-3 clear sentences with the key figures and facts from the notes.\n"
+    "===OFFICIAL===\nONE sentence with an official statement or direct quote, attributed to the named official or "
+    "body. If the notes contain none, write exactly: NONE\n"
     "===SOURCE===\nThe outlet names taken from the notes, separated by ' / ' (Amharic names where established: "
-    "ቢቢሲ አማርኛ, ሮይተርስ, ፋና, ኢቢሲ, ኢዜአ, አል-አይን, ዶቼ ቬለ አማርኛ; AP).\n"
-    "===TAG===\nONE specific story hashtag, e.g. #የነዳጅ_ዋጋ or #Bitcoin (no spaces).\n"
+    "ቢቢሲ አማርኛ, ሮይተርስ, ፋና, ኢቢሲ, ኢዜአ, ዋልታ, አል-አይን, ዶቼ ቬለ አማርኛ; AP).\n"
+    "===TAGS===\n4-6 topic-specific hashtags separated by spaces: a mix of high-search Amharic and English ones, e.g. "
+    "#ኢትዮጵያ #Ethiopia #PremierLeague #አርሰናል #TikTokEthiopia. No spaces inside a tag. Do NOT include "
+    "#ሰከላ_ሚዲያ, #SekelaMedia, #ሰከላ_ኒውስ, #SekelaNews, #ሰከላ_ስፖርት or #SekelaSport.\n"
     "===IMAGE===\nOne English paragraph, 25-45 words: a symbolic, cinematic photojournalism scene that visualizes the "
     "story's theme (setting, subject matter, lighting, lens, mood, high-contrast colour grade). No identifiable real "
     "people, no text, no logos, no flags, no depiction of violence or casualties.\n"
@@ -867,16 +1011,20 @@ UNVERIFIED_NOTE = (
 
 IMAGE_STYLE = ("high-contrast cinematic news photography, dramatic lighting, shallow depth of field, ultra detailed, "
                "sharp focus, dark moody tones, square composition, no text, no letters, no watermark")
-IMAGE_FALLBACK = ("a dramatic dusk skyline of a modern African capital with glowing city lights and a newsroom "
-                  "feel, teal and orange colour grade")
+IMAGE_FALLBACKS = {
+    "media": ("a dramatic dusk skyline of a modern African capital with glowing city lights and a newsroom "
+              "feel, teal and orange colour grade"),
+    "sport": ("an empty floodlit football stadium at night, green pitch, dramatic light beams, dark moody atmosphere, "
+              "orange and teal colour grade"),
+}
 
-PKG_KEYS = ("headline", "lead", "context", "official", "source", "tag", "image")
+PKG_KEYS = ("headline", "lead", "context", "official", "source", "tags", "image")
 
 
 def parse_package(text):
     """Split the writer output into its labelled blocks. Missing blocks stay empty."""
     out = {k: "" for k in PKG_KEYS}
-    parts = re.split(r"===(HEADLINE|LEAD|CONTEXT|OFFICIAL|SOURCE|TAG|IMAGE)===", text or "")
+    parts = re.split(r"===(HEADLINE|LEAD|CONTEXT|OFFICIAL|SOURCE|TAGS|IMAGE)===", text or "")
     for i in range(1, len(parts) - 1, 2):
         out[parts[i].lower()] = parts[i + 1].strip()
     return out
@@ -898,7 +1046,7 @@ def detect_outlets(text):
     """Amharic display names of the recognised top-tier outlets mentioned in text."""
     low = (text or "").lower()
     found = [name for name, rx in OUTLETS if re.search(rx, low)]
-    for generic, specific in (("ቢቢሲ", "ቢቢሲ አማርኛ"), ("ዶቼ ቬለ", "ዶቼ ቬለ አማርኛ")):
+    for generic, specific in (("ቢቢሲ", "ቢቢሲ አማርኛ"), ("ቢቢሲ", "ቢቢሲ ስፖርት"), ("ዶቼ ቬለ", "ዶቼ ቬለ አማርኛ")):
         if generic in found and specific in found:
             found.remove(generic)
     return found
@@ -922,15 +1070,33 @@ def resolve_source(raw_src, facts, sources, unverified=False):
     return None
 
 
-def story_tag(raw, headline):
-    t = (raw or "").strip().split()[0] if (raw or "").strip() else ""
-    t = re.sub(r"[^\wሀ-፿#]", "", t).rstrip("_")
-    if t and not t.startswith("#"):
+def build_tags(brand, raw, headline):
+    """Brand hashtags (fixed per brand) + 4-6 dynamic topic hashtags (Amharic + English) from the writer's ===TAGS===.
+    """
+    brand_tags = list(BRANDS[brand]["tags"])
+    seen = {t.lower() for t in brand_tags} | ALL_BRAND_TAGS
+    dyn = []
+    for tok in re.split(r"[\s,]+", raw or ""):
+        t = re.sub(r"[^\w#]", "", tok).lstrip("#").strip("_")
+        if len(t) < 2:
+            continue
         t = "#" + t
-    if len(t) < 3 or t.lower() in {b.lower() for b in BRAND_TAGS}:
-        words = [re.sub(r"[^\wሀ-፿]", "", w) for w in headline.split()[:2]]
-        t = "#" + "_".join(w for w in words if w) if any(words) else "#ዜና"
-    return t
+        key = t.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        dyn.append(t)
+    if len(dyn) < 4:  # top up so every post carries 4-6 topic tags
+        words = [re.sub(r"[^\w]", "", w) for w in (headline or "").split()[:2]]
+        extras = (["#" + "_".join(w for w in words if w)] if any(words) else [])
+        extras += (["#ኢትዮጵያ", "#Ethiopia"] if brand == "media" else ["#እግር_ኳስ", "#Football"])
+        for t in extras:
+            if len(dyn) >= 4:
+                break
+            if t.lower() not in seen and len(t) > 2:
+                seen.add(t.lower())
+                dyn.append(t)
+    return brand_tags + dyn[:6]
 
 
 def _para(s):
@@ -939,38 +1105,47 @@ def _para(s):
     return re.sub(r"\s+", " ", s).strip()
 
 
-def assemble_news_post(pkg, facts="", sources=None, unverified=False):
-    """Build the post in the exact 5-part Sekela News template. Returns (post, headline) or None if the writer's
-    output is unusable (missing lead / context / source)."""
+def long_sentences(pkg, limit=22):
+    """Sentences of the body that are too long for the crystal-clear style (the prompt asks for 10-18 words)."""
+    txt = " ".join([pkg.get("lead", ""), pkg.get("context", ""), pkg.get("official", "")])
+    return [x for x in re.split(r"[።!?\n]+", txt) if len(x.split()) > limit]
+
+
+def assemble_news_post(pkg, facts="", sources=None, unverified=False, brand="media"):
+    """Build the post: bold headline -> hook -> details -> (official statement) -> sources -> brand footer -> hashtags.
+    Returns (post, headline) or None if the writer's output is unusable (missing lead / context / source)."""
     lead, context = _para(pkg.get("lead")), _para(pkg.get("context"))
-    official = _para(pkg.get("official")) or NO_OFFICIAL_LINE
+    official = _para(pkg.get("official"))
+    if official.strip(" .።").upper() in ("", "NONE", "N/A"):
+        official = ""
     if not lead or not context:
         return None
-    headline = clean_headline(pkg.get("headline"), lead)
+    headline = clean_headline(pkg.get("headline"), lead, max_words=7)
     if not headline:
         return None
     src = resolve_source(pkg.get("source"), facts, sources, unverified)
     if not src:
         return None
-    tags = " ".join(BRAND_TAGS + [story_tag(pkg.get("tag"), headline)])
-    post = (f"🔴 {headline}\n\n{lead}\n\n{context}\n\n{official}\n\n"
-            f"📌 ምንጭ፡ {src}\n\n{FOOTER}\n\n{tags}")
-    return post, headline
+    tags = " ".join(build_tags(brand, pkg.get("tags"), headline))
+    parts = [f"🔴 {headline}", lead, context]
+    if official:
+        parts.append(official)
+    parts += [f"📌 ምንጭ፡ {src}", brand_footer(brand), tags]
+    return "\n\n".join(parts), headline
 
 
 # --- story discovery (used by /news and by the breaking-news hunter) -------------------------------------------
 STORY_PROMPT = (
     "Search the web NOW and find the most important and timely news from the last {hours} hours about: {focus}\n"
-    "Use verified reporting from: BBC Amharic, Fana BC, EBC, ENA, VOA Amharic, DW Amharic, Al Ain Amharic, "
-    "Addis Standard, Reuters, AP, official Ethiopian government statements, and verified news accounts on X (Twitter) "
-    "such as @PMEthiopia, @FanaBC, @ENA_Amharic, @BBCAmharic, @addisstandard, @VOAAmharic, @dwamharic. "
-    "Cover diplomacy and the Prime Minister's visits/meetings, ministry updates, economy and prices, Addis Ababa "
-    "developments, Horn of Africa, and major global/tech news.\n"
+    "Use verified reporting and ROTATE across many outlets - never take all stories from one outlet: Fana BC, EBC, "
+    "ENA, Walta, Addis Standard, Borkena, DW Amharic, VOA Amharic, Al Ain Amharic, BBC Amharic, Reuters, AP, official "
+    "Ethiopian government statements, Sky Sports, BBC Sport, Fabrizio Romano and other verified news accounts on X "
+    "(Twitter). Each story must be about a DIFFERENT event.\n"
     "{feeds}"
     "Return {n} top stories, ONE per line, in EXACTLY this format (English):\n"
     "STORY|<importance 1-10>|<headline, max 14 words>|<outlet names, comma separated>|<one sentence with the key fact>\n"
-    "Importance: 8-10 = major national/diplomatic/breaking news, 5-7 = important daily news. "
-    "Always return the top available verified news stories - there is almost always important daily news."
+    "Importance: 8-10 = major national/diplomatic/breaking news or a decisive goal/transfer, 5-7 = important daily "
+    "news. Always return the top available verified stories - there is almost always important daily news."
 )
 _STORY_RE = re.compile(r"^\s*STORY\s*\|\s*(\d+)\s*\|(.*?)\|(.*?)\|(.*)$")
 
@@ -1021,9 +1196,15 @@ def amharic_story_lines(stories):
 NUM_EMOJI = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣"]
 
 
-def run_news(chat_id, label, topic):
+def detect_brand(text):
+    """Sport topics go to ሰከላ ስፖርት, everything else to ሰከላ ሚዲያ (can be switched with one tap before publishing)."""
+    return "sport" if has_any(text, SPORT_WORDS) else "media"
+
+
+def run_news(chat_id, label, topic, brand=None):
     """/news: a clean numbered list of verified top stories; each has a button that builds the full card + post."""
     start = time.time()
+    brand = brand or detect_brand(topic)
     try:
         with Typing(chat_id):
             stories, sources = scan_stories(topic, hours=24, n=4)
@@ -1031,7 +1212,7 @@ def run_news(chat_id, label, topic):
         nid = uuid.uuid4().hex[:10]
         with state_lock:
             news_cache[nid] = {"label": label, "topic": topic, "stories": stories, "sources": sources,
-                               "ts": time.time()}
+                               "brand": brand, "ts": time.time()}
         prune(news_cache)
         kb = types.InlineKeyboardMarkup()
         if not stories:
@@ -1056,10 +1237,10 @@ def run_news(chat_id, label, topic):
 # ----------------------------------------------------------------------------
 # Sekela News card (Pollinations background + Pillow overlay)
 # ----------------------------------------------------------------------------
-def build_image_prompt(scene):
+def build_image_prompt(scene, brand="media"):
     scene = re.sub(r"\s+", " ", (scene or "")).strip()
     if not scene or re.search(r"[ሀ-፿]", scene):  # empty or accidentally Amharic -> safe default
-        scene = IMAGE_FALLBACK
+        scene = IMAGE_FALLBACKS.get(brand, IMAGE_FALLBACKS["media"])
     return (scene[:420].rstrip(" ,.") + ", " + IMAGE_STYLE)[:640]
 
 
@@ -1081,6 +1262,68 @@ def fetch_image(prompt, attempts=3):
         except Exception as e:
             log.warning("Pollinations attempt %d failed: %s", i + 1, e)
         time.sleep(3)
+    return None
+
+
+_PHOTO_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; SekelaNewsBot/1.0; +https://t.me/sekelamediaET)"}
+_META_IMG = [
+    re.compile(r'<meta[^>]+(?:property|name)\s*=\s*["\'](?:og:image(?::secure_url|:url)?|twitter:image(?::src)?)["\']'
+               r'[^>]*?content\s*=\s*["\']([^"\']+)["\']', re.I),
+    re.compile(r'<meta[^>]+content\s*=\s*["\']([^"\']+)["\'][^>]*?(?:property|name)\s*=\s*["\']'
+               r'(?:og:image|twitter:image)["\']', re.I),
+]
+_BAD_IMG = re.compile(r"logo|favicon|placeholder|sprite|avatar|default[-_]?(?:image|thumb|share)|1x1", re.I)
+
+
+def download_photo(url, referer=None):
+    """Download one photo; accept only real, reasonably large images (not logos / icons). Returns bytes or None."""
+    try:
+        headers = dict(_PHOTO_HEADERS)
+        if referer:
+            headers["Referer"] = referer
+        r = requests.get(url, headers=headers, timeout=20)
+        if r.status_code != 200 or not r.headers.get("Content-Type", "").startswith("image/") or len(r.content) < 25000:
+            return None
+        if PIL_OK:
+            w, h = Image.open(io.BytesIO(r.content)).size
+            if w < 500 or h < 350:
+                return None
+        return r.content
+    except Exception as e:
+        log.info("photo download failed: %s", short_reason(e, 80))
+        return None
+
+
+def find_real_photo(urls, direct_image=None, max_pages=4):
+    """REAL PHOTO FIRST: the RSS image if given, otherwise og:image / twitter:image of the source articles
+    (grounding redirects are followed to the publisher page). Returns bytes or None -> caller falls back to AI."""
+    if direct_image:
+        b = download_photo(direct_image)
+        if b:
+            return b
+    seen, pages = set(), 0
+    for u in urls or []:
+        if not u or u in seen or pages >= max_pages:
+            continue
+        seen.add(u)
+        pages += 1
+        try:
+            r = requests.get(u, headers=_PHOTO_HEADERS, timeout=15, allow_redirects=True)
+            if r.status_code != 200 or "html" not in r.headers.get("Content-Type", ""):
+                continue
+            html = r.text[:250000]
+            for rx in _META_IMG:
+                m = rx.search(html)
+                if not m:
+                    continue
+                img = urljoin(r.url, html_lib.unescape(m.group(1)).strip())
+                if _BAD_IMG.search(img):
+                    continue
+                b = download_photo(img, referer=r.url)
+                if b:
+                    return b
+        except Exception as e:
+            log.info("article page fetch failed: %s", short_reason(e, 80))
     return None
 
 
@@ -1204,7 +1447,7 @@ def _wrap(text, f_eth, f_lat, max_w):
     return lines
 
 
-def compose_card(bg_bytes, headline, size=1080):
+def compose_card(bg_bytes, headline, badge=None, ai=True, size=1080):
     """1080x1080 Sekela News poster: cropped background, dark bottom gradient, bold headline, brand badge.
     Returns JPEG bytes, or None when Pillow / an Ethiopic font is unavailable or anything fails."""
     if not PIL_OK or not bg_bytes or not headline:
@@ -1247,12 +1490,12 @@ def compose_card(bg_bytes, headline, size=1080):
 
         # signature badge  "ሰከላ | Sekela"
         b_eth, b_lat = ImageFont.truetype(eth_path, 36), _latin_font(34)
-        badge_text = "ሰከላ | Sekela"
+        badge_text = badge or BRANDS["media"]["badge"]
         bw = int(_measure(badge_text, b_eth, b_lat)) + 56
         draw.rounded_rectangle([margin, badge_y, margin + bw, badge_y + badge_h], radius=32, fill=BRAND_RED + (255,))
         _draw_mixed(draw, margin + 28, badge_y + 44, badge_text, b_eth, b_lat, (255, 255, 255, 255))
 
-        if AI_LABEL:
+        if AI_LABEL and ai:  # the tag is only for generated backgrounds, never for real photos
             t_font = _latin_font(22)
             label = "AI illustration"
             lw = int(t_font.getlength(label)) + 28
@@ -1282,32 +1525,32 @@ class FBError(Exception):
         self.code = code
 
 
-def fb_enabled():
-    return bool(FB_PAGE_ID and FB_PAGE_ACCESS_TOKEN)
-
-
 def _fb_clean(s):
     s = str(s)
-    return s.replace(FB_PAGE_ACCESS_TOKEN, "***") if FB_PAGE_ACCESS_TOKEN else s
+    for b in BRANDS.values():
+        if b["fb_token"]:
+            s = s.replace(b["fb_token"], "***")
+    return s
 
 
-def _fb_request(method, path, params=None, data=None, files=None, timeout=90):
-    """Single choke point for Graph API calls. Hard-coded policy: only POST to /photos and /feed, and refuse any
-    path that touches comments (the bot never auto-replies or writes to comments)."""
+def _fb_request(method, path, params=None, data=None, files=None, timeout=90, brand="media"):
+    """Single choke point for Graph API calls. Hard-coded policy: only POST to /photos, /feed and /videos, and refuse
+    any path that touches comments (the bot never auto-replies or writes to comments). Uses the brand's own token."""
     p = path.strip("/").lower()
     if "comment" in p:
         raise FBError("blocked by no-commenting policy")
-    if method == "POST" and p.split("/")[-1] not in ("photos", "feed"):
+    if method == "POST" and p.split("/")[-1] not in ("photos", "feed", "videos"):
         raise FBError(f"blocked: POST not allowed on {p}")
+    token = BRANDS[brand]["fb_token"]
     url = f"{FB_GRAPH}/{path.strip('/')}"
     try:
         if method == "POST":
             body = dict(data or {})
-            body["access_token"] = FB_PAGE_ACCESS_TOKEN
+            body["access_token"] = token
             r = requests.post(url, data=body, files=files, timeout=timeout)
         else:
             q = dict(params or {})
-            q["access_token"] = FB_PAGE_ACCESS_TOKEN
+            q["access_token"] = token
             r = requests.get(url, params=q, timeout=timeout)
     except requests.RequestException as e:
         raise FBError(_fb_clean(f"network error: {e}"))
@@ -1321,13 +1564,14 @@ def _fb_request(method, path, params=None, data=None, files=None, timeout=90):
     return js
 
 
-def fb_publish(post, image_bytes=None):
-    """Photo with caption when an image exists, otherwise a plain feed post. Returns the Graph object id."""
+def fb_publish(post, image_bytes=None, brand="media"):
+    """Photo with caption when an image exists, otherwise a plain feed post, on the brand's Facebook Page."""
+    pid = BRANDS[brand]["fb_id"]
     if image_bytes:
-        js = _fb_request("POST", f"{FB_PAGE_ID}/photos", data={"caption": post, "published": "true"},
-                         files={"source": ("sekela-card.jpg", image_bytes, "image/jpeg")}, timeout=120)
+        js = _fb_request("POST", f"{pid}/photos", data={"caption": post, "published": "true"},
+                         files={"source": ("sekela-card.jpg", image_bytes, "image/jpeg")}, timeout=120, brand=brand)
     else:
-        js = _fb_request("POST", f"{FB_PAGE_ID}/feed", data={"message": post})
+        js = _fb_request("POST", f"{pid}/feed", data={"message": post}, brand=brand)
     return js.get("post_id") or js.get("id")
 
 
@@ -1366,20 +1610,21 @@ def _insight_value(js, mode):
     return int(vals[-1] if mode == "last" else sum(vals))
 
 
-def fb_analytics_text(metrics=None):
+def fb_analytics_text(brand="media", metrics=None):
     """Page name/id via `me?fields=name,id`, 7-day insights (each metric optional) and the latest post counters.
     If a dict is passed as `metrics` it is filled with the numbers (reach, views, engagement, new_follows, followers)
     plus `_ok` / `_err` so the dashboard image can use them."""
     metrics = metrics if metrics is not None else {}
-    if not fb_enabled():
+    pid, page_name = BRANDS[brand]["fb_id"], BRANDS[brand]["fb_name"]
+    if not fb_enabled(brand):
         metrics.update(_ok=False, _err="no token")
         return "⚪ ፌስቡክ አልተዋቀረም — በ Render ላይ FB_PAGE_ACCESS_TOKEN ጨምር።"
-    lines = [f"📊 {FB_PAGE_NAME} — Facebook Analytics", "━━━━━━━━━━━━"]
+    lines = [f"📊 {page_name} — Facebook Analytics", "━━━━━━━━━━━━"]
     try:
-        me = _fb_request("GET", "me", params={"fields": "name,id"}, timeout=40)
+        me = _fb_request("GET", "me", params={"fields": "name,id"}, timeout=40, brand=brand)
         metrics["_ok"] = True
-        lines.append(f"📄 ገጽ: {me.get('name', FB_PAGE_NAME)} (id {me.get('id', FB_PAGE_ID)})")
-        if me.get("id") and str(me["id"]) != str(FB_PAGE_ID):
+        lines.append(f"📄 ገጽ: {me.get('name', page_name)} (id {me.get('id', pid)})")
+        if me.get("id") and str(me["id"]) != str(pid):
             lines.append("⚠️ ቶክኑ የሌላ ገጽ ነው — FB_PAGE_ID እና ቶክኑ አይዛመዱም።")
     except FBError as e:
         metrics.update(_ok=False, _err=short_reason(e, 90))
@@ -1389,9 +1634,9 @@ def fb_analytics_text(metrics=None):
     got = []
     for metric, label, mode, key in FB_INSIGHT_CANDIDATES:
         try:
-            js = _fb_request("GET", f"{FB_PAGE_ID}/insights",
+            js = _fb_request("GET", f"{pid}/insights",
                              params={"metric": metric, "period": "day", "since": now - 7 * 86400, "until": now},
-                             timeout=40)
+                             timeout=40, brand=brand)
             val = _insight_value(js, mode)
             if val is not None:
                 got.append(f"{label}: {val:,}")
@@ -1407,8 +1652,8 @@ def fb_analytics_text(metrics=None):
     posts = None
     for fields in (rich, "message,created_time,permalink_url"):
         try:
-            posts = _fb_request("GET", f"{FB_PAGE_ID}/posts", params={"fields": fields, "limit": 5},
-                                timeout=40).get("data", [])
+            posts = _fb_request("GET", f"{pid}/posts", params={"fields": fields, "limit": 5},
+                                timeout=40, brand=brand).get("data", [])
             break
         except FBError as e:
             log.info("posts query (%s) failed: %s", fields[:20], e)
@@ -1428,61 +1673,88 @@ def fb_analytics_text(metrics=None):
     return "\n".join(lines)
 
 
+
+
 # ----------------------------------------------------------------------------
 # Post package: Sekela News card + copy -> preview -> approval -> Telegram + Facebook
 # ----------------------------------------------------------------------------
-def build_draft(topic, facts=None, sources=None, allow_fallback=True):
-    """Research -> Amharic news copy (template) -> AI background -> Sekela card. No Telegram I/O.
-    Returns a draft dict or None. With allow_fallback=False an unverifiable story is dropped;
-    with allow_fallback=True an editorial synthesis is drafted but flagged `unverified` when no facts exist."""
+def build_draft(topic, facts=None, sources=None, allow_fallback=True, brand=None, photo_urls=None, story_image=None):
+    """Research -> clear Amharic news copy (+SEO tags) -> REAL photo (else AI background) -> brand card. No Telegram I/O.
+    Returns a draft dict or None. With allow_fallback=False an unverifiable story is dropped; with True an editorial
+    synthesis is drafted but flagged `unverified` when no facts exist."""
+    brand = brand or detect_brand(topic)
     sources = list(sources or [])
     if not facts:
         facts, sources = research_for(topic)
     unverified = not facts
     if unverified and not allow_fallback:
         return None
-    built, pkg = None, {}
-    for attempt in range(2):
+    best, extra = None, ""
+    for attempt in range(3):
         brief = (NEWS_BRIEF.replace("{topic}", topic)
+                 .replace("{brand_note}", BRANDS[brand]["brief_note"])
                  .replace("{facts}", facts or "(none)")
-                 .replace("{mode_note}", UNVERIFIED_NOTE if unverified else ""))
-        text, _ = llm_write(brief, system=NEWSROOM_SYSTEM, max_tokens=2600, temperature=0.6 if attempt == 0 else 0.4)
+                 .replace("{mode_note}", UNVERIFIED_NOTE if unverified else "")) + extra
+        text, _ = llm_write(brief, system=NEWSROOM_SYSTEM, max_tokens=2600, temperature=0.5 if attempt == 0 else 0.3)
         if not text:
             continue
         pkg = parse_package(text)
-        built = assemble_news_post(pkg, facts or "", sources, unverified)
-        if built:
+        built = assemble_news_post(pkg, facts or "", sources, unverified, brand)
+        if not built:
+            continue
+        best = (pkg, built)
+        if not long_sentences(pkg):
             break
-    if not built:
+        extra = ("\n\nREWRITE: some sentences were longer than 18 words. Split every long sentence so that each "
+                 "sentence has 10-18 words. Keep all facts unchanged.")
+    if not best:
         return None
-    post, headline = built
-    bg = fetch_image(build_image_prompt(pkg.get("image")))
-    card = compose_card(bg, headline) if bg else None
+    pkg, (post, headline) = best
+    real = find_real_photo(list(photo_urls or []) + [u for _, u in sources[:4]], story_image)
+    bg = real or fetch_image(build_image_prompt(pkg.get("image"), brand))
+    card = compose_card(bg, headline, BRANDS[brand]["badge"], ai=not real) if bg else None
     bot_stats["drafts"] += 1
-    return {"post": post, "headline": headline, "image": card or bg, "card": bool(card),
-            "sources": sources, "unverified": unverified}
+    mark_seen(headline + " " + _para(pkg.get("lead")))
+    return {"post": post, "headline": headline, "image": card or bg, "card": bool(card), "sources": sources,
+            "unverified": unverified, "brand": brand, "pkg": pkg, "facts": facts or "", "bg": bg, "real": bool(real)}
+
+
+def draft_keyboard(did, brand):
+    kb = types.InlineKeyboardMarkup()
+    kb.add(
+        types.InlineKeyboardButton("✅ አጽድቅና ፖስት አድርግ", callback_data=f"ok:{did}"),
+        types.InlineKeyboardButton("❌ ሰርዝ", callback_data=f"no:{did}"),
+    )
+    kb.add(
+        types.InlineKeyboardButton(f"🎯 {brand_label(brand)}", callback_data="noop"),
+        types.InlineKeyboardButton(f"🔄 ወደ {brand_label(other_brand(brand))} ቀይር", callback_data=f"sw:{did}"),
+    )
+    return kb
 
 
 def present_draft(chat_id, label, d, header, start=None):
     """Send the card preview + details with the approval buttons, and register the draft for publishing."""
+    brand = d["brand"]
     post, headline, image = d["post"], d["headline"], d.get("image")
     caption_fits = len(post) <= CAPTION_LIMIT
-    file_id = None
+    file_id, photo_msg = None, None
     if image:
         try:
             sent = bot.send_photo(chat_id, _as_photo(image), caption=post if caption_fits else f"🔴 {headline}")
-            file_id = sent.photo[-1].file_id
+            file_id, photo_msg = sent.photo[-1].file_id, sent.message_id
         except Exception as e:
             log.error("sending preview photo failed: %s", e)
 
     did = uuid.uuid4().hex[:10]
     with state_lock:
-        drafts[did] = {"post": post, "file_id": file_id, "image": image, "headline": headline,
-                       "unverified": d.get("unverified", False), "confirmed": False,
-                       "tg": False, "fb": False, "busy": False, "ts": time.time()}
-    prune(drafts)
+        drafts[did] = {"post": post, "file_id": file_id, "image": image, "headline": headline, "card": d.get("card"),
+                       "unverified": d.get("unverified", False), "confirmed": False, "brand": brand,
+                       "pkg": d.get("pkg") or {}, "facts": d.get("facts", ""), "sources": d.get("sources") or [],
+                       "bg": d.get("bg"), "real": d.get("real", False), "photo_msg": photo_msg, "details_msg": None,
+                       "pid": None, "tg": False, "fb": False, "busy": False, "ts": time.time()}
+    prune(drafts, 12)
 
-    details = [header]
+    details = [header + f"\n🎯 መድረሻ: {brand_label(brand)}"]
     if not (file_id and caption_fits):
         details.append("━━━━━━━━━━━━\n" + post)
     if d.get("unverified"):
@@ -1490,36 +1762,64 @@ def present_draft(chat_id, label, d, header, start=None):
                        "ከመለጠፍህ በፊት አረጋግጥ (ሲያጸድቅ ሁለተኛ ማረጋገጫ ይጠየቃል)።")
     if not image:
         details.append("⚠️ ምስሉ በዚህ ጊዜ አልተሳካም — ያለ ምስል መለጠፍ ወይም ሰርዘህ እንደገና መጠየቅ ትችላለህ።")
+    elif d.get("real"):
+        details.append("📷 ምስሉ ከምንጭ ዜናው የተወሰደ እውነተኛ ፎቶ ነው።")
+        if not d.get("card"):
+            details.append("⚠️ ርዕሱን በፎቶው ላይ ማተም አልተቻለም (Ethiopic font የለም) — ርዕሱ በፖስቱ ጽሑፍ ውስጥ አለ።")
     elif not d.get("card"):
         details.append("⚠️ ርዕሱን በምስሉ ላይ ማተም አልተቻለም (Ethiopic font የለም) — ርዕሱ በፖስቱ ጽሑፍ ውስጥ አለ። "
                        "NotoSansEthiopic-Bold.ttf ን ከ agent.py ጎን ኮሚት አድርግ።")
     src = format_sources(d.get("sources"), limit=4)
     if src:
         details.append(src)
-    targets = [str(TARGET_CHANNEL)] + ([FB_PAGE_NAME + " (Facebook)"] if fb_enabled() else [])
+    targets = [str(BRANDS[brand]["tg"])] + ([BRANDS[brand]["fb_name"] + " (Facebook)"] if fb_enabled(brand) else [])
     details.append("━━━━━━━━━━━━\n🔒 ✅ ከነካህ ብቻ ይለጠፋል → " + " + ".join(targets) +
                    "\nበፌስቡክ ኮመንቶች ላይ ቦቱ ፈጽሞ አይመልስም።")
     if start:
         details.append(took(start))
-    kb = types.InlineKeyboardMarkup()
-    kb.add(
-        types.InlineKeyboardButton("✅ አጽድቅና ፖስት አድርግ", callback_data=f"ok:{did}"),
-        types.InlineKeyboardButton("❌ ሰርዝ", callback_data=f"no:{did}"),
-    )
-    deliver(chat_id, None, "\n\n".join(details), kb)
+    mid = deliver(chat_id, None, "\n\n".join(details), draft_keyboard(did, brand))
+    with state_lock:
+        if did in drafts:
+            drafts[did]["details_msg"] = mid
     return did
 
 
-def run_post(chat_id, label, topic, context_text=None, context_sources=None):
+def rebrand_draft(chat_id, msg_id, did):
+    """One-tap switch Media <-> Sport: re-badge the card, swap footer links + brand hashtags, show a fresh preview."""
+    with state_lock:
+        d = drafts.get(did)
+        if d is None or d["busy"]:
+            d = None
+        else:
+            drafts.pop(did, None)
+    if d is None:
+        bot.send_message(chat_id, "⚠️ ይህ ረቂቅ ጊዜው አልፏል ወይም አሁን እየተሰራ ነው።")
+        return
+    new = other_brand(d["brand"])
+    built = assemble_news_post(d["pkg"], d["facts"], d["sources"], d["unverified"], new)
+    if not built:
+        bot.send_message(chat_id, "ሄኖክ፣ ረቂቁን ወደ ሌላ ብራንድ መቀየር አልተቻለም 😕 እንደገና ጠይቀኝ።")
+        return
+    post, headline = built
+    card = compose_card(d["bg"], headline, BRANDS[new]["badge"], ai=not d.get("real")) if d.get("bg") else None
+    nd = {"post": post, "headline": headline, "image": card or d.get("bg"), "card": bool(card),
+          "sources": d["sources"], "unverified": d["unverified"], "brand": new, "pkg": d["pkg"],
+          "facts": d["facts"], "bg": d.get("bg"), "real": d.get("real", False)}
+    for mid in {d.get("photo_msg"), d.get("details_msg"), msg_id}:
+        drop_message(chat_id, mid)
+    present_draft(chat_id, "", nd, f"🔄 ወደ {brand_label(new)} ተቀይሯል")
+
+
+def run_post(chat_id, label, topic, context_text=None, context_sources=None, brand=None):
     start = time.time()
     ack_id = send_progress(
-        chat_id, "⏳ ሄኖክ፣ ጥናቱን አድርጌ የሰከላ ኒውስ ፖስቱን እና AI ምስሉን እያዘጋጀሁ ነው (ከ20-40 ሰከንድ ይወስዳል)...")
+        chat_id, "⏳ ሄኖክ፣ ጥናቱን አድርጌ ፖስቱን እና ምስሉን እያዘጋጀሁ ነው (ከ20-50 ሰከንድ ይወስዳል)...")
     try:
-        d = build_draft(topic, facts=context_text, sources=context_sources, allow_fallback=True)
+        d = build_draft(topic, facts=context_text, sources=context_sources, allow_fallback=True, brand=brand)
         if not d:
             deliver(chat_id, ack_id, "ሄኖክ፣ ዜናውን አሁን ማዘጋጀት አልቻልኩም 😕 ጥቂት ቆይተህ ደግመህ ሞክር።")
             return
-        present_draft(chat_id, label, d, f"📝 የሰከላ ኒውስ ረቂቅ ዝግጁ ነው — {label}", start)
+        present_draft(chat_id, label, d, f"📝 ረቂቅ ዝግጁ ነው — {label}", start)
         drop_message(chat_id, ack_id)
     except Exception as e:
         log.error("post failed: %s", e)
@@ -1527,33 +1827,50 @@ def run_post(chat_id, label, topic, context_text=None, context_sources=None):
 
 
 def publish_telegram(d):
-    """Photo + caption (or text) to the target channel."""
+    """Photo + caption (or text) to the draft's brand channel. Returns (message_id, kind, channel) of the post
+    message that Pin / Edit will act on."""
+    chan = BRANDS[d["brand"]]["tg"]
     post = d["post"]
     photo = d.get("file_id") or (_as_photo(d["image"]) if d.get("image") else None)
     if photo:
         if len(post) <= CAPTION_LIMIT:
-            bot.send_photo(TARGET_CHANNEL, photo, caption=post)
-        else:
-            bot.send_photo(TARGET_CHANNEL, photo)
-            for chunk in split_text(post, 4000):
-                bot.send_message(TARGET_CHANNEL, chunk)
-    else:
+            m = bot.send_photo(chan, photo, caption=post)
+            return m.message_id, "photo", chan
+        first = bot.send_photo(chan, photo)
+        text_id = None
         for chunk in split_text(post, 4000):
-            bot.send_message(TARGET_CHANNEL, chunk)
+            m = bot.send_message(chan, chunk)
+            text_id = text_id or m.message_id
+        return text_id or first.message_id, "text", chan
+    msg_id = None
+    for chunk in split_text(post, 4000):
+        m = bot.send_message(chan, chunk)
+        msg_id = msg_id or m.message_id
+    return msg_id, "text", chan
 
 
-def retry_keyboard(did):
+def published_keyboard(pid):
+    kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton("📌 Pin Post", callback_data=f"pin:{pid}"),
+           types.InlineKeyboardButton("✏️ Edit Post", callback_data=f"ed:{pid}"))
+    return kb
+
+
+def retry_keyboard(did, pid=None):
     kb = types.InlineKeyboardMarkup()
     kb.add(
         types.InlineKeyboardButton("🔁 ያልተሳካውን እንደገና ሞክር", callback_data=f"ok:{did}"),
         types.InlineKeyboardButton("❌ ሰርዝ", callback_data=f"no:{did}"),
     )
+    if pid:
+        kb.add(types.InlineKeyboardButton("📌 Pin Post", callback_data=f"pin:{pid}"),
+               types.InlineKeyboardButton("✏️ Edit Post", callback_data=f"ed:{pid}"))
     return kb
 
 
 def approve_and_publish(chat_id, msg_id, did):
-    """Approval gate: Telegram first, then Facebook. Each target is tracked separately so a retry never
-    double-posts to a target that already succeeded."""
+    """Approval gate: the brand's Telegram channel first, then its Facebook Page. Each target is tracked separately so
+    a retry never double-posts to a target that already succeeded."""
     with state_lock:
         d = drafts.get(did)
         if d is None:
@@ -1567,20 +1884,28 @@ def approve_and_publish(chat_id, msg_id, did):
         bot.edit_message_text("⚠️ ይህ ረቂቅ ጊዜው አልፏል ወይም ቀድሞ ተስተናግዷል።", chat_id, msg_id)
         return
 
+    brand = d["brand"]
+    b = BRANDS[brand]
     tg_err = fb_err = None
-    fb_on = fb_enabled()
+    fb_on = fb_enabled(brand)
     try:
         if not d["tg"]:
             try:
-                publish_telegram(d)
+                mid, kind, chan = publish_telegram(d)
                 d["tg"] = True
                 bot_stats["tg_posts"] += 1
+                pid = uuid.uuid4().hex[:10]
+                with state_lock:
+                    published[pid] = {"chan": chan, "msg_id": mid, "kind": kind, "post": d["post"], "brand": brand,
+                                      "ts": time.time()}
+                d["pid"] = pid
+                prune(published, 30)
             except Exception as e:
                 log.error("telegram publish failed: %s", e)
                 tg_err = short_reason(e, 200)
         if fb_on and not d["fb"]:
             try:
-                fb_publish(d["post"], d.get("image"))
+                fb_publish(d["post"], d.get("image"), brand)
                 d["fb"] = True
                 bot_stats["fb_posts"] += 1
             except FBError as e:
@@ -1592,74 +1917,206 @@ def approve_and_publish(chat_id, msg_id, did):
     finally:
         d["busy"] = False
 
-    tg_line = f"• Telegram: {TARGET_CHANNEL} " + ("✅" if d["tg"] else f"❌ {tg_err or ''}".rstrip())
+    tg_line = f"• Telegram: {b['tg']} " + ("✅" if d["tg"] else f"❌ {tg_err or ''}".rstrip())
     if not fb_on:
-        fb_line = f"• Facebook: {FB_PAGE_NAME} ⚪ አልተዋቀረም (FB_PAGE_ACCESS_TOKEN)"
+        fb_line = f"• Facebook: {b['fb_name']} ⚪ አልተዋቀረም (token)"
     else:
-        fb_line = f"• Facebook: {FB_PAGE_NAME} " + ("✅" if d["fb"] else f"❌ {fb_err or ''}".rstrip())
+        fb_line = f"• Facebook: {b['fb_name']} " + ("✅" if d["fb"] else f"❌ {fb_err or ''}".rstrip())
 
     if d["tg"] and (d["fb"] or not fb_on):
         with state_lock:
             drafts.pop(did, None)
-        bot.edit_message_text(f"✅ ጸድቋል እና ተለጥፏል! 🚀\n{tg_line}\n{fb_line}", chat_id, msg_id)
+        bot.edit_message_text(f"✅ ጸድቋል እና ተለጥፏል! 🚀 ({brand_label(brand)})\n{tg_line}\n{fb_line}", chat_id, msg_id,
+                              reply_markup=published_keyboard(d["pid"]) if d.get("pid") else None)
     else:
         extra = ""
         if tg_err and "chat not found" in tg_err.lower():
-            extra = ("\n\n💡 ቻናሉ public መሆኑን፣ TARGET_CHANNEL በትክክል መጻፉን እና ቦቱ አድሚን ('Post Messages') "
+            extra = ("\n\n💡 ቻናሉ public መሆኑን፣ ቻናሉ በትክክል መጻፉን እና ቦቱ አድሚን ('Post Messages') "
                      "መሆኑን አረጋግጥ — /ai_status ያሳይሃል።")
-        bot.edit_message_text(f"⚠️ በከፊል ተሳክቷል\n{tg_line}\n{fb_line}{extra}\n\nየተሳካው እንደገና አይለጠፍም።",
-                              chat_id, msg_id, reply_markup=retry_keyboard(did))
+        bot.edit_message_text(f"⚠️ በከፊል ተሳክቷል ({brand_label(brand)})\n{tg_line}\n{fb_line}{extra}\n\n"
+                              "የተሳካው እንደገና አይለጠፍም።", chat_id, msg_id, reply_markup=retry_keyboard(did, d.get("pid")))
+
+
+def pin_published(chat_id, pid):
+    with state_lock:
+        p = published.get(pid)
+    if not p:
+        bot.send_message(chat_id, "ሄኖክ፣ ይህ ፖስት ከማህደረ ትውስታ ተሰርዟል (ቦቱ እንደገና ተነስቷል) — በቻናሉ ላይ በእጅ Pin አድርግ 🙏")
+        return
+    try:
+        bot.pin_chat_message(p["chan"], p["msg_id"], disable_notification=True)
+        bot.send_message(chat_id, f"📌 ፖስቱ በ {p['chan']} ላይ ተሰክቷል (Pin ተደርጓል)።")
+    except Exception as e:
+        bot.send_message(chat_id, f"❌ Pin ማድረግ አልተሳካም: {short_reason(e, 140)}\n"
+                                  "💡 ቦቱ በቻናሉ ላይ 'Pin Messages' ፈቃድ ሊኖረው ይገባል።")
+
+
+def edit_published(chat_id, pid, new_text):
+    """Replace the text/caption of a post the owner already approved on the Telegram channel (Facebook posts are never
+    edited by the bot)."""
+    with state_lock:
+        p = published.get(pid)
+    if not p:
+        bot.send_message(chat_id, "ሄኖክ፣ ይህ ፖስት ከማህደረ ትውስታ ተሰርዟል — በቻናሉ ላይ በእጅ አርም 🙏")
+        return
+    if p["kind"] == "photo" and len(new_text) > CAPTION_LIMIT:
+        with state_lock:
+            awaiting_topic[OWNER_ID] = f"edit:{pid}"
+        bot.send_message(chat_id, f"ሄኖክ፣ ጽሑፉ {len(new_text)} ፊደል ነው — ለፎቶ ፖስት ከ{CAPTION_LIMIT} መብለጥ አይችልም። "
+                                  "አሳጥረህ እንደገና ላክልኝ።")
+        return
+    try:
+        if p["kind"] == "photo":
+            bot.edit_message_caption(new_text, p["chan"], p["msg_id"])
+        else:
+            bot.edit_message_text(new_text, p["chan"], p["msg_id"], disable_web_page_preview=True)
+        p["post"] = new_text
+        bot.send_message(chat_id, f"✅ ፖስቱ በ {p['chan']} ላይ ተስተካክሏል (የ Facebook ፖስት አልተነካም)።",
+                         reply_markup=published_keyboard(pid))
+    except Exception as e:
+        bot.send_message(chat_id, f"❌ ማስተካከል አልተሳካም: {short_reason(e, 160)}")
 
 
 # ----------------------------------------------------------------------------
 # Proactive breaking-news hunter (background thread -> push to Henok's private DM)
 # ----------------------------------------------------------------------------
-HUNT_HEADER = "🔔 ሄኖክ፣ አዲስ ሰበር ዜና አዘጋጅቼልሃለሁ! ይሄንን ለሰከላ ኒውስ ፖስት እናድርገው?"
-HUNT_FOCUS = ("Ethiopia (top priority: government and politics, Prime Minister Abiy Ahmed's activities and diplomatic "
+HUNT_HEADERS = {
+    "media": "🔔 ሄኖክ፣ አዲስ ሰበር ዜና አዘጋጅቼልሃለሁ! ለሰከላ ሚዲያ ፖስት እናድርገው?",
+    "sport": "⚽ ሄኖክ፣ አዲስ የስፖርት ዜና አዘጋጅቼልሃለሁ! ለሰከላ ስፖርት ፖስት እናድርገው?",
+}
+HUNT_FOCUS = {
+    "media": ("Ethiopia (top priority: government and politics, Prime Minister Abiy Ahmed's activities and diplomatic "
               "visits, economy and prices, diplomacy, security developments as reported by official or verified "
-              "outlets, infrastructure, major events in Addis Ababa) and major international developments that matter "
-              "to Ethiopians (Horn of Africa, African Union, global economy, AI/tech, crypto markets)")
+              "outlets, infrastructure, events and culture in Addis Ababa, Ethiopian social-media and TikTok trends "
+              "such as the TikTok Creative Awards, tech and AI) and major international developments that matter to "
+              "Ethiopians (Horn of Africa, African Union, global economy, crypto markets)"),
+    "sport": ("Football and sport news and LIVE results: Ethiopian Premier League, English Premier League, Champions "
+              "League, European leagues, transfer news (ዝውውሮች, e.g. confirmed deals by Fabrizio Romano), Olympics. "
+              "Include goals from matches played in the last hours: scorer, minute, scoreline and teams "
+              "(e.g. Arsenal vs Man Utd) - give a decisive goal in a big match importance 9"),
+}
 
-hunt_lock = threading.Lock()
-hunt_seen = []                               # [(token_set, timestamp)] stories already offered (last 24h)
-hunt_daily = {"date": "", "count": 0}
+hunt_locks = {"media": threading.Lock(), "sport": threading.Lock()}
+hunt_daily = {"media": {"date": "", "count": 0}, "sport": {"date": "", "count": 0}}
+recent_outlets = {"media": [], "sport": []}   # primary outlet of the last offered stories (source rotation)
 
-DEFAULT_FEEDS = (
-    "BBC Amharic|https://feeds.bbci.co.uk/amharic/rss.xml,"
-    "Fana BC|https://www.fanabc.com/feed/,"
-    "VOA Amharic|https://amharic.voanews.com/api/z$pqveymop,"
-    "DW Amharic|https://rss.dw.com/xml/rss-am-all,"
-    "Addis Standard|https://addisstandard.com/feed/,"
-    "ENA|https://www.ena.et/feed"
-)
+DEFAULT_FEEDS = {
+    "media": (
+        "BBC Amharic|https://feeds.bbci.co.uk/amharic/rss.xml,"
+        "Fana BC|https://www.fanabc.com/feed/,"
+        "Walta|https://waltainfo.com/feed/,"
+        "Borkena|https://borkena.com/feed/,"
+        "DW Amharic|https://rss.dw.com/xml/rss-am-all,"
+        "VOA Amharic|https://amharic.voanews.com/api/z$pqveymop,"
+        "Addis Standard|https://addisstandard.com/feed/,"
+        "ENA|https://www.ena.et/feed,"
+        "Al Ain Amharic|https://am.al-ain.com/feed"
+    ),
+    "sport": (
+        "BBC Sport|https://feeds.bbci.co.uk/sport/football/rss.xml,"
+        "Sky Sports|https://www.skysports.com/rss/12040,"
+        "The Guardian|https://www.theguardian.com/football/rss,"
+        "ESPN FC|https://www.espn.com/espn/rss/soccer/news"
+    ),
+}
+
+# ---- 48-hour persistent topic de-duplication (entities / keywords, stored as JSON) ---------------------------------
+SEEN_FILE = os.environ.get("SEEN_FILE", os.path.join(tempfile.gettempdir(), "sekela_seen_stories.json"))
+SEEN_TTL = 48 * 3600
+_seen_lock = threading.Lock()
+_seen_items = None
+STOP_KEYS = {
+    "ethiopia", "ethiopian", "ethiopians", "addis", "ababa", "news", "says", "said", "with", "from", "that", "this",
+    "will", "have", "been", "after", "over", "into", "their", "about", "report", "reports", "reported", "year", "years",
+    "week", "more", "than", "also", "amid", "government", "minister", "prime", "million", "billion", "percent",
+    "announced", "announces", "official", "officials", "state", "country", "african", "africa", "latest", "today",
+    "first", "second", "other", "between", "during", "against", "while", "which", "where", "there", "these", "those",
+    "sekela", "media", "sport", "football", "match", "game", "team", "club",
+}
+STOP_AM = {"ኢትዮጵያ", "አዲስ", "አበባ", "ዜና", "መንግሥት", "ሚኒስትር", "ጠቅላይ", "ሰከላ", "ሚዲያ", "ስፖርት", "ምንጭ",
+           "አስታወቀ", "ገለጸ", "ዘግቧል", "ተናግረዋል", "ተናግሯል", "አስታውቋል", "እንደዘገበው", "ኢትዮጵያዊ", "ሀገር", "ሃገር"}
 
 
-def _title_tokens(title):
-    return {w for w in re.findall(r"[a-z0-9]+", (title or "").lower()) if len(w) > 3}
+def _stem_am(w):
+    if len(w) > 3 and w[0] in "የበለከ":
+        w = w[1:]
+    if len(w) > 3 and w[-1] in "ንናምው":
+        w = w[:-1]
+    return w
 
 
-def _is_seen(title):
+def story_keys(text):
+    """Canonical keywords of a story: proper-noun-like Latin words, significant numbers and stemmed Amharic words."""
+    t = text or ""
+    keys = set()
+    for w in re.findall(r"[A-Za-z]{4,}", t):
+        lw = w.lower()
+        if lw not in STOP_KEYS:
+            keys.add(lw)
+    for n in re.findall(r"\d[\d,.]*\d|\d{3,}", t):
+        if not re.fullmatch(r"(19|20)\d\d", n):
+            keys.add(n)
+    for w in re.findall(r"[ሀ-፿]{3,}", t):
+        w = _stem_am(w)
+        if len(w) >= 3 and w not in STOP_AM:
+            keys.add(w)
+    return keys
+
+
+def _seen_load():
+    global _seen_items
+    if _seen_items is not None:
+        return
+    try:
+        with open(SEEN_FILE, "r", encoding="utf-8") as f:
+            _seen_items = [i for i in json.load(f) if isinstance(i, dict) and "keys" in i and "ts" in i]
+    except Exception:
+        _seen_items = []
+
+
+def _seen_save():
+    try:
+        tmp = SEEN_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(_seen_items, f, ensure_ascii=False)
+        os.replace(tmp, SEEN_FILE)
+    except Exception as e:
+        log.info("seen-topics file not saved: %s", e)
+
+
+def _seen_prune():
     now = time.time()
-    hunt_seen[:] = [(t, ts) for t, ts in hunt_seen if now - ts < 86400]
-    tokens = _title_tokens(title)
-    if len(tokens) < 2:  # non-Latin (Amharic) title: compare the raw string
-        raw = (title or "").strip()
-        return any(raw and raw == r for r in _raw_seen)
-    for t, _ in hunt_seen:
-        if len(t) >= 2 and len(tokens & t) / min(len(tokens), len(t)) >= 0.6:
-            return True
+    _seen_items[:] = [i for i in _seen_items if now - i["ts"] < SEEN_TTL]
+
+
+def is_seen(text):
+    """True when the story shares >=3 keywords (or >=2 and half of the smaller set) with a story from the last 48h."""
+    keys = story_keys(text)
+    raw = re.sub(r"\s+", " ", (text or "").lower()).strip()[:120]
+    with _seen_lock:
+        _seen_load()
+        _seen_prune()
+        if len(keys) < 2:  # too few keywords: only an exact repeat counts
+            return bool(raw) and any(it.get("raw") == raw for it in _seen_items)
+        for it in _seen_items:
+            ik = set(it["keys"])
+            shared = keys & ik
+            if len(shared) >= 3 or (len(shared) >= 2 and len(shared) / max(1, min(len(keys), len(ik))) >= 0.5):
+                return True
     return False
 
 
-_raw_seen = []
-
-
-def _mark_seen(title):
-    hunt_seen.append((_title_tokens(title), time.time()))
-    raw = (title or "").strip()
-    if raw:
-        _raw_seen.append(raw)
-        del _raw_seen[:-200]
+def mark_seen(text):
+    keys = story_keys(text)
+    raw = re.sub(r"\s+", " ", (text or "").lower()).strip()[:120]
+    if not raw:
+        return
+    with _seen_lock:
+        _seen_load()
+        _seen_prune()
+        _seen_items.append({"ts": time.time(), "keys": sorted(keys)[:40], "raw": raw})
+        del _seen_items[:-400]
+        _seen_save()
 
 
 def in_quiet_hours(hour=None):
@@ -1673,12 +2130,14 @@ def in_quiet_hours(hour=None):
     return (h >= a or h < b) if a > b else (a <= h < b)
 
 
-def fetch_feed_items(max_age_hours=24, per_feed=8):
-    """Recent items from configured RSS/Atom feeds as [{"source","title"}] (best effort; a dead feed is skipped)."""
-    spec = os.environ.get("NEWS_RSS_FEEDS", DEFAULT_FEEDS)
-    atom = "{http://www.w3.org/2005/Atom}"
-    out = []
-    for item in [s for s in spec.split(",") if "|" in s]:
+def fetch_feed_items(brand="media", max_age_hours=24, per_feed=5):
+    """Recent items from the brand's RSS/Atom feeds as [{"source","title","link","image"}], interleaved round-robin
+    across outlets (in random order) so no single outlet dominates. A dead feed is simply skipped."""
+    env_name = "NEWS_RSS_FEEDS" if brand == "media" else "SPORT_RSS_FEEDS"
+    spec = os.environ.get(env_name, DEFAULT_FEEDS[brand])
+    atom, mrss = "{http://www.w3.org/2005/Atom}", "{http://search.yahoo.com/mrss/}"
+    per = {}
+    for item in [x for x in spec.split(",") if "|" in x]:
         name, url = [x.strip() for x in item.split("|", 1)]
         try:
             r = requests.get(url, timeout=12, headers={"User-Agent": "Mozilla/5.0 SekelaNewsBot"})
@@ -1686,7 +2145,7 @@ def fetch_feed_items(max_age_hours=24, per_feed=8):
                 continue
             root = ET.fromstring(r.content)
             entries = list(root.iter("item")) or list(root.iter(atom + "entry"))
-            n = 0
+            rows = []
             for it in entries:
                 title = (it.findtext("title") or it.findtext(atom + "title") or "").strip()
                 pub = it.findtext("pubDate") or it.findtext(atom + "updated") or it.findtext(atom + "published")
@@ -1700,101 +2159,151 @@ def fetch_feed_items(max_age_hours=24, per_feed=8):
                             dt = None
                     if dt is not None and dt.tzinfo and (datetime.now(timezone.utc) - dt).total_seconds() > max_age_hours * 3600:
                         continue
-                if title:
-                    out.append({"source": name, "title": title})
-                    n += 1
-                if n >= per_feed:
+                if not title:
+                    continue
+                link = (it.findtext("link") or "").strip()
+                if not link:
+                    el = it.find(atom + "link")
+                    link = (el.get("href") if el is not None else "") or ""
+                img = None
+                for tag in (mrss + "content", mrss + "thumbnail"):
+                    el = it.find(tag)
+                    if el is not None and el.get("url"):
+                        img = el.get("url")
+                        break
+                if not img:
+                    enc = it.find("enclosure")
+                    if enc is not None and (enc.get("type") or "").startswith("image"):
+                        img = enc.get("url")
+                rows.append({"source": name, "title": title, "link": link, "image": img})
+                if len(rows) >= per_feed:
                     break
+            if rows:
+                per[name] = rows
         except Exception as e:
             log.info("feed %s unavailable: %s", name, e)
+    names = list(per)
+    random.shuffle(names)
+    out = []
+    while any(per[n] for n in names):
+        for n in names:
+            if per[n]:
+                out.append(per[n].pop(0))
     return out
 
 
-def feed_items_text(items):
-    return "\n".join(f"- [{i['source']}] {i['title']}" for i in items)
+def feed_items_text(items, limit=30):
+    return "\n".join(f"- [{i['source']}] {i['title']}" for i in items[:limit])
 
 
-def stories_from_feeds(items, n=6):
+def stories_from_feeds(items, n=8):
     """Last-resort story list built straight from RSS headlines of recognised outlets (importance 6)."""
-    return [{"importance": 6, "title": i["title"], "outlets": i["source"],
-             "summary": i["title"]} for i in items[:n]]
+    return [{"importance": 6, "title": i["title"], "outlets": i["source"], "summary": i["title"],
+             "link": i.get("link"), "image": i.get("image")} for i in items[:n]]
 
 
-def hunt_once(manual=False, min_importance=None):
-    """One scan. Searches the last 12h (automatic 24h fallback, then RSS fallback) for a timely, not-yet-offered story
-    with importance >= threshold (default 5), drafts the card + copy and pushes it to Henok with the approve/cancel
-    buttons. A story that came from a recognised outlet is never dropped as 'unverified'.
+def _outlet_key(story):
+    first = ((story.get("outlets") or "").split(",")[0]).strip().lower()
+    return first.split(" ")[0] if first else ""
+
+
+def pick_story(fresh, brand):
+    """Source rotation: prefer a story whose primary outlet differs from the last two offered (no BBC-only runs)."""
+    recent = recent_outlets[brand][-2:]
+    chosen = next((s for s in fresh if _outlet_key(s) not in recent), fresh[0])
+    recent_outlets[brand].append(_outlet_key(chosen))
+    del recent_outlets[brand][:-6]
+    return chosen
+
+
+def hunt_once(manual=False, min_importance=None, brand="media"):
+    """One scan for the given brand. Searches the recent window (12h media / 6h sport, automatic 24h fallback, then RSS
+    fallback) for a story that was NOT offered in the last 48h, rotates outlets, drafts the card + copy (real photo
+    first) and pushes it to Henok with approve / switch / cancel buttons.
     Returns: sent | none | failed | busy | cap | nokey."""
-    if not hunt_lock.acquire(blocking=False):
+    lock = hunt_locks[brand]
+    if not lock.acquire(blocking=False):
         return "busy"
     try:
         if not GEMINI_API_KEY:
             return "nokey"
         today = addis_now().strftime("%Y-%m-%d")
-        if hunt_daily["date"] != today:
-            hunt_daily.update(date=today, count=0)
-        if not manual and hunt_daily["count"] >= int(os.environ.get("HUNT_MAX_PER_DAY", "20")):
+        daily = hunt_daily[brand]
+        if daily["date"] != today:
+            daily.update(date=today, count=0)
+        cap = int(os.environ.get("HUNT_MAX_PER_DAY", "20") if brand == "media"
+                  else os.environ.get("HUNT_SPORT_MAX_PER_DAY", "25"))
+        if not manual and daily["count"] >= cap:
             return "cap"
         threshold = min_importance if min_importance is not None else int(os.environ.get("HUNT_MIN_IMPORTANCE", "5"))
-        feed_items = fetch_feed_items(max_age_hours=24, per_feed=8)
+        focus = HUNT_FOCUS[brand]
+        feed_items = fetch_feed_items(brand, max_age_hours=24, per_feed=5)
         feeds_txt = feed_items_text(feed_items)
 
-        stories, scan_sources = scan_stories(HUNT_FOCUS, hours=12, n=6, feeds=feeds_txt)
-        fresh = [s for s in stories if s["importance"] >= threshold and not _is_seen(s["title"])]
+        def unseen(lst, min_imp=None):
+            return [s for s in lst if (min_imp is None or s["importance"] >= min_imp)
+                    and not is_seen(f"{s['title']} {s['summary']}")]
+
+        stories, scan_sources = scan_stories(focus, hours=6 if brand == "sport" else 12, n=6, feeds=feeds_txt)
+        fresh = unseen(stories, threshold)
         if not fresh:  # 24h fallback
-            stories24, src24 = scan_stories(HUNT_FOCUS, hours=24, n=6, feeds=feeds_txt)
+            stories24, src24 = scan_stories(focus, hours=24, n=6, feeds=feeds_txt)
             if src24:
                 scan_sources = src24
             stories = stories or stories24
-            fresh = [s for s in stories24 if s["importance"] >= threshold and not _is_seen(s["title"])]
-            if not fresh:
-                fresh = [s for s in stories24 if not _is_seen(s["title"])]
+            fresh = unseen(stories24, threshold) or unseen(stories24)
         if not fresh:  # RSS fallback: recognised outlets' own headlines
-            fresh = [s for s in stories_from_feeds(feed_items) if not _is_seen(s["title"])]
+            fresh = unseen(stories_from_feeds(feed_items))
         if not fresh and manual and stories:
             fresh = stories  # manual request: show the top story even if it was offered before
         if not fresh:
             return "none"
 
-        story = fresh[0]
-        _mark_seen(story["title"])
+        story = pick_story(fresh, brand)
+        mark_seen(f"{story['title']} {story['summary']}")
         start = time.time()
         topic = f"{story['title']}. {story['summary']}"
         facts, sources = research_for(topic)
         if not facts:  # a story from a recognised outlet is still usable: build on the scan's own facts
             facts = f"{story['title']}. {story['summary']} (Reported by: {story['outlets']})"
-            sources = scan_sources or [(story['outlets'] or "Sekela News Desk", "https://t.me/HenokGraphics")]
-        d = build_draft(topic, facts=facts, sources=sources, allow_fallback=True)
+            sources = scan_sources or [(story['outlets'] or "Sekela Media Desk", BRANDS[brand]["tg_link"])]
+        photo_urls = [story["link"]] if story.get("link") else []
+        d = build_draft(topic, facts=facts, sources=sources, allow_fallback=True, brand=brand,
+                        photo_urls=photo_urls, story_image=story.get("image"))
         if not d:
             return "failed"
-        present_draft(OWNER_ID, "ሰበር ዜና", d, HUNT_HEADER, start)
-        hunt_daily["count"] += 1
+        present_draft(OWNER_ID, "ሰበር ዜና", d, HUNT_HEADERS[brand], start)
+        daily["count"] += 1
         bot_stats["breaking"] += 1
         return "sent"
     except Exception as e:
-        log.error("hunt failed: %s", e)
+        log.error("hunt failed (%s): %s", brand, e)
         return "failed"
     finally:
-        hunt_lock.release()
+        lock.release()
 
 
-def hunter_loop():
-    time.sleep(180)
+def hunter_loop(brand):
+    time.sleep(180 if brand == "media" else 420)
+    interval_env = "HUNT_INTERVAL_MIN" if brand == "media" else "HUNT_SPORT_INTERVAL_MIN"
     while True:
         try:
             if not in_quiet_hours():
-                log.info("breaking-news hunt: %s", hunt_once())
+                log.info("hunt %s: %s", brand, hunt_once(brand=brand))
         except Exception as e:
-            log.error("hunter loop error: %s", e)
-        time.sleep(max(5, int(os.environ.get("HUNT_INTERVAL_MIN", "45"))) * 60)
+            log.error("hunter loop error (%s): %s", brand, e)
+        time.sleep(max(5, int(os.environ.get(interval_env, "45" if brand == "media" else "30"))) * 60)
 
 
 def start_hunter():
     if os.environ.get("HUNTER_ENABLED", "1") == "0" or not GEMINI_API_KEY:
         return
-    threading.Thread(target=hunter_loop, daemon=True, name="hunter").start()
-    log.info("Breaking-news hunter started (every %s min, quiet hours %s Addis time)",
-             os.environ.get("HUNT_INTERVAL_MIN", "45"), os.environ.get("HUNT_QUIET", "23-6") or "off")
+    threading.Thread(target=hunter_loop, args=("media",), daemon=True, name="hunter-media").start()
+    if os.environ.get("HUNTER_SPORT_ENABLED", "1") != "0":
+        threading.Thread(target=hunter_loop, args=("sport",), daemon=True, name="hunter-sport").start()
+    log.info("Hunters started (media every %s min, sport every %s min, quiet hours %s Addis time)",
+             os.environ.get("HUNT_INTERVAL_MIN", "45"), os.environ.get("HUNT_SPORT_INTERVAL_MIN", "30"),
+             os.environ.get("HUNT_QUIET", "23-6") or "off")
 
 
 # ----------------------------------------------------------------------------
@@ -2187,7 +2696,7 @@ def collect_analytics():
             data["yt"] = yt_channel_stats()
         except Exception as e:
             data["yt"] = {"error": short_reason(e, 150)}
-    data["fb_text"] = fb_analytics_text(data["fb"])
+    data["fb_text"] = fb_analytics_text("media", data["fb"])
     return data
 
 
@@ -2569,7 +3078,8 @@ HELP_TEXT = (
     "ምን ላደርግልህ እችላለሁ:\n"
     "📰 /news — ዋና ዋና ዜናዎች (ከታማኝ ምንጮች) → ቁልፍ ስትነካ ካርድ + ፖስት\n"
     "🔔 /breaking — ሰበር ዜና አሁን ፈልግ (ቦቱ በራሱም ይፈትሻል እና ያሳውቅሃል)\n"
-    "📝 /post — የሰከላ ኒውስ ካርድ + ፖስት → ✅ ስትነካ ወደ Telegram እና Facebook\n"
+    "⚽ /sport — የስፖርት ዜና፣ ዝውውሮች እና ቀጥታ ጎሎች (ሰከላ ስፖርት)\n"
+    "📝 /post — ካርድ + ፖስት (📰 ሰከላ ሚዲያ ወይም ⚽ ሰከላ ስፖርት — በአንድ ንካ ይቀየራል) → ✅ ስትነካ ወደ Telegram እና Facebook\n"
     "📊 /analytics — Telegram + YouTube + Facebook ዳሽቦርድ (ምስል) — ጠቃሚ ለውጥ ሲኖር በራሴ አሳውቅሃለሁ\n"
     "✂️ /shorts — ረጅም ቪዲዮ (YouTube ሊንክ ወይም ፋይል) → 9:16 Shorts → ✅ ስትነካ YouTube ላይ\n"
     "🎙 ድምፅ ላክልኝ (እስከ 5 ደቂቃ) — ትራንስክሪፕት + ማጠቃለያ + Action Items\n"
@@ -2650,24 +3160,35 @@ def cmd_shorts(message):
                               "ከትንታኔው በታች ✂️ ቁልፍ ይመጣል። (ለመሰረዝ /cancel)")
 
 
-@bot.message_handler(commands=["breaking", "hunt"])
-@private_owner_only
-def cmd_breaking(message):
+def _manual_hunt(message, brand):
     start = time.time()
     chat_id = message.chat.id
-    ack_id = send_progress(chat_id, "⏳ ሄኖክ፣ ሰበር ዜናዎችን እየፈተሽኩ ነው (ባለፉት 12 ሰዓታት፣ አስፈላጊ ከሆነ 24 ሰዓት) — ከ40-90 ሰከንድ ይወስዳል...")
-    status = hunt_once(manual=True, min_importance=5)
+    what = "ሰበር ዜናዎችን" if brand == "media" else "የስፖርት ዜናዎችን እና ቀጥታ ጎሎችን"
+    ack_id = send_progress(chat_id, f"⏳ ሄኖክ፣ {what} እየፈተሽኩ ነው (ባለፉት ሰዓታት፣ አስፈላጊ ከሆነ 24 ሰዓት) — ከ40-90 ሰከንድ ይወስዳል...")
+    status = hunt_once(manual=True, min_importance=5, brand=brand)
     if status == "sent":
         drop_message(chat_id, ack_id)
         return
     msgs = {
-        "none": "ሄኖክ፣ አሁን አዲስ ያልቀረበ ዜና አልተገኘም — ቀደም ብለው የተላኩልህን ዜናዎች ደግሜ አልልክም። ሲገኝ በራሴ አሳውቅሃለሁ 🔔",
+        "none": "ሄኖክ፣ አሁን አዲስ ያልቀረበ ዜና አልተገኘም — ባለፉት 48 ሰዓታት የተላኩልህን ዜናዎች ደግሜ አልልክም። ሲገኝ በራሴ አሳውቅሃለሁ 🔔",
         "failed": "ሄኖክ፣ ዜናውን አሁን ማዘጋጀት አልቻልኩም 😅 ጥቂት ቆይተህ እንደገና ሞክር።",
         "busy": "ሄኖክ፣ ፍተሻው አሁን እየተካሄደ ነው — ጥቂት ቆይተህ ሞክር።",
-        "nokey": "GEMINI_API_KEY አልተሞላም — ሰበር ዜና መፈለግ አልችልም።",
-        "cap": "የዛሬው የሰበር ዜና ገደብ ደርሷል።",
+        "nokey": "GEMINI_API_KEY አልተሞላም — ዜና መፈለግ አልችልም።",
+        "cap": "የዛሬው የዜና ገደብ ደርሷል።",
     }
     deliver(chat_id, ack_id, msgs.get(status, msgs["failed"]) + "\n\n" + took(start))
+
+
+@bot.message_handler(commands=["breaking", "hunt"])
+@private_owner_only
+def cmd_breaking(message):
+    _manual_hunt(message, "media")
+
+
+@bot.message_handler(commands=["sport", "goals"])
+@private_owner_only
+def cmd_sport(message):
+    _manual_hunt(message, "sport")
 
 
 def _gemini_status_lines():
@@ -2729,10 +3250,11 @@ def _openrouter_status_lines():
     return lines
 
 
-def _channel_status_lines():
-    lines = [f"📣 Telegram target: {TARGET_CHANNEL}"]
+def _channel_status_lines(brand):
+    b = BRANDS[brand]
+    lines = [f"📣 {brand_label(brand)} — Telegram: {b['tg']}"]
     try:
-        chat = bot.get_chat(TARGET_CHANNEL)
+        chat = bot.get_chat(b["tg"])
         lines.append(f"  ✅ ቻናሉ ተገኝቷል: {getattr(chat, 'title', '?')} (id {chat.id})")
         member = bot.get_chat_member(chat.id, bot.get_me().id)
         status = getattr(member, "status", "?")
@@ -2747,15 +3269,17 @@ def _channel_status_lines():
     return lines
 
 
-def _fb_status_lines():
-    lines = [f"📘 Facebook Page: {FB_PAGE_NAME} (id {FB_PAGE_ID})"]
-    if not FB_PAGE_ACCESS_TOKEN:
-        return lines + ["  ⚪ FB_PAGE_ACCESS_TOKEN አልተሞላም — ወደ ፌስቡክ አይለጠፍም"]
+def _fb_status_lines(brand):
+    b = BRANDS[brand]
+    lines = [f"📘 {brand_label(brand)} — Facebook Page: {b['fb_name']} (id {b['fb_id']})"]
+    if not b["fb_token"]:
+        env = "FB_PAGE_ACCESS_TOKEN" if brand == "media" else "FB_SPORT_ACCESS_TOKEN"
+        return lines + [f"  ⚪ {env} አልተሞላም — ወደ ፌስቡክ አይለጠፍም"]
     try:
-        me = _fb_request("GET", "me", params={"fields": "name,id"}, timeout=30)
+        me = _fb_request("GET", "me", params={"fields": "name,id"}, timeout=30, brand=brand)
         lines.append(f"  ✅ ተገናኝቷል: {me.get('name')} (id {me.get('id')})")
-        if me.get("id") and str(me["id"]) != str(FB_PAGE_ID):
-            lines.append("  ⚠️ ቶክኑ የሌላ ገጽ ነው — FB_PAGE_ID እና ቶክኑ አይዛመዱም")
+        if me.get("id") and str(me["id"]) != str(b["fb_id"]):
+            lines.append("  ⚠️ ቶክኑ የሌላ ገጽ ነው — የገጹ ID እና ቶክኑ አይዛመዱም")
     except FBError as e:
         lines.append(f"  ❌ {short_reason(e, 140)}")
         if fb_error_hint(e):
@@ -2769,7 +3293,6 @@ def _yt_status_lines():
         lines.append("  ⚪ YOUTUBE_CLIENT_ID / SECRET / REFRESH_TOKEN አልተሞሉም")
     else:
         try:
-            _yt_get("channels", {"part": "id", "mine": "true"})
             s = yt_channel_stats()
             lines.append(f"  ✅ ተገናኝቷል: {s['title']} ({s['subs']:,} subs · {s['videos']:,} videos)")
         except Exception as e:
@@ -2790,9 +3313,13 @@ def cmd_ai_status(message):
         lines.append("\n🔎 ምርምር/ሚዲያ — Gemini:")
         lines += _gemini_status_lines()
         lines.append("")
-        lines += _channel_status_lines()
+        lines += _channel_status_lines("media")
         lines.append("")
-        lines += _fb_status_lines()
+        lines += _channel_status_lines("sport")
+        lines.append("")
+        lines += _fb_status_lines("media")
+        lines.append("")
+        lines += _fb_status_lines("sport")
         lines.append("")
         lines += _yt_status_lines()
         font = find_ethiopic_font() if PIL_OK else None
@@ -2835,11 +3362,12 @@ def on_callback(call):
                 bot.send_message(chat_id, "እሺ ሄኖክ ✍️ ርዕሱን ጻፍልኝ (ለመሰረዝ /cancel):")
                 return
             label, topic = CATEGORIES[key]
+            brand = "sport" if key == "sport" else "media"
             bot.edit_message_text(f"✅ የመረጥከው: {label}", chat_id, msg_id)  # permanent chat record
             if mode == "news":
-                run_news(chat_id, label, topic)
+                run_news(chat_id, label, topic, brand=brand)
             else:
-                run_post(chat_id, label, topic)
+                run_post(chat_id, label, topic, brand=brand)
 
         elif data.startswith("mk:"):
             nid = data.split(":", 1)[1]
@@ -2848,7 +3376,7 @@ def on_callback(call):
             if not item:
                 bot.send_message(chat_id, "ሄኖክ፣ ይህ መረጃ ጊዜው አልፏል — /news ብለህ እንደገና ጠይቀኝ 🙏")
                 return
-            run_post(chat_id, item["label"], item["topic"])
+            run_post(chat_id, item["label"], item["topic"], brand=item.get("brand"))
 
         elif data.startswith("st:"):
             _, nid, idx = data.split(":", 2)
@@ -2858,7 +3386,7 @@ def on_callback(call):
                 bot.send_message(chat_id, "ሄኖክ፣ ይህ መረጃ ጊዜው አልፏል — /news ብለህ እንደገና ጠይቀኝ 🙏")
                 return
             s = item["stories"][int(idx)]
-            run_post(chat_id, item["label"], f"{s['title']}. {s['summary']}")
+            run_post(chat_id, item["label"], f"{s['title']}. {s['summary']}", brand=item.get("brand"))
 
         elif data.startswith("ok:"):
             did = data.split(":", 1)[1]
@@ -2889,6 +3417,26 @@ def on_callback(call):
             with state_lock:
                 drafts.pop(did, None)
             bot.edit_message_text("❌ ተሰርዟል — ምንም አልተለጠፈም።", chat_id, msg_id)
+
+        elif data == "noop":
+            return
+
+        elif data.startswith("sw:"):  # switch the draft between Media and Sport
+            rebrand_draft(chat_id, msg_id, data.split(":", 1)[1])
+
+        elif data.startswith("pin:"):
+            pin_published(chat_id, data.split(":", 1)[1])
+
+        elif data.startswith("ed:"):
+            pid = data.split(":", 1)[1]
+            with state_lock:
+                known = pid in published
+                if known:
+                    awaiting_topic[uid] = f"edit:{pid}"
+            if known:
+                bot.send_message(chat_id, "✏️ እሺ ሄኖክ፣ የፖስቱን አዲስ ሙሉ ጽሑፍ ላክልኝ — በቻናሉ ላይ እተካዋለሁ (ለመሰረዝ /cancel)።")
+            else:
+                bot.send_message(chat_id, "ሄኖክ፣ ይህ ፖስት ከማህደረ ትውስታ ተሰርዟል — በቻናሉ ላይ በእጅ አርም 🙏")
 
         elif data.startswith("vc:"):  # cut Shorts from a video that was just analysed
             vid = data.split(":", 1)[1]
@@ -2939,6 +3487,9 @@ def handle_text(message):
     # Topic typed after tapping "write my own topic" (or a link after /shorts)
     with state_lock:
         pending_mode = awaiting_topic.pop(uid, None)
+    if pending_mode and pending_mode.startswith("edit:"):
+        edit_published(chat_id, pending_mode.split(":", 1)[1], text)
+        return
     if pending_mode == "shorts":
         m = re.search(r"https?://\S+", text)
         if not m or not is_youtube_url(m.group(0)):
@@ -2994,8 +3545,9 @@ def handle_text(message):
 def main():
     start_health_server()
     start_keepalive()
-    log.info("Starting Henok Assistant agent... Telegram target: %s | Facebook: %s | YouTube: %s", TARGET_CHANNEL,
-             "on" if fb_enabled() else "off (no FB_PAGE_ACCESS_TOKEN)", "on" if yt_enabled() else "off")
+    log.info("Starting Henok Assistant agent... Media: %s (FB %s) | Sport: %s (FB %s) | YouTube: %s",
+             TARGET_CHANNEL, "on" if fb_enabled("media") else "off", SPORT_CHANNEL,
+             "on" if fb_enabled("sport") else "off", "on" if yt_enabled() else "off")
 
     if not TELEGRAM_BOT_TOKEN:
         log.error("TELEGRAM_BOT_TOKEN is missing. Set it in Render environment variables.")
@@ -3028,7 +3580,8 @@ def main():
         bot.set_my_commands([
             types.BotCommand("news", "ዋና ዋና ዜናዎች (ከታማኝ ምንጮች)"),
             types.BotCommand("breaking", "ሰበር ዜና አሁን ፈልግ"),
-            types.BotCommand("post", "የሰከላ ኒውስ ካርድ + ፖስት"),
+            types.BotCommand("sport", "የስፖርት ዜና እና ቀጥታ ጎሎች"),
+            types.BotCommand("post", "ካርድ + ፖስት (ሚዲያ / ስፖርት)"),
             types.BotCommand("analytics", "Telegram + YouTube + Facebook ዳሽቦርድ"),
             types.BotCommand("shorts", "ረጅም ቪዲዮ → 9:16 Shorts"),
             types.BotCommand("ai_status", "የ AI፣ ቻናል፣ YouTube እና Facebook ሁኔታ"),
