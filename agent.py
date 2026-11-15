@@ -19,6 +19,9 @@ Canva    : CANVA_CLIENT_ID, CANVA_CLIENT_SECRET (callback = <RENDER_EXTERNAL_URL
            CANVA_SCOPES default "profile:read design:meta:read")
 Images   : /image uses Pollinations (flux + turbo, no key) + Gemini image models (GEMINI_API_KEY) and, when present,
            HF_TOKEN (Hugging Face FLUX.1-schnell) and TOGETHER_API_KEY (FLUX.1-schnell-Free)
+Learning : LEARN_FILE (default agent_learning.json next to agent.py; a pinned Telegram backup restores it after restarts)
+Sport    : SPORT_ENGINE=1, SPORT_LEAGUES=eng.1,uefa.champions,..., SPORT_POLL_SEC=75, SPORT_ALERT_ALL=0, SPORT_ALERT_MAX_PER_DAY=30,
+           SPORT_HIGHLIGHTS=1, SPORT_HIGHLIGHT_CHANNELS='Name|YouTubeChannelId,...', SPORT_CLIP_MAX_SEC=60
 News AI  : NEWS_WRITER_MODELS (default anthropic/claude-haiku-5.5,openai/gpt-4o-mini,deepseek/deepseek-chat),
            NEWS_ALLOW_GEMINI=0 (final Amharic is written by OpenRouter only), NEWS_PROOFREAD=1
            YT_PRIVACY            (public | unlisted | private; default public - upload happens ONLY after approval tap)
@@ -26,13 +29,13 @@ Optional : OWNER_ID              (default 511440586)
            TARGET_CHANNEL        (ሰከላ ሚዲያ channel, default @sekelamediaET)
            SPORT_CHANNEL         (ሰከላ ስፖርት channel, default @SekelaSportET)
            SEEN_FILE             (48h story-dedup JSON file, default in the temp dir)
-           HUNT_SPORT_INTERVAL_MIN (default 30), HUNT_SPORT_MAX_PER_DAY (default 25), HUNTER_SPORT_ENABLED=1
+           HUNT_SPORT_INTERVAL_MIN (default 40), HUNT_SPORT_MAX_PER_DAY (default 16), HUNTER_SPORT_ENABLED=1
            SPORT_RSS_FEEDS="Name|url,Name|url"
            OPENROUTER_MODELS     (comma list; default deepseek/deepseek-chat,openai/gpt-4o-mini)
            OPENROUTER_AUTO_EXTRA (default 1: auto-add a verified Claude Haiku / Grok mini slug taken from OpenRouter's
                                   live /api/v1/models list as extra fallback; 0 disables)
            FONT_PATH, PORT (default 10000), RENDER_EXTERNAL_URL
-           HUNTER_ENABLED=1, HUNT_INTERVAL_MIN=45, HUNT_MIN_IMPORTANCE=5, HUNT_MAX_PER_DAY=20, HUNT_QUIET=23-6,
+           HUNTER_ENABLED=1, HUNT_INTERVAL_MIN=30, HUNT_MIN_IMPORTANCE=5, HUNT_MAX_PER_DAY=24, HUNT_QUIET=23-6,
            NEWS_RSS_FEEDS="Name|url,Name|url"
            ALERTS_ENABLED=1, ALERT_INTERVAL_MIN=240, ALERT_SUBS_DELTA=3, ALERT_VIEWS_DELTA=1000, ALERT_TG_DELTA=10,
            ALERT_FB_DELTA=5
@@ -1022,48 +1025,53 @@ def show_categories(chat_id, mode):
 UNVERIFIED_SOURCE = "ሰከላ ሚዲያ ዴስክ (በማረጋገጥ ላይ)"
 
 NEWSROOM_SYSTEM = (
-    "You are the senior Amharic news editor of 'ሰከላ ሚዲያ (Sekela Media)' and 'ሰከላ ስፖርት (Sekela Sport)', writing in "
-    "the style of Addis Ababa newsrooms such as Tikvah-Ethiopia, Getu Temesgen and Gursha.\n"
-    "WRITING RULES (highest priority):\n"
-    "- Crystal-clear, everyday Addis Ababa journalistic Amharic that any reader understands at first read.\n"
-    "- Sentences are 10-20 words, never more. One main idea per sentence. Subject first, active voice. If a sentence "
-    "needs more than 20 words, split it into two sentences.\n"
-    "- PERFECT AMHARIC GRAMMAR. Check every single sentence before you answer:\n"
-    "  * Subject-verb agreement: plural, respectful or collective subjects take PLURAL verbs. Correct: "
-    "«ግጭቶች እየተባባሱ ናቸው», «ባለሥልጣናቱ አስታውቀዋል», «ዋጋዎች ጨምረዋል», «ተሳታፊዎች ተገኝተዋል». Wrong: "
-    "«ግጭቶች እየተባባሱ ነው», «ባለሥልጣናቱ አስታውቋል». Singular subjects take singular verbs: «ሚኒስቴሩ አስታውቋል», "
-    "«ዋጋው ጨምሯል».\n"
-    "  * Use one consistent tense inside a paragraph (finished news: አስታውቋል, ተካሂዷል, ተፈርሟል; ongoing: እየ... ነው / ናቸው).\n"
-    "  * Correct plural and definite forms (-ዎች, -ኦች, -ዎቹ, -ው, -ዋ, -ቱ); correct prepositions and conjunctions; no doubled "
-    "words; no word-for-word English structure; spelling exactly as Ethiopian news media write it.\n"
-    "- RICH, SPECIFIC CONTENT: never write a vague 1-2 line summary. Answer who / what / where / when AND add concrete "
-    "details taken from the notes: names, places, dates, numbers, amounts, percentages, reasons, background and what "
-    "happens next. A claim like «ሁኔታዎች እየተባባሱ ነው» without who, where and how much is forbidden.\n"
-    "- No tangled clauses, no chains of 'እና ... እና ...', no rare or old-fashioned words, no machine-translated idioms. "
-    "If unsure of an Amharic word, use the common English term in Latin letters.\n"
+    "You are a veteran Ethiopian Amharic journalist and the senior editor of 'ሰከላ ሚዲያ (Sekela Media)' and 'ሰከላ ስፖርት "
+    "(Sekela Sport)'. You THINK in Amharic and write the way the best Addis Ababa online newsrooms do - ZeHabesha, Gursha "
+    "and Getu Temesgen: warm, vivid, fluent, informative. You never translate: you retell the story as an Ethiopian "
+    "reporter who heard the facts in Amharic.\n"
+    "NATIVE-VOICE RULES (highest priority):\n"
+    "- ZERO calques. Do not follow English word order or clause stacking. Start with what matters to an Ethiopian reader, "
+    "put time and place where Amharic puts them (e.g. «ማክሰኞ ዕለት በአዲስ አበባ ...»), and end sentences with the verb. Never "
+    "translate English idioms or buzzwords literally (game-changer, boost, tip of the iceberg, landmark, spark, "
+    "raise concerns...); say the same thing the way an Amharic speaker would.\n"
+    "- Avoid noun-chains with «ማድረግ / መሆን / ተችሏል» repeated; prefer one strong verb: «አስታውቋል», «ይፋ አድርጓል», «ተፈራርመዋል», "
+    "«አሻቅቧል», «ወርዷል», «ተጠናቋል». Vary sentence rhythm and open sentences differently.\n"
+    "- Connect the story so it flows like a narration, not a list: «በተጨማሪም», «ይህም», «ከዚህ ቀደም», «በሌላ በኩል», «በመሆኑም», "
+    "«ይሁን እንጂ», «እንደ ባለሙያዎች ገለጻ». Mostly 12-22 words per sentence, never more than 26.\n"
+    "- Before answering read every sentence in your head: if it sounds like it was translated from English, rewrite it "
+    "in natural Amharic.\n"
+    "- PERFECT GRAMMAR: plural / respectful / collective subjects take PLURAL verbs («ግጭቶች እየተባባሱ ናቸው», «ባለሥልጣናቱ "
+    "አስታውቀዋል», «ዋጋዎች ጨምረዋል»), never «ግጭቶች እየተባባሱ ነው»; singular subjects take singular verbs («ሚኒስቴሩ "
+    "አስታውቋል»). One consistent tense inside a paragraph, correct plural/definite forms (-ዎች, -ኦች, -ዎቹ, -ው, -ዋ, -ቱ), no "
+    "doubled words, spelling as Ethiopian media write it.\n"
+    "- RICH AND SPECIFIC: never a bare 2-line stub. Give the complete story: who, what, where, when, the key numbers, "
+    "names, amounts, dates, the background (what happened before), why it matters to Ethiopians and what happens next - "
+    "all taken from the notes. A vague claim without who / where / how much is forbidden.\n"
     "- Neutral third person; NEVER address anyone (no አንተ/እናንተ/እኔ/እኛ, no questions, no greetings, never the name ሄኖክ).\n"
-    "- News register verbs: አስታወቀ, ገለጸ, ዘግቧል, እንደ ... ገለጻ. Attribute every claim and quote to its source "
-    "(e.g. 'ሮይተርስ እንደዘገበው', 'የገንዘብ ሚኒስቴር አስታውቋል').\n"
+    "- Attribute every claim and quote to its source («ሮይተርስ እንደዘገበው», «የገንዘብ ሚኒስቴር አስታውቋል»).\n"
     "- Use ONLY facts, numbers, names and quotes present in the research notes. Never invent, embellish or speculate. "
-    "Never mix facts of different events. Spell names of people and places the same way everywhere.\n"
-    "- Plain text, no markdown, no emojis inside paragraphs; keep widely used English terms (AI, Bitcoin, TikTok) in "
-    "Latin letters."
+    "Never mix facts of different events. Spell names the same way everywhere.\n"
+    "- Plain text, no markdown, no emojis inside paragraphs; keep widely used English terms (AI, Bitcoin, TikTok, club "
+    "and player names when no common Amharic spelling exists) in Latin letters."
 )
 
 NEWS_BRIEF = (
-    "Write ONE Amharic news item from the research notes in this exact structure: bold headline -> hook -> detail "
-    "sentences -> sources.\n"
+    "Write ONE Amharic news item from the research notes in this exact structure: bold headline -> hook -> full "
+    "explanation -> sources. Write it as a native Ethiopian journalist who thinks in Amharic - no literal "
+    "English-to-Amharic phrasing anywhere.\n"
     "Topic: {topic}\n{brand_note}\n\n[RESEARCH NOTES]\n{facts}\n\n{mode_note}"
     "SEO: the headline and the hook must naturally contain the main high-search keyword of the story (the key name, "
     "place, club or topic, in Amharic; add the common English spelling when people search for it that way).\n"
-    "Every sentence must be 10-20 words and grammatically perfect (check subject-verb agreement: plural subject -> "
-    "plural verb, e.g. «እየተባባሱ ናቸው», never «እየተባባሱ ነው»).\n"
+    "Check every sentence: perfect grammar, plural subject -> plural verb («እየተባባሱ ናቸው», never «እየተባባሱ ነው»), natural "
+    "word order, mostly 12-22 words.\n"
     "Return EXACTLY these blocks and nothing else:\n"
-    "===HEADLINE===\n5-7 words: a bold, factual, scroll-stopping headline; no quotes, no emoji, no full stop.\n"
-    "===LEAD===\nThe hook: 1-2 punchy sentences (20-40 words in total) that answer who, what, where and when.\n"
-    "===CONTEXT===\nThe body: 3-5 clear, well-structured sentences (60-110 words in total) with the specific facts, "
-    "names, numbers, dates and background from the notes, why it matters and what comes next. Never a vague "
-    "two-line summary.\n"
+    "===HEADLINE===\n4-7 words: a bold, factual, scroll-stopping headline that fits a photo card; no quotes, no emoji, "
+    "no full stop.\n"
+    "===LEAD===\nThe hook: 1-2 vivid, crystal-clear sentences (25-45 words in total) that answer who, what, where and "
+    "when and make the reader want to continue.\n"
+    "===CONTEXT===\nThe full explanation: 4-6 well-connected sentences (80-130 words in total) that tell the complete "
+    "story - the key figures and names, the background, the reactions or reasons, why it matters to Ethiopians and "
+    "what comes next. Never a bare two-line stub.\n"
     "===OFFICIAL===\nONE sentence with an official statement or direct quote, attributed to the named official or "
     "body. If the notes contain none, write exactly: NONE\n"
     "===SOURCE===\nThe outlet names taken from the notes, separated by ' / ' (Amharic names where established: "
@@ -1075,6 +1083,7 @@ NEWS_BRIEF = (
     "story's theme (setting, subject matter, lighting, lens, mood, high-contrast colour grade). No identifiable real "
     "people, no text, no logos, no flags, no depiction of violence or casualties.\n"
 )
+
 UNVERIFIED_NOTE = (
     "[NO LIVE RESEARCH WAS AVAILABLE] Write a careful editorial synthesis using ONLY well-established background "
     "facts you are certain of. Do NOT state specific recent numbers, dates, quotes or events. In ===SOURCE=== write "
@@ -1181,14 +1190,17 @@ def too_thin(pkg):
     """True when the body is the kind of vague 2-line summary we do not want (fewer than 3 sentences / ~40 words)."""
     ctx = _para(pkg.get("context"))
     sents = [x for x in re.split(r"[።!?\n]+", ctx) if x.strip()]
-    return len(sents) < 3 or len(ctx.split()) < 40
+    return len(sents) < 4 or len(ctx.split()) < 55
 
 
 PROOF_PROMPT = (
     "You are a strict Amharic proofreader of a news desk. Below are the LEAD, CONTEXT and OFFICIAL blocks of a news "
     "post. Fix ONLY: grammar, subject-verb agreement (plural subjects need plural verbs: «ግጭቶች እየተባባሱ ናቸው», never "
-    "«ነው»), tense consistency, spelling, doubled words and awkward phrasing. Do NOT add, remove or change any fact, "
-    "number, name or attribution. Keep every sentence 10-20 words and keep the same number of sentences. Return "
+    "«ነው»), tense consistency, spelling, doubled words, awkward phrasing, and EVERY sentence that sounds translated "
+    "from English (literal calques, English word order, stacked clauses): rewrite those the way a native Addis Ababa "
+    "journalist (ZeHabesha / Gursha / Getu Temesgen style) would say it, with smooth connectors between sentences. "
+    "Do NOT add, remove or change any fact, number, name or attribution. Keep the same number of sentences (mostly "
+    "12-22 words each). Return "
     "EXACTLY the same three labelled blocks and nothing else:\n===LEAD===\n...\n===CONTEXT===\n...\n"
     "===OFFICIAL===\n...\n\n"
 )
@@ -1223,7 +1235,7 @@ def proofread_pkg(pkg):
     return new
 
 
-def long_sentences(pkg, limit=22):
+def long_sentences(pkg, limit=27):
     """Sentences of the body that are too long for the crystal-clear style (the prompt asks for 10-18 words)."""
     txt = " ".join([pkg.get("lead", ""), pkg.get("context", ""), pkg.get("official", "")])
     return [x for x in re.split(r"[።!?\n]+", txt) if len(x.split()) > limit]
@@ -1262,7 +1274,9 @@ STORY_PROMPT = (
     "BALANCE RULES (strict): use BBC Amharic for AT MOST ONE of the stories; include AT MOST ONE conflict / fighting / "
     "security story; make the majority of the stories about economy & business, technology & AI, Addis Ababa & "
     "infrastructure, diplomacy, Ethiopian social-media / creator trends (e.g. TikTok Creative Awards) or culture. "
-    "(Sport scans: ignore the topic list and rotate across Sky Sports, BBC Sport, Guardian, ESPN, Fabrizio Romano.)\n"
+    "(Sport scans: ignore the topic list; follow the desk in the focus text and rotate across Ethiopian sports media "
+    "(EBC Sport, Fana, Sheger FM, Ethiopian football federation), World Athletics, Sky Sports, BBC Sport, Guardian, ESPN, "
+    "Fabrizio Romano.)\n"
     "{feeds}"
     "Return {n} top stories, ONE per line, in EXACTLY this format (English):\n"
     "STORY|<importance 1-10>|<headline, max 14 words>|<outlet names, comma separated>|<one sentence with the key fact>\n"
@@ -1575,10 +1589,26 @@ CARD_THEMES = {  # cohesive palettes: deep crimson + gold (Media), emerald + gol
 }
 
 
+def _draw_bold_shadow(draw, x, baseline, text, f_eth, f_lat, fill, shadow=True):
+    """Headline text that survives white shirts and bright skies: a multi-pixel dark drop shadow + dark outline, then a
+    faux-bold (1 px double strike) fill."""
+    if shadow:
+        for dx, dy, a in ((0, 8, 70), (3, 8, 70), (6, 8, 60), (0, 6, 90), (3, 6, 90), (5, 6, 90), (2, 4, 120),
+                          (4, 4, 120), (-2, 3, 130), (0, 3, 150), (3, 3, 150), (6, 3, 120)):
+            _draw_mixed(draw, x + dx, baseline + dy, text, f_eth, f_lat, (0, 0, 0, a))
+        for dx in (-3, -2, -1, 0, 1, 2, 3):  # crisp dark outline
+            for dy in (-3, -2, -1, 0, 1, 2, 3):
+                if dx * dx + dy * dy in (4, 5, 8, 9, 10, 13, 18):
+                    _draw_mixed(draw, x + dx, baseline + dy, text, f_eth, f_lat, (8, 6, 10, 235))
+    for dx, dy in ((0, 0), (1, 0), (0, 1), (1, 1)):
+        _draw_mixed(draw, x + dx, baseline + dy, text, f_eth, f_lat, fill)
+
+
 def compose_card(bg_bytes, headline, badge=None, ai=True, size=1080, brand="media"):
-    """1080x1080 Sekela card: cropped photo, smooth dark bottom gradient (faces stay visible), a smaller headline
-    anchored in the bottom third above the brand badge, brand-colour badge with a gold accent and a subtle neutral
-    "Today" tag. Returns JPEG bytes, or None when Pillow / an Ethiopic font is unavailable or anything fails."""
+    """1080x1080 Sekela card: cropped photo, a rich dark scrim anchored to the headline (the subject above stays
+    visible), a BIG bold off-white headline (last line warm gold) with a heavy dark shadow so it stays readable over white
+    shirts / bright skies, a brand-colour badge with gold outline and a subtle neutral "Today" tag.
+    Returns JPEG bytes, or None when Pillow / an Ethiopic font is unavailable or anything fails."""
     if not PIL_OK or not bg_bytes or not headline:
         return None
     eth_path = find_ethiopic_font()
@@ -1591,43 +1621,47 @@ def compose_card(bg_bytes, headline, badge=None, ai=True, size=1080, brand="medi
         s = min(w, h)
         left, top = (w - s) // 2, (h - s) // 2
         img = img.crop((left, top, left + s, top + s)).resize((size, size), Image.LANCZOS)
-        img = ImageEnhance.Contrast(img).enhance(1.08)
+        img = ImageEnhance.Contrast(img).enhance(1.06)
 
-        # smooth gradient: untouched top 42 %, soft ease-in, deepest behind the badge (faces stay clear)
-        tint = tuple(int(c * 0.20) for c in theme["deep"])
-        overlay = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-        od = ImageDraw.Draw(overlay)
-        g0 = int(size * 0.42)
-        for y in range(g0, size):
-            t = (y - g0) / (size - g0)
-            ease = t * t * (3 - 2 * t)  # smoothstep
-            od.line([(0, y), (size, y)], fill=tint + (int(238 * ease),))
-        img = Image.alpha_composite(img.convert("RGBA"), overlay).convert("RGB")  # RGB so translucent shapes blend
-        draw = ImageDraw.Draw(img, "RGBA")
-
-        margin, max_w = 60, size - 120
-        fs, lines = 92, []  # was 112: about 18 % smaller
-        for fs in range(92, 43, -4):
+        # --- headline layout first (the scrim is anchored to it): large, bold, at most 3 lines, lower third
+        margin, max_w = 58, size - 116
+        fs, lines = 108, []
+        for fs in range(108, 55, -4):
             f_eth, f_lat = ImageFont.truetype(eth_path, fs), _latin_font(fs)
             lines = _wrap(headline, f_eth, f_lat, max_w)
             if len(lines) <= 3 and all(_measure(ln, f_eth, f_lat) <= max_w for ln in lines):
                 break
-        line_h = int(fs * 1.2)
+        line_h = int(fs * 1.16)
         badge_h = 60
-        badge_y = size - margin + 4 - badge_h
-        y0 = badge_y - 40 - line_h * len(lines)  # headline sits directly above the badge (bottom third)
-        draw.rectangle([margin, y0 - 26, margin + 96, y0 - 17], fill=theme["gold"] + (255,))
+        badge_y = size - 52 - badge_h
+        y0 = badge_y - 44 - line_h * len(lines)
+
+        # --- rich scrim: clear above, quickly deep dark behind the text, darkest at the bottom
+        tint = tuple(int(c * 0.16) for c in theme["deep"])
+        overlay = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+        od = ImageDraw.Draw(overlay)
+        g0 = max(int(size * 0.28), y0 - 200)
+        for y in range(g0, size):
+            t = (y - g0) / (size - g0)
+            ease = (t * t * (3 - 2 * t)) ** 0.72
+            od.line([(0, y), (size, y)], fill=tint + (int(250 * ease),))
+        img = Image.alpha_composite(img.convert("RGBA"), overlay).convert("RGB")
+        draw = ImageDraw.Draw(img, "RGBA")
+
+        draw.rectangle([margin, y0 - 30, margin + 110, y0 - 20], fill=theme["gold"] + (255,))
+        f_eth, f_lat = ImageFont.truetype(eth_path, fs), _latin_font(fs)
         for i, ln in enumerate(lines):
-            base = y0 + i * line_h + int(fs * 0.98)
-            _draw_mixed(draw, margin + 2, base + 3, ln, f_eth, f_lat, (0, 0, 0, 150))  # soft shadow
-            _draw_mixed(draw, margin, base, ln, f_eth, f_lat, (255, 255, 255, 255))
+            base = y0 + i * line_h + int(fs * 0.96)
+            gold_line = len(lines) > 1 and i == len(lines) - 1
+            _draw_bold_shadow(draw, margin, base, ln, f_eth, f_lat,
+                              (255, 214, 118, 255) if gold_line else (255, 249, 238, 255))
 
         # brand badge: deep brand colour, gold outline
         b_eth, b_lat = ImageFont.truetype(eth_path, 33), _latin_font(31)
         badge_text = badge or BRANDS["media"]["badge"]
         bw = int(_measure(badge_text, b_eth, b_lat)) + 52
         draw.rounded_rectangle([margin, badge_y, margin + bw, badge_y + badge_h], radius=30,
-                               fill=theme["main"] + (248,), outline=theme["gold"] + (255,), width=2)
+                               fill=theme["main"] + (250,), outline=theme["gold"] + (255,), width=3)
         _draw_mixed(draw, margin + 26, badge_y + 41, badge_text, b_eth, b_lat, (255, 255, 255, 255))
 
         # subtle neutral "Today" tag, right side of the badge row
@@ -1636,18 +1670,18 @@ def compose_card(bg_bytes, headline, badge=None, ai=True, size=1080, brand="medi
         tw = int(t_font.getlength(tag)) + 40
         tx1 = size - margin
         draw.rounded_rectangle([tx1 - tw, badge_y + 6, tx1, badge_y + badge_h - 6], radius=24,
-                               fill=(255, 255, 255, 36), outline=(255, 255, 255, 80), width=1)
-        draw.text((tx1 - tw + 20, badge_y + badge_h // 2 + 9), tag, font=t_font, fill=(236, 236, 236, 235), anchor="ls")
+                               fill=(255, 255, 255, 40), outline=(255, 255, 255, 90), width=1)
+        draw.text((tx1 - tw + 20, badge_y + badge_h // 2 + 9), tag, font=t_font, fill=(240, 240, 240, 240), anchor="ls")
 
         if AI_LABEL and ai:  # the tag is only for generated backgrounds, never for real photos
             a_font = _latin_font(21)
             label = "AI illustration"
             lw = int(a_font.getlength(label)) + 28
-            draw.rounded_rectangle([size - margin - lw + 20, 34, size - 40, 34 + 36], radius=18, fill=(0, 0, 0, 110))
-            draw.text((size - margin - lw + 34, 34 + 26), label, font=a_font, fill=(255, 255, 255, 210), anchor="ls")
+            draw.rounded_rectangle([size - margin - lw + 20, 34, size - 40, 34 + 36], radius=18, fill=(0, 0, 0, 120))
+            draw.text((size - margin - lw + 34, 34 + 26), label, font=a_font, fill=(255, 255, 255, 215), anchor="ls")
 
         out = io.BytesIO()
-        img.convert("RGB").save(out, "JPEG", quality=91, optimize=True)
+        img.save(out, "JPEG", quality=92, optimize=True)
         return out.getvalue()
     except Exception as e:
         log.error("card composition failed: %s", e)
@@ -1840,7 +1874,7 @@ def build_draft(topic, facts=None, sources=None, allow_fallback=True, brand=None
         brief = (NEWS_BRIEF.replace("{topic}", topic)
                  .replace("{brand_note}", BRANDS[brand]["brief_note"])
                  .replace("{facts}", facts or "(none)")
-                 .replace("{mode_note}", UNVERIFIED_NOTE if unverified else "")) + extra
+                 .replace("{mode_note}", UNVERIFIED_NOTE if unverified else "")) + learning_block(brand) + extra
         text, engine = llm_write(brief, system=NEWSROOM_SYSTEM, max_tokens=3000,
                                  temperature=0.5 if attempt == 0 else 0.3, allow_gemini=NEWS_ALLOW_GEMINI,
                                  models=NEWS_WRITER_MODELS)
@@ -1858,10 +1892,10 @@ def build_draft(topic, facts=None, sources=None, allow_fallback=True, brand=None
             break
         extra = "\n\nREWRITE:"
         if longs:
-            extra += " some sentences were longer than 20 words - split them so each has 10-20 words."
+            extra += " some sentences were longer than 26 words - split them (mostly 12-22 words each)."
         if thin:
-            extra += (" the CONTEXT block was too thin - write 3-5 sentences (60-110 words) with the concrete names, "
-                      "numbers, dates and background from the notes.")
+            extra += (" the CONTEXT block was too thin - write 4-6 well-connected sentences (80-130 words) with the "
+                      "concrete names, numbers, dates and background from the notes.")
         extra += " Keep all facts unchanged and keep the grammar perfect."
     if not best:
         log.error("news writer produced nothing (OpenRouter unavailable? NEWS_ALLOW_GEMINI=%s)", NEWS_ALLOW_GEMINI)
@@ -1881,16 +1915,17 @@ def build_draft(topic, facts=None, sources=None, allow_fallback=True, brand=None
             "unverified": unverified, "brand": brand, "pkg": pkg, "facts": facts or "", "bg": bg, "real": bool(real)}
 
 
-def draft_keyboard(did, brand):
+def draft_keyboard(did, brand, swap=True):
     kb = types.InlineKeyboardMarkup()
     kb.add(
         types.InlineKeyboardButton("✅ አጽድቅና ፖስት አድርግ", callback_data=f"ok:{did}"),
         types.InlineKeyboardButton("❌ ሰርዝ", callback_data=f"no:{did}"),
     )
-    kb.add(
-        types.InlineKeyboardButton(f"🎯 {brand_label(brand)}", callback_data="noop"),
-        types.InlineKeyboardButton(f"🔄 ወደ {brand_label(other_brand(brand))} ቀይር", callback_data=f"sw:{did}"),
-    )
+    if swap:
+        kb.add(
+            types.InlineKeyboardButton(f"🎯 {brand_label(brand)}", callback_data="noop"),
+            types.InlineKeyboardButton(f"🔄 ወደ {brand_label(other_brand(brand))} ቀይር", callback_data=f"sw:{did}"),
+        )
     return kb
 
 
@@ -1913,7 +1948,9 @@ def present_draft(chat_id, label, d, header, start=None):
                        "unverified": d.get("unverified", False), "confirmed": False, "brand": brand,
                        "pkg": d.get("pkg") or {}, "facts": d.get("facts", ""), "sources": d.get("sources") or [],
                        "bg": d.get("bg"), "real": d.get("real", False), "photo_msg": photo_msg, "details_msg": None,
-                       "pid": None, "tg": False, "fb": False, "busy": False, "ts": time.time()}
+                       "pid": None, "tg": False, "fb": False, "busy": False, "ts": time.time(),
+                       "topic": draft_topic(d), "fixed": d.get("fixed", False), "learned": False, "fb_post_id": None,
+                       "outlet": ((d.get("sources") or [("", "")])[0][0] if d.get("sources") else "")}
     prune(drafts, 12)
 
     details = [header + f"\n🎯 መድረሻ: {brand_label(brand)}"]
@@ -1922,13 +1959,13 @@ def present_draft(chat_id, label, d, header, start=None):
     if d.get("unverified"):
         details.append("⚠️ ቀጥታ የዜና ፍለጋ አልተሳካም — ይህ ረቂቅ በታወቁ እውነታዎች ላይ ብቻ የተመሠረተ ነው፤ ምንጩ አልተረጋገጠም። "
                        "ከመለጠፍህ በፊት አረጋግጥ (ሲያጸድቅ ሁለተኛ ማረጋገጫ ይጠየቃል)።")
-    if not image:
+    if not image and not d.get("text_only"):
         details.append("⚠️ ምስሉ በዚህ ጊዜ አልተሳካም — ያለ ምስል መለጠፍ ወይም ሰርዘህ እንደገና መጠየቅ ትችላለህ።")
     elif d.get("real"):
         details.append("📷 ምስሉ ከምንጭ ዜናው የተወሰደ እውነተኛ ፎቶ ነው።")
         if not d.get("card"):
             details.append("⚠️ ርዕሱን በፎቶው ላይ ማተም አልተቻለም (Ethiopic font የለም) — ርዕሱ በፖስቱ ጽሑፍ ውስጥ አለ።")
-    elif not d.get("card"):
+    elif image and not d.get("card"):
         details.append("⚠️ ርዕሱን በምስሉ ላይ ማተም አልተቻለም (Ethiopic font የለም) — ርዕሱ በፖስቱ ጽሑፍ ውስጥ አለ። "
                        "NotoSansEthiopic-Bold.ttf ን ከ agent.py ጎን ኮሚት አድርግ።")
     src = format_sources(d.get("sources"), limit=4)
@@ -1939,7 +1976,7 @@ def present_draft(chat_id, label, d, header, start=None):
                    "\nበፌስቡክ ኮመንቶች ላይ ቦቱ ፈጽሞ አይመልስም።")
     if start:
         details.append(took(start))
-    mid = deliver(chat_id, None, "\n\n".join(details), draft_keyboard(did, brand))
+    mid = deliver(chat_id, None, "\n\n".join(details), draft_keyboard(did, brand, swap=not d.get("fixed")))
     with state_lock:
         if did in drafts:
             drafts[did]["details_msg"] = mid
@@ -2059,7 +2096,8 @@ def approve_and_publish(chat_id, msg_id, did):
                 pid = uuid.uuid4().hex[:10]
                 with state_lock:
                     published[pid] = {"chan": chan, "msg_id": mid, "kind": kind, "post": d["post"], "brand": brand,
-                                      "ts": time.time()}
+                                      "ts": time.time(), "topic": d.get("topic"), "headline": d.get("headline"),
+                                      "outlet": d.get("outlet", "")}
                 d["pid"] = pid
                 prune(published, 30)
             except Exception as e:
@@ -2067,7 +2105,7 @@ def approve_and_publish(chat_id, msg_id, did):
                 tg_err = short_reason(e, 200)
         if fb_on and not d["fb"]:
             try:
-                fb_publish(d["post"], d.get("image"), brand)
+                d["fb_post_id"] = fb_publish(d["post"], d.get("image"), brand)
                 d["fb"] = True
                 bot_stats["fb_posts"] += 1
             except FBError as e:
@@ -2085,6 +2123,10 @@ def approve_and_publish(chat_id, msg_id, did):
     else:
         fb_line = f"• Facebook: {b['fb_name']} " + ("✅" if d["fb"] else f"❌ {fb_err or ''}".rstrip())
 
+    if (d["tg"] or d["fb"]) and not d.get("learned"):
+        d["learned"] = True
+        learn_event("approve", d)
+        learn_track(d, fb_post_id=d.get("fb_post_id"))
     if d["tg"] and (d["fb"] or not fb_on):
         with state_lock:
             drafts.pop(did, None)
@@ -2132,11 +2174,445 @@ def edit_published(chat_id, pid, new_text):
             bot.edit_message_caption(new_text, p["chan"], p["msg_id"])
         else:
             bot.edit_message_text(new_text, p["chan"], p["msg_id"], disable_web_page_preview=True)
+        old_text = p.get("post", "")
         p["post"] = new_text
+        if new_text.strip() != old_text.strip():
+            learn_event("edit", p)
+            learn_style_example(new_text)
         bot.send_message(chat_id, f"✅ ፖስቱ በ {p['chan']} ላይ ተስተካክሏል (የ Facebook ፖስት አልተነካም)።",
                          reply_markup=published_keyboard(pid))
     except Exception as e:
         bot.send_message(chat_id, f"❌ ማስተካከል አልተሳካም: {short_reason(e, 160)}")
+
+
+# ----------------------------------------------------------------------------
+# Self-learning memory (agent_learning.json): approvals / cancels / edits + post performance + Henok's own rules
+# ----------------------------------------------------------------------------
+LEARN_FILE = os.environ.get("LEARN_FILE", "").strip() or os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "agent_learning.json")
+_learn_lock = threading.RLock()
+_L = None
+_learn_flags = {"dirty": False, "important": False, "perf_ts": 0.0, "loaded_from_disk": False}
+LEARN_TOPICS = ["economy", "tech", "addis", "diplomacy", "social", "culture", "conflict", "politics", "ethiopian_football",
+                "athletics", "boxing", "womens", "premier", "champions", "transfers", "other"]
+TOPIC_AM = {"economy": "ኢኮኖሚ", "tech": "ቴክኖሎጂ", "addis": "አዲስ አበባ/መሠረተ ልማት", "diplomacy": "ዲፕሎማሲ", "social": "ማህበራዊ ሚዲያ",
+            "culture": "ባህል", "conflict": "ግጭት", "politics": "ፖለቲካ", "ethiopian_football": "የኢትዮጵያ እግር ኳስ",
+            "athletics": "አትሌቲክስ", "boxing": "ቦክስ", "womens": "የሴቶች ስፖርት", "premier": "ፕሪሚየር ሊግ",
+            "champions": "ቻምፒየንስ ሊግ", "transfers": "ዝውውር", "other": "ሌላ"}
+
+
+def _learn_default():
+    return {"version": 1, "updated": 0, "rules": [], "events": [], "pending": [], "perf": {}, "boosts": {},
+            "favorites": [], "style": [], "winners": [], "backup": {"msg_id": None, "ts": 0}}
+
+
+def _learn_paths():
+    return [LEARN_FILE, os.path.join(tempfile.gettempdir(), "agent_learning.json")]
+
+
+def learn_load():
+    global _L
+    with _learn_lock:
+        if _L is not None:
+            return _L
+        _L = _learn_default()
+        for path in _learn_paths():
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    js = json.load(f)
+                if isinstance(js, dict):
+                    _L.update(js)
+                    _learn_flags["loaded_from_disk"] = True
+                    break
+            except Exception:
+                continue
+        return _L
+
+
+def learn_save():
+    with _learn_lock:
+        L = learn_load()
+        L["updated"] = time.time()
+        payload = json.dumps(L, ensure_ascii=False)
+        for path in _learn_paths():
+            try:
+                tmp = path + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as f:
+                    f.write(payload)
+                os.replace(tmp, path)
+                _learn_flags["dirty"] = False
+                return True
+            except Exception as e:
+                log.info("learning file not saved at %s: %s", path, e)
+        return False
+
+
+def learn_touch(important=False):
+    _learn_flags["dirty"] = True
+    if important:
+        _learn_flags["important"] = True
+
+
+def draft_topic(d):
+    """Topic key of a draft/story: explicit `topic`, else keyword classification (news or sport vocabulary)."""
+    if d.get("topic"):
+        return d["topic"]
+    text = f"{d.get('headline', '')} {_para((d.get('pkg') or {}).get('lead'))}"
+    return classify_sport_topic(text) if d.get("brand") == "sport" else classify_topic(text)
+
+
+def learn_event(action, d):
+    """action: approve | cancel | edit | switch. `d` = draft or published record (brand, headline, topic, outlet)."""
+    try:
+        with _learn_lock:
+            L = learn_load()
+            L["events"].append({"ts": time.time(), "brand": d.get("brand", "media"), "action": action,
+                                "topic": draft_topic(d), "outlet": d.get("outlet", ""),
+                                "headline": (d.get("headline") or "")[:90]})
+            del L["events"][:-400]
+        learn_touch()
+    except Exception as e:
+        log.info("learn_event failed: %s", e)
+
+
+def learn_style_example(text):
+    """Remember how Henok words things when he edits a published post (last 4 examples)."""
+    text = re.sub(r"\s+", " ", text or "").strip()
+    if len(text) < 40:
+        return
+    with _learn_lock:
+        L = learn_load()
+        L["style"].append(text[:260])
+        del L["style"][:-4]
+    learn_touch()
+
+
+def learn_weights(brand):
+    """topic -> weight (1.0 = neutral, 0.3..2.5): recent approvals / cancels (21-day half-life), measured post
+    performance and Henok's explicit 'more / less' rules."""
+    now = time.time()
+    with _learn_lock:
+        L = learn_load()
+        events, boosts = list(L["events"]), dict(L["boosts"])
+        perf = json.loads(json.dumps(L["perf"].get(brand, {})))
+    w = {}
+    for e in events:
+        if e.get("brand") != brand:
+            continue
+        delta = {"approve": 0.25, "cancel": -0.25, "edit": 0.05, "switch": -0.1}.get(e.get("action"), 0)
+        decay = 0.5 ** (((now - e.get("ts", now)) / 86400) / 21)
+        w[e["topic"]] = w.get(e["topic"], 1.0) + delta * decay
+    avgs = {t: p["score"] / p["n"] for t, p in perf.items() if p.get("n", 0) >= 2}
+    if len(avgs) >= 2:
+        mean = sum(avgs.values()) / len(avgs)
+        if mean > 0:
+            for t, a in avgs.items():
+                w[t] = w.get(t, 1.0) + 0.4 * (min(a / mean, 2.5) - 1)
+    for t, b in boosts.items():
+        w[t] = w.get(t, 1.0) + b
+    return {t: max(0.3, min(2.5, v)) for t, v in w.items()}
+
+
+def topic_weight(brand, topic):
+    return learn_weights(brand).get(topic, 1.0)
+
+
+def learn_favorites():
+    with _learn_lock:
+        return list(learn_load().get("favorites", []))
+
+
+def learning_block(brand):
+    """Text appended to the writer prompts: standing rules, winning topics / headlines, Henok's own wording."""
+    try:
+        with _learn_lock:
+            L = learn_load()
+            rules = [r["rule"] for r in L["rules"]][-12:]
+            winners = list(L["winners"])[:4]
+            style = list(L["style"])[-3:]
+        w = learn_weights(brand)
+        lines = []
+        if rules:
+            lines.append("HENOK'S STANDING EDITORIAL RULES (obey strictly):\n" + "\n".join("- " + r for r in rules))
+        good = [TOPIC_AM.get(t, t) for t, v in sorted(w.items(), key=lambda x: -x[1]) if v >= 1.2][:3]
+        bad = [TOPIC_AM.get(t, t) for t, v in sorted(w.items(), key=lambda x: x[1]) if v <= 0.8][:3]
+        if good:
+            lines.append("Topics Henok approves / that perform best: " + ", ".join(good) + ".")
+        if bad:
+            lines.append("Topics he usually cancels (be extra selective): " + ", ".join(bad) + ".")
+        win = [x["headline"] for x in winners if x.get("brand") == brand]
+        if win:
+            lines.append("Best-performing recent headlines (match their angle and clarity, never copy):\n" +
+                         "\n".join("- " + h for h in win))
+        if style:
+            lines.append("Henok's own edits show his preferred wording (imitate this tone):\n" + "\n".join("- " + x for x in style))
+        return ("\n\n" + "\n".join(lines))[:1800] if lines else ""
+    except Exception as e:
+        log.info("learning_block failed: %s", e)
+        return ""
+
+
+def learning_scan_note(brand):
+    """Short steering text for the story scan (rules + favoured topics)."""
+    with _learn_lock:
+        rules = [r["rule"] for r in learn_load()["rules"]][-6:]
+    w = learn_weights(brand)
+    good = [t for t, v in sorted(w.items(), key=lambda x: -x[1]) if v >= 1.2][:3]
+    parts = []
+    if rules:
+        parts.append("Owner's standing rules: " + "; ".join(rules) + ".")
+    if good:
+        parts.append("Prefer these topics: " + ", ".join(good) + ".")
+    return " ".join(parts)
+
+
+def choose_desk(brand, wheel_topic, topics):
+    """Rotation stays balanced, but learned weights tilt the next desk toward what Henok approves and what performs."""
+    w = learn_weights(brand)
+    weights = [max(0.15, w.get(t, 1.0)) * (2.2 if t == wheel_topic else 1.0) for t in topics]
+    return random.choices(list(topics), weights=weights, k=1)[0]
+
+
+def learn_summary_facts():
+    """Facts for the /analytics growth note."""
+    cutoff = time.time() - 30 * 86400
+    with _learn_lock:
+        L = learn_load()
+        ev = [e for e in L["events"] if e.get("ts", 0) >= cutoff]
+        winners = list(L["winners"])[:3]
+    if not ev and not winners:
+        return ""
+    ap, ca = sum(1 for e in ev if e["action"] == "approve"), sum(1 for e in ev if e["action"] == "cancel")
+    cnt = {}
+    for e in ev:
+        if e["action"] == "approve":
+            cnt[e["topic"]] = cnt.get(e["topic"], 0) + 1
+    top = ", ".join(f"{TOPIC_AM.get(t, t)} ({n})" for t, n in sorted(cnt.items(), key=lambda x: -x[1])[:3])
+    out = f"Henok's drafts in the last 30 days: {ap} approved, {ca} cancelled" + (f"; most approved topics: {top}" if top else "")
+    if winners:
+        out += "; best-performing posts: " + "; ".join(f"«{x['headline']}» score {x['score']:.0f}" for x in winners)
+    return out
+
+
+# ---- performance tracking (Facebook post counters, YouTube views) -------------------------------------------------
+def learn_track(d, fb_post_id=None, yt_id=None):
+    with _learn_lock:
+        L = learn_load()
+        L["pending"].append({"brand": d.get("brand", "media"), "topic": draft_topic(d), "headline": (d.get("headline") or "")[:90],
+                             "fb": fb_post_id, "yt": yt_id, "ts": time.time(), "done": False})
+        del L["pending"][:-60]
+    learn_touch()
+
+
+def _fb_post_score(brand, post_id):
+    js = _fb_request("GET", post_id, params={
+        "fields": "reactions.summary(total_count).limit(0),comments.summary(total_count).limit(0),shares"},
+        timeout=40, brand=brand)
+    react = ((js.get("reactions") or {}).get("summary") or {}).get("total_count", 0) or 0
+    comm = ((js.get("comments") or {}).get("summary") or {}).get("total_count", 0) or 0
+    shares = (js.get("shares") or {}).get("count", 0) or 0
+    views = 0
+    try:
+        ins = _fb_request("GET", f"{post_id}/insights", params={"metric": "post_media_view"}, timeout=40, brand=brand)
+        views = (ins.get("data") or [{}])[0].get("values", [{}])[0].get("value", 0) or 0
+    except Exception:
+        pass
+    return react + 3 * comm + 4 * shares + (views / 200.0 if isinstance(views, (int, float)) else 0)
+
+
+def learn_collect_performance():
+    """Measure published posts that are 6h-14d old; feed the per-topic averages and the 'winners' list."""
+    now = time.time()
+    with _learn_lock:
+        todo = [p for p in learn_load()["pending"] if not p["done"] and 6 * 3600 <= now - p["ts"] <= 14 * 86400]
+    for p in todo:
+        score = None
+        try:
+            if p.get("fb") and fb_enabled(p["brand"]):
+                score = _fb_post_score(p["brand"], p["fb"])
+            elif p.get("yt") and yt_enabled():
+                v = _yt_get("videos", {"part": "statistics", "id": p["yt"]}, 0).get("items", [{}])[0].get("statistics", {})
+                score = int(v.get("viewCount", 0)) / 50 + 2 * int(v.get("likeCount", 0)) + 4 * int(v.get("commentCount", 0))
+        except Exception as e:
+            log.info("performance check failed: %s", short_reason(e, 100))
+            continue
+        if score is None:
+            continue
+        with _learn_lock:
+            L = learn_load()
+            t = L["perf"].setdefault(p["brand"], {}).setdefault(p["topic"], {"n": 0, "score": 0.0})
+            t["n"] += 1
+            t["score"] += float(score)
+            p["done"], p["score"] = True, float(score)
+            L["winners"].append({"brand": p["brand"], "topic": p["topic"], "headline": p["headline"], "score": float(score)})
+            L["winners"] = sorted(L["winners"], key=lambda x: -x["score"])[:10]
+        learn_touch()
+    _learn_flags["perf_ts"] = now
+
+
+# ---- standing rules typed in natural language ---------------------------------------------------------------------
+RULE_TRIGGERS = ["ከዛሬ ጀምሮ", "ከአሁን ጀምሮ", "ከአሁን በኋላ", "ለወደፊት", "ከዚህ በኋላ", "ህግ:", "ሕግ:", "ህግ፦", "rule:", "from now on"]
+_MORE = ["አብዛ", "ጨምር", "ተጨማሪ", "ቅድሚያ", "አበዛ", "more", "increase", "prioritize", "prioritise", "focus on", "follow"]
+_LESS = ["ቀንስ", "አቁም", "አታድርግ", "ያነሰ", "አትጻፍ", "አትለጥፍ", "less", "stop", "avoid", "no more", "don't", "never"]
+RULE_PARSE_PROMPT = (
+    "Convert Henok's editorial instruction for his news bot (Amharic or English) into ONE JSON object and nothing else: "
+    '{"rule": "<one clear English directive, max 25 words>", "topic": "<one of ' + ", ".join(LEARN_TOPICS) +
+    ' or null>", "direction": "<more|less|null>", "team": "<football club in English or null>"}.\n'
+    "Instruction: "
+)
+
+
+def learn_add_rule(text):
+    text = re.sub(r"\s+", " ", text or "").strip()
+    rule, topic, direction, team = text, None, None, None
+    raw, _ = llm_write(RULE_PARSE_PROMPT + text, max_tokens=300, temperature=0.1, models=NEWS_WRITER_MODELS)
+    try:
+        m = re.search(r"\{.*\}", raw or "", re.S)
+        js = json.loads(m.group(0)) if m else {}
+        rule = str(js.get("rule") or text)[:220]
+        topic = js.get("topic") if js.get("topic") in LEARN_TOPICS else None
+        direction = js.get("direction") if js.get("direction") in ("more", "less") else None
+        team = (js.get("team") or None)
+    except Exception:
+        pass
+    low = text.lower()
+    if not direction:
+        direction = "more" if any(w in low for w in _MORE) else ("less" if any(w in low for w in _LESS) else None)
+    if not topic:
+        t = classify_topic(text)
+        topic = t if t != "other" else (classify_sport_topic(text) if classify_sport_topic(text) != "other" else None)
+    if not team:
+        known = [t for t in DEFAULT_FAVORITES + [k.title() for k in TEAM_AM] if t.lower() in low]
+        team = known[0] if known else None
+    rid = uuid.uuid4().hex[:6]
+    with _learn_lock:
+        L = learn_load()
+        L["rules"].append({"id": rid, "text": text[:300], "rule": rule, "topic": topic, "direction": direction,
+                           "team": team, "ts": time.time()})
+        del L["rules"][:-25]
+        if topic and direction:
+            L["boosts"][topic] = max(-0.7, min(1.5, L["boosts"].get(topic, 0.0) + (0.5 if direction == "more" else -0.5)))
+        if team and direction != "less" and team not in L["favorites"]:
+            L["favorites"].append(str(team)[:40])
+            del L["favorites"][:-15]
+    learn_touch(important=True)
+    return {"id": rid, "rule": rule, "topic": topic, "direction": direction, "team": team}
+
+
+def learn_delete_rule(rid):
+    with _learn_lock:
+        L = learn_load()
+        r = next((x for x in L["rules"] if x["id"] == rid), None)
+        if not r:
+            return False
+        L["rules"].remove(r)
+        if r.get("topic") and r.get("direction"):
+            L["boosts"][r["topic"]] = L["boosts"].get(r["topic"], 0.0) - (0.5 if r["direction"] == "more" else -0.5)
+            if abs(L["boosts"][r["topic"]]) < 0.05:
+                L["boosts"].pop(r["topic"], None)
+    learn_touch(important=True)
+    return True
+
+
+def learn_rules_message():
+    with _learn_lock:
+        L = learn_load()
+        rules, favs = list(L["rules"]), list(L["favorites"])
+        n_ev = len(L["events"])
+    lines = ["🧠 የሄኖክ ቋሚ የአርትኦት ህጎች (ያለ ኮድ ማስተካከያ):"]
+    lines += [f"{i}. {r['text'][:120]}" for i, r in enumerate(rules, 1)] or ["(ገና ምንም ህግ የለም)"]
+    if favs:
+        lines.append("\n⚽ የምከታተላቸው ክለቦች: " + ", ".join(favs))
+    for brand in ("media", "sport"):
+        w = learn_weights(brand)
+        if w:
+            up = [TOPIC_AM.get(t, t) for t, v in sorted(w.items(), key=lambda x: -x[1]) if v >= 1.15][:3]
+            dn = [TOPIC_AM.get(t, t) for t, v in sorted(w.items(), key=lambda x: x[1]) if v <= 0.85][:3]
+            if up or dn:
+                lines.append(f"{BRANDS[brand]['emoji']} " + (f"የሚወደዱ: {', '.join(up)}  " if up else "") + (f"የሚቀነሱ: {', '.join(dn)}" if dn else ""))
+    lines.append(f"\n📚 የተመዘገቡ ውሳኔዎች (✅/❌/✏️): {n_ev}")
+    lines.append("\n➕ አዲስ ህግ ለመጨመር በቀጥታ ጻፍ: «ከዛሬ ጀምሮ የኢኮኖሚ ዜና አብዛ» ወይም /rules add <ህግ>")
+    kb = types.InlineKeyboardMarkup(row_width=4)
+    btns = [types.InlineKeyboardButton(f"🗑 {i}", callback_data=f"rl:{r['id']}") for i, r in enumerate(rules, 1)]
+    for i in range(0, len(btns), 4):
+        kb.add(*btns[i:i + 4])
+    return "\n".join(lines), (kb if btns else None)
+
+
+# ---- survive Render restarts: pinned Telegram backup of the learning file -----------------------------------------
+def learn_backup():
+    try:
+        with _learn_lock:
+            L = learn_load()
+            L["updated"] = time.time()
+            data = json.dumps(L, ensure_ascii=False).encode("utf-8")
+            old = (L.get("backup") or {}).get("msg_id")
+        f = io.BytesIO(data)
+        f.name = "agent_learning.json"
+        m = bot.send_document(OWNER_ID, f, caption="🧠 የራስ-ትምህርት ማህደረ ትውስታ backup — አታጥፋው (ቦቱ ሲጀምር ከዚህ ይመልሳል)",
+                              disable_notification=True)
+        try:
+            bot.pin_chat_message(OWNER_ID, m.message_id, disable_notification=True)
+        except Exception as e:
+            log.info("backup pin failed: %s", short_reason(e, 80))
+        if old:
+            try:
+                bot.delete_message(OWNER_ID, old)
+            except Exception:
+                pass
+        with _learn_lock:
+            learn_load()["backup"] = {"msg_id": m.message_id, "ts": time.time()}
+        _learn_flags["important"] = False
+        learn_save()
+        log.info("learning backup sent (%d bytes)", len(data))
+    except Exception as e:
+        log.info("learning backup failed: %s", short_reason(e, 120))
+
+
+def learn_restore():
+    """After a restart the local file may be gone: pull the pinned backup document from Henok's DM."""
+    try:
+        learn_load()
+        local_ts = learn_load().get("updated", 0) if _learn_flags["loaded_from_disk"] else 0
+        pm = getattr(bot.get_chat(OWNER_ID), "pinned_message", None)
+        doc = getattr(pm, "document", None)
+        if not doc or doc.file_name != "agent_learning.json":
+            return
+        raw = bot.download_file(bot.get_file(doc.file_id).file_path)
+        js = json.loads(raw.decode("utf-8"))
+        if isinstance(js, dict) and js.get("updated", 0) > local_ts:
+            with _learn_lock:
+                global _L
+                base = _learn_default()
+                base.update(js)
+                base["backup"] = {"msg_id": pm.message_id, "ts": js.get("updated", 0)}
+                _L = base
+            learn_save()
+            log.info("learning memory restored from the pinned Telegram backup (%d rules)", len(js.get("rules", [])))
+    except Exception as e:
+        log.info("learning restore skipped: %s", short_reason(e, 100))
+
+
+def learn_worker():
+    learn_restore()
+    last_backup = time.time()
+    while True:
+        time.sleep(600)
+        try:
+            if _learn_flags["dirty"]:
+                learn_save()
+            if time.time() - _learn_flags["perf_ts"] > 3 * 3600:
+                learn_collect_performance()
+            if _learn_flags["important"] or (_learn_flags["dirty"] and time.time() - last_backup > 12 * 3600):
+                learn_backup()
+                last_backup = time.time()
+        except Exception as e:
+            log.warning("learn worker error: %s", e)
+
+
+def start_learning():
+    learn_load()
+    threading.Thread(target=learn_worker, daemon=True, name="learning").start()
 
 
 # ----------------------------------------------------------------------------
@@ -2153,10 +2629,8 @@ HUNT_FOCUS = {
               "creator trends (e.g. the TikTok Creative Awards) and culture - plus major international developments "
               "that matter to Ethiopians (Horn of Africa, global economy, crypto markets). Conflict / security news "
               "only when it is truly major, and never more than one such story"),
-    "sport": ("Football and sport news and LIVE results: Ethiopian Premier League, English Premier League, Champions "
-              "League, European leagues, transfer news (ዝውውሮች, e.g. confirmed deals by Fabrizio Romano), Olympics. "
-              "Include goals from matches played in the last hours: scorer, minute, scoreline and teams "
-              "(e.g. Arsenal vs Man Utd) - give a decisive goal in a big match importance 9"),
+    "sport": ("Football and sport that Ethiopian fans care about, with LIVE results and goals from matches played in the "
+              "last hours (scorer, minute, scoreline, teams); a decisive goal in a big match = importance 9"),
 }
 
 PRIORITY_TOPICS = ("economy", "tech", "addis", "diplomacy", "social", "culture")
@@ -2203,6 +2677,48 @@ def classify_topic(text):
     return next(k for k in order if scores.get(k) == best)
 
 
+SPORT_DESKS = {
+    "premier": "English Premier League: results, goals, injuries, managers and transfer-window news with Ethiopian fan interest",
+    "champions": "UEFA Champions League and the big European leagues (La Liga, Serie A, Bundesliga, Ligue 1): results, goals, stars",
+    "transfers": "Confirmed football transfers and contract news (Fabrizio Romano style 'here we go' deals)",
+    "ethiopian_football": ("Ethiopian football: Ethiopian Premier League, Saint George (ቅዱስ ጊዮርጊስ), Ethiopia Bunna, the Walia Ibex "
+                           "national team, CAF qualifiers, Ethiopian players abroad"),
+    "athletics": ("Ethiopian athletics and running (ሩጫ): marathons, Diamond League, World Athletics, Olympic and world "
+                  "championship results of Ethiopian runners, new records"),
+    "boxing": "Boxing (ቦክስ): major fights and results, heavyweight scene, East-African boxers",
+    "womens": "Women's sports (የሴቶች ስፖርት): Women's Super League, women's Champions League, Ethiopian women athletes and footballers",
+}
+SPORT_WHEEL = ["premier", "ethiopian_football", "athletics", "champions", "womens", "boxing", "transfers", "ethiopian_football",
+               "premier", "athletics"]
+_wheel["sport"] = 0
+offer_log = []            # [(ts, brand)] of drafts the hunters pushed (fairness between the two brands)
+none_streak = {"media": 0, "sport": 0}
+_SPORT_WORDS = {
+    "ethiopian_football": ["ethiopian premier league", "ethiopia national", "walia", "saint george", "st george", "ethiopia bunna",
+                           "ethiopian football", "ethiopian players", "ቅዱስ ጊዮርጊስ", "ኢትዮጵያ ቡና", "ብሔራዊ ቡድን", "ዋልያ", "የኢትዮጵያ ፕሪሚየር"],
+    "athletics": ["athletics", "marathon", "diamond league", "world athletics", "olympic", "10,000m", "5,000m", "half marathon",
+                  "sprint", "ሩጫ", "አትሌት", "ማራቶን", "ዳይመንድ ሊግ", "አትሌቲክስ"],
+    "boxing": ["boxing", "boxer", "heavyweight", "knockout", "title fight", "ቦክስ"],
+    "womens": ["women's", "womens", "wsl", "lionesses", "female", "women football", "ሴቶች", "የሴቶች"],
+    "transfers": ["transfer", "signing", "signs", "here we go", "contract", "loan deal", "bid ", "ዝውውር", "ፈረመ", "ኮንትራት"],
+    "champions": ["champions league", "uefa", "europa league", "la liga", "serie a", "bundesliga", "ligue 1", "real madrid",
+                  "barcelona", "bayern", "ቻምፒየንስ ሊግ", "ላ ሊጋ", "ሴሪኤ", "ቡንደስሊጋ"],
+    "premier": ["premier league", "arsenal", "chelsea", "liverpool", "manchester", "tottenham", "newcastle", "aston villa", "epl",
+                "ፕሪሚየር ሊግ", "አርሰናል", "ቼልሲ", "ሊቨርፑል", "ማንቸስተር"],
+}
+
+
+def classify_sport_topic(text):
+    """Sport desk of a story: ethiopian_football | athletics | boxing | womens | transfers | champions | premier | other."""
+    low = " " + (text or "").lower() + " "
+    scores = {k: sum(1 for w in ws if w in low) for k, ws in _SPORT_WORDS.items()}
+    best = max(scores.values())
+    if best == 0:
+        return "other"
+    order = ["ethiopian_football", "athletics", "boxing", "womens", "transfers", "champions", "premier"]
+    return next(k for k in order if scores.get(k) == best)
+
+
 hunt_locks = {"media": threading.Lock(), "sport": threading.Lock()}
 hunt_daily = {"media": {"date": "", "count": 0}, "sport": {"date": "", "count": 0}}
 recent_outlets = {"media": [], "sport": []}   # primary outlet of the last offered stories (source rotation)
@@ -2228,7 +2744,10 @@ DEFAULT_FEEDS = {
         "BBC Sport|https://feeds.bbci.co.uk/sport/football/rss.xml,"
         "Sky Sports|https://www.skysports.com/rss/12040,"
         "The Guardian|https://www.theguardian.com/football/rss,"
-        "ESPN FC|https://www.espn.com/espn/rss/soccer/news"
+        "ESPN FC|https://www.espn.com/espn/rss/soccer/news,"
+        "BBC Athletics|https://feeds.bbci.co.uk/sport/athletics/rss.xml,"
+        "BBC Boxing|https://feeds.bbci.co.uk/sport/boxing/rss.xml,"
+        "BBC Women's Football|https://feeds.bbci.co.uk/sport/football/womens/rss.xml"
     ),
 }
 
@@ -2432,17 +2951,19 @@ def _outlet_key(story):
 
 def pick_story(fresh, brand, desk=None, strict=False):
     """Source + topic balancing. Media rules: BBC at most 1 of every 4 offered stories, conflict at most 1 of every 4,
-    never the same outlet as the last two stories, and priority topics (economy, tech, Addis & infrastructure,
-    diplomacy, social/creator trends, culture) first - the `desk` topic of the current scan wins when available."""
+    never the same outlet as the last two stories, priority topics first, the scan's `desk` first of all, and Henok's
+    learned topic weights as a tie-breaker. Sport: the scan's desk (Ethiopian football, athletics, boxing, women's
+    sport, Premier League, Champions League, transfers) and no same-topic repeat when avoidable."""
     recent_o = recent_outlets[brand][-2:]
     window = recent_picks[brand][-(BALANCE_WINDOW - 1):]
     bbc_used = any(r["outlet"] == "bbc" for r in window)
     conflict_used = any(r["topic"] == "conflict" for r in window)
+    wmap = learn_weights(brand)
+    classify = classify_topic if brand == "media" else classify_sport_topic
+    last_topic = recent_picks[brand][-1]["topic"] if recent_picks[brand] else None
 
     def info(st):
-        outlet = _outlet_key(st)
-        topic = classify_topic(f"{st.get('title', '')} {st.get('summary', '')}")
-        return outlet, topic
+        return _outlet_key(st), classify(f"{st.get('title', '')} {st.get('summary', '')}")
 
     def allowed(st):
         outlet, topic = info(st)
@@ -2462,10 +2983,11 @@ def pick_story(fresh, brand, desk=None, strict=False):
 
     def rank(st):
         outlet, topic = info(st)
+        learned = -wmap.get(topic, 1.0)
         if brand != "media":
-            return (0, -st.get("importance", 0))
-        return (0 if topic == desk else (1 if topic in PRIORITY_TOPICS else (2 if topic in ("other", "politics") else 3)),
-                1 if outlet == "bbc" else 0, -st.get("importance", 0))
+            return (0 if topic == desk else 1, 1 if topic == last_topic else 0, learned, -st.get("importance", 0))
+        tier = 0 if topic == desk else (1 if topic in PRIORITY_TOPICS else (2 if topic in ("other", "politics") else 3))
+        return (tier, 1 if outlet == "bbc" else 0, learned, -st.get("importance", 0))
 
     chosen = sorted(pool, key=rank)[0]
     outlet, topic = info(chosen)
@@ -2492,17 +3014,29 @@ def hunt_once(manual=False, min_importance=None, brand="media"):
         daily = hunt_daily[brand]
         if daily["date"] != today:
             daily.update(date=today, count=0)
-        cap = int(os.environ.get("HUNT_MAX_PER_DAY", "20") if brand == "media"
-                  else os.environ.get("HUNT_SPORT_MAX_PER_DAY", "25"))
+        cap = int(os.environ.get("HUNT_MAX_PER_DAY", "24") if brand == "media"
+                  else os.environ.get("HUNT_SPORT_MAX_PER_DAY", "16"))
         if not manual and daily["count"] >= cap:
             return "cap"
         threshold = min_importance if min_importance is not None else int(os.environ.get("HUNT_MIN_IMPORTANCE", "5"))
+        recent_b = [b for _, b in offer_log[-3:]]
+        if not manual and brand == "sport" and len(recent_b) == 3 and all(b == "sport" for b in recent_b):
+            return "wait"  # fairness: never let Sport starve Media - Media gets the next slot
         focus, desk = HUNT_FOCUS[brand], None
-        if brand == "media":  # rotating priority desk so every scan leans to a different topic (no conflict loop)
-            desk = TOPIC_WHEEL[_wheel["media"] % len(TOPIC_WHEEL)]
+        if brand == "media":  # rotating priority desk (tilted by what Henok approves) so every scan leans elsewhere
+            wheel_topic = TOPIC_WHEEL[_wheel["media"] % len(TOPIC_WHEEL)]
             _wheel["media"] += 1
+            desk = choose_desk("media", wheel_topic, PRIORITY_TOPICS)
             focus = ("PRIORITY DESK FOR THIS SCAN: " + TOPIC_DESK[desk] + ". Return at least 3 stories from this desk or "
                      "the other priority topics. " + focus)
+        else:  # sport desks: Ethiopian football, athletics, boxing, women's sport, Premier League, Champions League...
+            wheel_topic = SPORT_WHEEL[_wheel["sport"] % len(SPORT_WHEEL)]
+            _wheel["sport"] += 1
+            desk = choose_desk("sport", wheel_topic, list(SPORT_DESKS))
+            focus = "DESK FOR THIS SCAN: " + SPORT_DESKS[desk] + ". Also include other top sport news. " + focus
+        note = learning_scan_note(brand)
+        if note:
+            focus += " " + note
         feed_items = fetch_feed_items(brand, max_age_hours=24, per_feed=5)
         feeds_txt = feed_items_text(feed_items)
 
@@ -2523,11 +3057,14 @@ def hunt_once(manual=False, min_importance=None, brand="media"):
         if not fresh and manual and stories:
             fresh = stories  # manual request: show the top story even if it was offered before
         if not fresh:
+            none_streak[brand] += 1
             return "none"
 
-        story = pick_story(fresh, brand, desk, strict=not manual)
+        story = pick_story(fresh, brand, desk, strict=not (manual or none_streak[brand] >= 2))
         if story is None:
+            none_streak[brand] += 1
             return "none"
+        none_streak[brand] = 0
         mark_seen(f"{story['title']} {story['summary']}")
         start = time.time()
         topic = f"{story['title']}. {story['summary']}"
@@ -2543,6 +3080,8 @@ def hunt_once(manual=False, min_importance=None, brand="media"):
         present_draft(OWNER_ID, "ሰበር ዜና", d, HUNT_HEADERS[brand], start)
         daily["count"] += 1
         bot_stats["breaking"] += 1
+        offer_log.append((time.time(), brand))
+        del offer_log[:-12]
         return "sent"
     except Exception as e:
         log.error("hunt failed (%s): %s", brand, e)
@@ -2560,7 +3099,7 @@ def hunter_loop(brand):
                 log.info("hunt %s: %s", brand, hunt_once(brand=brand))
         except Exception as e:
             log.error("hunter loop error (%s): %s", brand, e)
-        time.sleep(max(5, int(os.environ.get(interval_env, "45" if brand == "media" else "30"))) * 60)
+        time.sleep(max(5, int(os.environ.get(interval_env, "30" if brand == "media" else "40"))) * 60)
 
 
 def start_hunter():
@@ -2570,8 +3109,585 @@ def start_hunter():
     if os.environ.get("HUNTER_SPORT_ENABLED", "1") != "0":
         threading.Thread(target=hunter_loop, args=("sport",), daemon=True, name="hunter-sport").start()
     log.info("Hunters started (media every %s min, sport every %s min, quiet hours %s Addis time)",
-             os.environ.get("HUNT_INTERVAL_MIN", "45"), os.environ.get("HUNT_SPORT_INTERVAL_MIN", "30"),
+             os.environ.get("HUNT_INTERVAL_MIN", "30"), os.environ.get("HUNT_SPORT_INTERVAL_MIN", "40"),
              os.environ.get("HUNT_QUIET", "23-6") or "off")
+
+
+# ----------------------------------------------------------------------------
+# Ethiopian-fan Sports Engine (ሰከላ ስፖርት): matchday schedules, pre-match alerts, live goals, HT / FT results
+# (ESPN public scoreboards, no key) + 60-second highlight video drafts. EVERYTHING goes to Henok as a draft first.
+# ----------------------------------------------------------------------------
+ESPN_LEAGUES = {"eng.1": "Premier League", "uefa.champions": "Champions League", "uefa.europa": "Europa League",
+                "esp.1": "La Liga", "ita.1": "Serie A", "ger.1": "Bundesliga", "fra.1": "Ligue 1"}
+LEAGUE_AM = {"eng.1": "ፕሪሚየር ሊግ", "uefa.champions": "ቻምፒየንስ ሊግ", "uefa.europa": "ዩሮፓ ሊግ", "esp.1": "ላ ሊጋ",
+             "ita.1": "ሴሪኤ", "ger.1": "ቡንደስሊጋ", "fra.1": "ሊግ 1"}
+LEAGUE_TAGS = {"eng.1": "#PremierLeague #ፕሪሚየርሊግ", "uefa.champions": "#ChampionsLeague #ቻምፒየንስሊግ",
+               "uefa.europa": "#EuropaLeague", "esp.1": "#LaLiga #ላሊጋ", "ita.1": "#SerieA #ሴሪኤ",
+               "ger.1": "#Bundesliga", "fra.1": "#Ligue1"}
+TEAM_AM = {"manchester united": "ማንቸስተር ዩናይትድ", "manchester city": "ማንቸስተር ሲቲ", "arsenal": "አርሰናል", "chelsea": "ቼልሲ",
+           "liverpool": "ሊቨርፑል", "tottenham": "ቶተንሃም", "newcastle": "ኒውካስል", "aston villa": "አስቶን ቪላ",
+           "everton": "ኤቨርተን", "west ham": "ዌስትሃም", "brighton": "ብራይተን", "barcelona": "ባርሴሎና", "real madrid": "ሪያል ማድሪድ",
+           "atletico": "አትሌቲኮ ማድሪድ", "bayern": "ባየርን ሙኒክ", "dortmund": "ቦሩሲያ ዶርትሙንድ", "paris saint": "ፓሪስ ሴንት ዠርሜን",
+           "juventus": "ጁቬንቱስ", "inter": "ኢንተር ሚላን", "milan": "ኤሲ ሚላን", "napoli": "ናፖሊ", "roma": "ሮማ"}
+DEFAULT_FAVORITES = ["Arsenal", "Chelsea", "Liverpool", "Manchester United", "Manchester City", "Tottenham", "Newcastle",
+                     "Barcelona", "Real Madrid", "Bayern", "Paris Saint", "Juventus", "Inter", "Milan", "Atletico", "Dortmund"]
+WEEKDAY_AM = ["ሰኞ", "ማክሰኞ", "ረቡዕ", "ሐሙስ", "ዓርብ", "ቅዳሜ", "እሁድ"]
+_sport_state = {}                     # match id -> {"hs","as","goals","pre","ht","ft"}
+_sport_sent = set()
+_sport_sched = {"ts": 0.0, "matches": []}
+_sport_daily = {"date": "", "count": 0}
+_UA = {"User-Agent": "Mozilla/5.0 SekelaSportBot"}
+
+
+def team_am(name):
+    low = (name or "").lower()
+    for k, v in TEAM_AM.items():
+        if k in low:
+            return v
+    return name
+
+
+def fmt_eat(dt_utc):
+    """Kick-off time in East Africa Time (UTC+3), 12-hour clock with the Amharic part of the day."""
+    t = dt_utc.astimezone(timezone(timedelta(hours=3)))
+    h = t.hour
+    part = "ሌሊት" if h < 6 else ("ጠዋት" if h < 12 else ("ቀን" if h < 18 else "ምሽት"))
+    h12 = h % 12 or 12
+    return f"{part} {h12}:{t.minute:02d}"
+
+
+def sport_leagues():
+    raw = os.environ.get("SPORT_LEAGUES", "")
+    keys = [x.strip() for x in raw.split(",") if x.strip()] or list(ESPN_LEAGUES)
+    return keys
+
+
+def espn_scoreboard(league, dates=None):
+    """Normalised matches of one league (ESPN public scoreboard JSON). [] on any failure."""
+    try:
+        r = requests.get(f"https://site.api.espn.com/apis/site/v2/sports/soccer/{league}/scoreboard",
+                         params={"dates": dates} if dates else None, headers=_UA, timeout=20)
+        if r.status_code != 200:
+            log.info("ESPN %s HTTP %s", league, r.status_code)
+            return []
+        out = []
+        for ev in r.json().get("events", []):
+            comp = (ev.get("competitions") or [{}])[0]
+            cs = comp.get("competitors") or []
+            home = next((c for c in cs if c.get("homeAway") == "home"), None)
+            away = next((c for c in cs if c.get("homeAway") == "away"), None)
+            if not home or not away:
+                continue
+            st = ev.get("status") or comp.get("status") or {}
+            typ = st.get("type") or {}
+            try:
+                ko = datetime.fromisoformat((ev.get("date") or "").replace("Z", "+00:00"))
+                if ko.tzinfo is None:
+                    ko = ko.replace(tzinfo=timezone.utc)
+            except Exception:
+                continue
+            goals = []
+            for dt in comp.get("details") or []:
+                if dt.get("scoringPlay"):
+                    ath = ((dt.get("athletesInvolved") or [{}])[0] or {}).get("displayName", "")
+                    goals.append({"min": (dt.get("clock") or {}).get("displayValue", ""),
+                                  "team_id": str((dt.get("team") or {}).get("id", "")), "player": ath,
+                                  "own": bool(dt.get("ownGoal")), "pen": bool(dt.get("penaltyKick"))})
+            try:
+                hs, as_ = int(home.get("score") or 0), int(away.get("score") or 0)
+            except Exception:
+                hs = as_ = 0
+            out.append({"id": str(ev.get("id")), "league": league, "league_name": ESPN_LEAGUES.get(league, league),
+                        "kickoff": ko, "state": typ.get("state", "pre"), "status_name": typ.get("name", ""),
+                        "detail": typ.get("shortDetail", ""), "home": (home.get("team") or {}).get("displayName", "?"),
+                        "away": (away.get("team") or {}).get("displayName", "?"),
+                        "home_id": str((home.get("team") or {}).get("id", "")),
+                        "away_id": str((away.get("team") or {}).get("id", "")), "hs": hs, "as": as_, "goals": goals})
+        return out
+    except Exception as e:
+        log.info("ESPN %s failed: %s", league, short_reason(e, 100))
+        return []
+
+
+def sport_favorites():
+    return DEFAULT_FAVORITES + [t for t in learn_favorites() if t not in DEFAULT_FAVORITES]
+
+
+def notable_match(m):
+    if os.environ.get("SPORT_ALERT_ALL", "0") == "1" or m["league"] == "uefa.champions":
+        return True
+    names = f"{m['home']} {m['away']}".lower()
+    return any(f.lower() in names for f in sport_favorites())
+
+
+def refresh_schedule(force=False):
+    """Matches of yesterday-today-tomorrow for every tracked league (cached 3 h)."""
+    if not force and time.time() - _sport_sched["ts"] < 3 * 3600 and _sport_sched["matches"]:
+        return _sport_sched["matches"]
+    base = datetime.now(timezone.utc)
+    days = [(base + timedelta(days=d)).strftime("%Y%m%d") for d in (-1, 0, 1)]
+    seen, allm = set(), []
+    for lg in sport_leagues():
+        for dstr in days:
+            for m in espn_scoreboard(lg, dstr):
+                if m["id"] not in seen:
+                    seen.add(m["id"])
+                    allm.append(m)
+    _sport_sched.update(ts=time.time(), matches=allm)
+    return allm
+
+
+def compose_score_card(title, m, line1="", line2=""):
+    """1080x1080 emerald scoreboard card: pill (GOAL / HALF TIME / FULL TIME / SOON), teams, big score, scorer line."""
+    if not PIL_OK:
+        return None
+    eth = find_ethiopic_font()
+    if not eth:
+        return None
+    try:
+        size = 1080
+        th = CARD_THEMES["sport"]
+        img = Image.new("RGB", (size, size), (6, 30, 24))
+        d = ImageDraw.Draw(img, "RGBA")
+        for y in range(size):  # emerald vertical gradient
+            k = y / size
+            d.line([(0, y), (size, y)], fill=(int(6 + 8 * k), int(40 - 14 * k), int(32 - 10 * k)))
+        d.ellipse([-300, 560, 1380, 1500], outline=(255, 255, 255, 18), width=6)
+        d.line([(0, 800), (size, 800)], fill=(255, 255, 255, 14), width=4)
+        d.rectangle([0, 0, size, 14], fill=th["gold"] + (255,))
+        f_eth = lambda sz: ImageFont.truetype(eth, sz)
+
+        def centered(text, y, sz, fill, bold=False):
+            fe, fl = f_eth(sz), _latin_font(sz)
+            while _measure(text, fe, fl) > size - 120 and sz > 28:
+                sz -= 4
+                fe, fl = f_eth(sz), _latin_font(sz)
+            x = (size - _measure(text, fe, fl)) / 2
+            if bold:
+                _draw_bold_shadow(d, x, y, text, fe, fl, fill)
+            else:
+                _draw_mixed(d, x, y, text, fe, fl, fill)
+
+        centered(f"{LEAGUE_AM.get(m['league'], m['league_name'])} · {m['league_name']}", 120, 38, (230, 230, 230, 255))
+        fe, fl = f_eth(46), _latin_font(44)
+        pw = int(_measure(title, fe, fl)) + 70
+        d.rounded_rectangle([(size - pw) // 2, 160, (size + pw) // 2, 240], radius=40, fill=th["gold"] + (255,))
+        _draw_mixed(d, (size - pw) // 2 + 35, 214, title, fe, fl, (20, 20, 20, 255))
+        centered(team_am(m["home"]), 400, 66, (255, 249, 238, 255), bold=True)
+        centered(f"{m['hs']}  -  {m['as']}", 620, 190, (255, 214, 118, 255), bold=True)
+        centered(team_am(m["away"]), 760, 66, (255, 249, 238, 255), bold=True)
+        if line1:
+            centered(line1, 860, 40, (240, 240, 240, 255))
+        if line2:
+            centered(line2, 915, 34, (200, 215, 210, 255))
+        b_eth, b_lat = f_eth(33), _latin_font(31)
+        text = BRANDS["sport"]["badge"]
+        bw = int(_measure(text, b_eth, b_lat)) + 52
+        d.rounded_rectangle([58, 968, 58 + bw, 1028], radius=30, fill=th["main"] + (250,), outline=th["gold"] + (255,), width=3)
+        _draw_mixed(d, 84, 1009, text, b_eth, b_lat, (255, 255, 255, 255))
+        out = io.BytesIO()
+        img.save(out, "JPEG", quality=92)
+        return out.getvalue()
+    except Exception as e:
+        log.warning("score card failed: %s", e)
+        return None
+
+
+def _min_am(minute):
+    mm = re.sub(r"[^\d+]", "", minute or "")
+    return f"{mm}ኛው ደቂቃ" if mm else ""
+
+
+def _goal_line(g, m):
+    team = m["home"] if g.get("team_id") == m["home_id"] else m["away"]
+    who, mn = g.get("player", ""), _min_am(g.get("min"))
+    if g.get("own"):
+        return f"{who} በራሱ መረብ ላይ" + (f" በ{mn}" if mn else "") + " አስቆጠረ"
+    how = " ከፍጹም ቅጣት ምት" if g.get("pen") else ""
+    return (f"{who}" if who else team_am(team)) + (f" በ{mn}" if mn else "") + how + (f" ለ{team_am(team)}" if who else "") + " ጎል አስቆጠረ"
+
+
+def push_sport_alert(kind, m, headline, body, card_title=None, line1="", line2="", tags_extra=""):
+    """Build a Sekela Sport draft (card when possible, text otherwise) and send it to Henok for approval."""
+    if in_quiet_hours() and kind in ("goal", "pre", "ht"):
+        return
+    today = addis_now().strftime("%Y-%m-%d")
+    if _sport_daily["date"] != today:
+        _sport_daily.update(date=today, count=0)
+    if kind in ("goal", "pre", "ht", "ft") and _sport_daily["count"] >= int(os.environ.get("SPORT_ALERT_MAX_PER_DAY", "30")):
+        return
+    tags = " ".join(build_tags("sport", (LEAGUE_TAGS.get(m["league"], "") + " " + tags_extra).strip(), headline)) if m else \
+        " ".join(build_tags("sport", tags_extra, headline))
+    post = f"🔴 {headline}\n\n{body}\n\n{brand_footer('sport')}\n\n{tags}"
+    card = compose_score_card(card_title, m, line1, line2) if (card_title and m) else None
+    d = {"post": post, "headline": headline, "image": card, "card": bool(card), "sources": [("ESPN", "https://www.espn.com/soccer/")],
+         "brand": "sport", "pkg": {}, "facts": "", "bg": None, "real": False, "unverified": False, "fixed": True,
+         "text_only": card is None, "topic": {"goal": "live_goal", "pre": "prematch", "ht": "halftime", "ft": "fulltime",
+                                              "md": "matchday"}.get(kind, kind)}
+    header = {"goal": "⚽🔥 ጎል! ለሰከላ ስፖርት ፖስት እናድርገው?", "pre": "⏰ የቅድመ-ጨዋታ ማሳሰቢያ ዝግጁ ነው",
+              "ht": "⏸ የእረፍት ውጤት ዝግጁ ነው", "ft": "🏁 የጨዋታ ፍጻሜ ውጤት ዝግጁ ነው",
+              "md": "📅 የጨዋታ ፕሮግራም ዝግጁ ነው"}.get(kind, "⚽ ሄኖክ፣ አዲስ የስፖርት ረቂቅ ዝግጁ ነው")
+    present_draft(OWNER_ID, "", d, header)
+    _sport_daily["count"] += 1
+
+
+def build_matchday(day_offset=0, force=False):
+    """Schedule post for the East-Africa-Time day `day_offset` days from now. Returns True when a draft was sent."""
+    eat = addis_now() + timedelta(days=day_offset)
+    key = ("md", eat.strftime("%Y-%m-%d"))
+    if key in _sport_sent and not force:
+        return False
+    ms = [m for m in refresh_schedule(force=force)
+          if m["kickoff"].astimezone(timezone(timedelta(hours=3))).strftime("%Y-%m-%d") == eat.strftime("%Y-%m-%d")]
+    ms.sort(key=lambda m: (not notable_match(m), m["kickoff"]))
+    ms = ms[:14]
+    if not ms:
+        return False
+    _sport_sent.add(key)
+    by_league = {}
+    for m in sorted(ms, key=lambda m: m["kickoff"]):
+        by_league.setdefault(m["league"], []).append(m)
+    lines = []
+    for lg, items in by_league.items():
+        lines.append(f"🏆 {LEAGUE_AM.get(lg, lg)}")
+        lines += [f"• {fmt_eat(m['kickoff'])} — {team_am(m['home'])} ከ {team_am(m['away'])}" for m in items]
+        lines.append("")
+    label = "የዛሬ" if day_offset == 0 else "የነገ"
+    headline = f"{label} ጨዋታዎች በኢትዮጵያ ሰዓት"
+    body = (f"📅 {WEEKDAY_AM[eat.weekday()]} {eat.strftime('%d %b')} — {label} ጨዋታዎች\n\n" + "\n".join(lines).strip() +
+            "\n\n⏰ ሰዓቱ በምስራቅ አፍሪካ ሰዓት (EAT) ነው።")
+    push_sport_alert("md", None, headline, body, tags_extra="#MatchDay #የዛሬጨዋታ #እግርኳስ")
+    return True
+
+
+def sport_engine_tick():
+    now = datetime.now(timezone.utc)
+    eat = addis_now()
+    day = eat.strftime("%Y-%m-%d")
+    if eat.hour >= 7 and ("md", day) not in _sport_sent:
+        build_matchday(0)
+    if eat.hour >= 19 and ("md", (eat + timedelta(days=1)).strftime("%Y-%m-%d")) not in _sport_sent:
+        build_matchday(1)
+    sched = refresh_schedule()
+    live_leagues = {m["league"] for m in sched
+                    if now - timedelta(hours=3, minutes=15) <= m["kickoff"] <= now + timedelta(minutes=40)}
+    for lg in live_leagues:
+        for m in espn_scoreboard(lg):
+            st = _sport_state.get(m["id"])
+            if st is None:  # first sight: remember, do not alert about what already happened (restart safety)
+                _sport_state[m["id"]] = {"hs": m["hs"], "as": m["as"], "goals": len(m["goals"]), "pre": m["state"] != "pre",
+                                         "ht": m["state"] != "pre" and m["status_name"] != "STATUS_FIRST_HALF",
+                                         "ft": m["state"] == "post"}
+                st = _sport_state[m["id"]]
+                if m["state"] == "pre":
+                    st.update(pre=False, ht=False, ft=False)
+            if not notable_match(m):
+                st.update(hs=m["hs"], **{"as": m["as"]}, goals=len(m["goals"]))
+                continue
+            mins_to_ko = (m["kickoff"] - now).total_seconds() / 60
+            if m["state"] == "pre" and not st["pre"] and 18 <= mins_to_ko <= 40:
+                st["pre"] = True
+                body = (f"⏰ በ30 ደቂቃ ውስጥ ይጀምራል!\n\n{team_am(m['home'])} ከ {team_am(m['away'])} — "
+                        f"{LEAGUE_AM.get(m['league'], m['league_name'])}\n🕒 {fmt_eat(m['kickoff'])} (EAT)")
+                push_sport_alert("pre", m, f"{team_am(m['home'])} ከ {team_am(m['away'])} በቅርቡ ይጀምራል", body, "KICK-OFF SOON",
+                                 line1=f"🕒 {fmt_eat(m['kickoff'])} (EAT)", tags_extra="#MatchDay #እግርኳስ")
+            if m["state"] in ("in", "post") and (m["hs"] + m["as"]) > (st["hs"] + st["as"]):
+                new_goals = m["goals"][st["goals"]:] if len(m["goals"]) > st["goals"] else []
+                g = new_goals[-1] if new_goals else {}
+                scorer = _goal_line(g, m) if g else "ጎል ተቆጥሯል"
+                body = (f"⚽ ጎል!\n\n{team_am(m['home'])} {m['hs']} - {m['as']} {team_am(m['away'])}\n{scorer}።\n"
+                        f"🏆 {LEAGUE_AM.get(m['league'], m['league_name'])}")
+                push_sport_alert("goal", m, f"ጎል! {team_am(m['home'])} {m['hs']}-{m['as']} {team_am(m['away'])}", body, "GOAL!",
+                                 line1=(g.get("player") or "") + (f" {g.get('min')}" if g.get("min") else ""),
+                                 tags_extra="#Goal #ጎል #እግርኳስ")
+            st.update(hs=m["hs"], **{"as": m["as"]}, goals=len(m["goals"]))
+            if m["status_name"] == "STATUS_HALFTIME" and not st["ht"]:
+                st["ht"] = True
+                gl = "\n".join("⚽ " + _goal_line(g, m) for g in m["goals"][:6])
+                body = (f"⏸ እረፍት\n\n{team_am(m['home'])} {m['hs']} - {m['as']} {team_am(m['away'])}\n"
+                        f"🏆 {LEAGUE_AM.get(m['league'], m['league_name'])}" + (f"\n\n{gl}" if gl else ""))
+                push_sport_alert("ht", m, f"እረፍት፡ {team_am(m['home'])} {m['hs']}-{m['as']} {team_am(m['away'])}", body, "HALF TIME",
+                                 tags_extra="#HalfTime #እግርኳስ")
+            if m["state"] == "post" and not st["ft"]:
+                st["ft"] = True
+                gl = "\n".join("⚽ " + _goal_line(g, m) for g in m["goals"][:8])
+                body = (f"🏁 ጨዋታው ተጠናቀቀ\n\n{team_am(m['home'])} {m['hs']} - {m['as']} {team_am(m['away'])}\n"
+                        f"🏆 {LEAGUE_AM.get(m['league'], m['league_name'])}" + (f"\n\n{gl}" if gl else ""))
+                push_sport_alert("ft", m, f"የጨዋታ ፍጻሜ፡ {team_am(m['home'])} {m['hs']}-{m['as']} {team_am(m['away'])}", body,
+                                 "FULL TIME", tags_extra="#FullTime #ውጤት #እግርኳስ")
+    if len(_sport_state) > 400:
+        for k in list(_sport_state)[:200]:
+            _sport_state.pop(k, None)
+
+
+def sport_engine_loop():
+    time.sleep(120)
+    while True:
+        try:
+            sport_engine_tick()
+        except Exception as e:
+            log.warning("sport engine error: %s", e)
+        time.sleep(max(30, int(os.environ.get("SPORT_POLL_SEC", "75"))))
+
+
+# ---- 60-second highlight clips -> video drafts ---------------------------------------------------------------------
+video_drafts = {}      # vid -> {"path","caption","headline","busy","tg","fb","topic","ts"}
+HL_SEEN_FILE = os.environ.get("HL_SEEN_FILE", os.path.join(tempfile.gettempdir(), "sekela_highlights_seen.json"))
+_hl_seen = None
+HL_GOOD = ["goal", "goals", "highlights", "stunning", "screamer", "save", "saves", "brace", "hat-trick", "hat trick", "winner"]
+HL_BAD = ["full match", "press conference", "live stream", "podcast", "interview", "preview", "predictions", "quiz"]
+
+
+def _hl_load():
+    global _hl_seen
+    if _hl_seen is None:
+        try:
+            with open(HL_SEEN_FILE, "r", encoding="utf-8") as f:
+                _hl_seen = set(json.load(f))
+        except Exception:
+            _hl_seen = set()
+
+
+def _hl_mark(vid):
+    _hl_load()
+    _hl_seen.add(vid)
+    try:
+        with open(HL_SEEN_FILE, "w", encoding="utf-8") as f:
+            json.dump(sorted(_hl_seen)[-400:], f)
+    except Exception:
+        pass
+
+
+def highlight_channels():
+    raw = os.environ.get("SPORT_HIGHLIGHT_CHANNELS", "Premier League|UC6c1z7bA__85CIWZ_jpCK-Q")
+    out = []
+    for it in raw.split(","):
+        if "|" in it:
+            n, c = [x.strip() for x in it.split("|", 1)]
+            if c:
+                out.append((n, c))
+    return out
+
+
+def yt_video_info(url):
+    import yt_dlp
+    with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True, "noplaylist": True, "socket_timeout": 30,
+                           "skip_download": True}) as y:
+        return y.extract_info(url, download=False)
+
+
+def normalize_highlight(ffmpeg, src, out, max_sec):
+    """<=max_sec seconds, fits 1280x1280, H.264 + AAC, under Telegram's 50 MB bot limit."""
+    for crf in ("26", "32"):
+        cmd = [ffmpeg, "-y", "-i", src, "-t", str(max_sec), "-vf",
+               "scale=w='min(iw,1280)':h='min(ih,1280)':force_original_aspect_ratio=decrease:force_divisible_by=2",
+               "-c:v", "libx264", "-preset", "veryfast", "-crf", crf, "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k",
+               "-movflags", "+faststart", out]
+        r = subprocess.run(cmd, capture_output=True, timeout=420)
+        if r.returncode != 0 or not os.path.isfile(out):
+            raise RuntimeError("ffmpeg failed: " + r.stderr.decode("utf-8", "ignore")[-160:])
+        if os.path.getsize(out) < 48 * 1024 * 1024:
+            return
+    raise RuntimeError("clip is larger than 48 MB")
+
+
+def prepare_video_draft(url, source_name="", chat_id=None):
+    """Download a short verified highlight (<= SPORT_CLIP_MAX_SEC, default 60 s), write the Amharic caption and send
+    Henok a video preview with approve / cancel buttons. Returns (ok, message)."""
+    chat_id = chat_id or OWNER_ID
+    max_sec = int(os.environ.get("SPORT_CLIP_MAX_SEC", "60"))
+    workdir = tempfile.mkdtemp(prefix="hl-")
+    keep = False
+    try:
+        ffmpeg = get_ffmpeg()
+        if not ffmpeg:
+            return False, "ffmpeg አልተገኘም"
+        try:
+            info = yt_video_info(url)
+        except Exception as e:
+            return False, "የቪዲዮ መረጃ ማግኘት አልተቻለም: " + short_reason(e, 120)
+        dur = int(info.get("duration") or 0)
+        if dur and dur > max_sec + 5:
+            return False, f"ቪዲዮው {dur} ሰከንድ ነው (ከ{max_sec} ሰከንድ በላይ) — አጭር ክሊፕ ላክ"
+        title = info.get("title") or ""
+        desc = (info.get("description") or "")[:500]
+        source_name = source_name or info.get("uploader") or info.get("channel") or "ምንጭ"
+        src, err = download_youtube(url, workdir)
+        if not src:
+            return False, "ማውረድ አልተቻለም: " + str(err)
+        out = os.path.join(workdir, "clip.mp4")
+        normalize_highlight(ffmpeg, src, out, max_sec)
+        facts = (f"Video title: {title}\nDescription: {desc}\nPublished by: {source_name}\nVideo link: {url}")
+        brief = (NEWS_BRIEF.replace("{topic}", title).replace("{brand_note}", BRANDS["sport"]["brief_note"])
+                 .replace("{facts}", facts).replace("{mode_note}", "This is a SHORT VIDEO HIGHLIGHT post. Describe what "
+                                                    "the clip shows using only the facts above (teams, scorer, minute only "
+                                                    "if given). LEAD 1-2 sentences, CONTEXT 3-4 sentences. Put NONE in "
+                                                    "OFFICIAL.\n") + learning_block("sport"))
+        text, _ = llm_write(brief, system=NEWSROOM_SYSTEM, max_tokens=2500, temperature=0.5, allow_gemini=NEWS_ALLOW_GEMINI,
+                            models=NEWS_WRITER_MODELS)
+        pkg = parse_package(text or "")
+        headline = clean_headline(pkg.get("headline"), _para(pkg.get("lead")), max_words=7) or "የጎል ቪዲዮ"
+        tags = " ".join(build_tags("sport", pkg.get("tags"), headline))
+        parts = [f"🔴 {headline}", _para(pkg.get("lead")), _para(pkg.get("context"))]
+        full = "\n\n".join(p for p in parts if p) + f"\n\n🎥 ምንጭ፡ {source_name}\n\n{brand_footer('sport')}\n\n{tags}"
+        if len(full) > 1024:  # Telegram video caption limit
+            ctx = " ".join(re.split(r"(?<=።)\s*", _para(pkg.get("context")))[:2])
+            full = "\n\n".join(p for p in [parts[0], parts[1], ctx] if p) + f"\n\n🎥 ምንጭ፡ {source_name}\n\n{brand_footer('sport')}\n\n{tags}"
+        if len(full) > 1024:
+            full = f"🔴 {headline}\n\n{_para(pkg.get('lead'))}\n\n🎥 ምንጭ፡ {source_name}\n\n{tags}"[:1020]
+        vid = uuid.uuid4().hex[:10]
+        with state_lock:
+            video_drafts[vid] = {"path": out, "caption": full, "headline": headline, "busy": False, "tg": False, "fb": False,
+                                 "topic": "highlight", "brand": "sport", "ts": time.time(), "url": url}
+        keep = True
+        kb = types.InlineKeyboardMarkup()
+        kb.add(types.InlineKeyboardButton("✅ አጽድቅና ፖስት አድርግ", callback_data=f"vk:{vid}"),
+               types.InlineKeyboardButton("❌ ሰርዝ", callback_data=f"vn:{vid}"))
+        with open(out, "rb") as vf:
+            bot.send_video(chat_id, vf, caption=full[:1020], reply_markup=kb, supports_streaming=True, timeout=180)
+        bot.send_message(chat_id, "🎬 የ60 ሰከንድ ቪዲዮ ረቂቅ ዝግጁ ነው — 🔒 ✅ ካልነካህ አይለጠፍም።\n"
+                                  f"⚠️ የቪዲዮው መብት የ «{source_name}» ነው፤ ከመለጠፍህ በፊት መጠቀም እንደሚፈቀድ አረጋግጥ።")
+        prune_video_drafts()
+        return True, "ok"
+    except Exception as e:
+        log.warning("highlight draft failed: %s", e)
+        return False, short_reason(e, 150)
+    finally:
+        if not keep:
+            shutil.rmtree(workdir, ignore_errors=True)
+
+
+def prune_video_drafts(max_age=4 * 3600):
+    now = time.time()
+    with state_lock:
+        old = [k for k, v in video_drafts.items() if now - v["ts"] > max_age]
+        items = [video_drafts.pop(k) for k in old]
+    for v in items:
+        shutil.rmtree(os.path.dirname(v["path"]), ignore_errors=True)
+
+
+def fb_video_publish(path, caption, brand="sport"):
+    pid = BRANDS[brand]["fb_id"]
+    with open(path, "rb") as f:
+        data = f.read()
+    js = _fb_request("POST", f"{pid}/videos", data={"description": caption, "published": "true"},
+                     files={"source": ("clip.mp4", data, "video/mp4")}, timeout=600, brand=brand)
+    return js.get("id")
+
+
+def approve_video(chat_id, msg_id, vid):
+    """Approval gate for highlight videos: Telegram channel first, then the Facebook page (tracked separately)."""
+    with state_lock:
+        d = video_drafts.get(vid)
+        if d is None or d["busy"]:
+            expired = d is None
+            d = None
+        else:
+            expired = False
+            d["busy"] = True
+    if d is None:
+        if expired:
+            bot.send_message(chat_id, "⚠️ ይህ ቪዲዮ ጊዜው አልፏል ወይም ቀድሞ ተስተናግዷል።")
+        return
+    b = BRANDS["sport"]
+    tg_err = fb_err = None
+    try:
+        try:
+            bot.edit_message_caption("⏳ እየለጠፍኩ ነው...", chat_id, msg_id)
+        except Exception:
+            pass
+        if not d["tg"]:
+            try:
+                with open(d["path"], "rb") as vf:
+                    bot.send_video(b["tg"], vf, caption=d["caption"][:1024], supports_streaming=True, timeout=300)
+                d["tg"] = True
+                bot_stats["tg_posts"] += 1
+            except Exception as e:
+                tg_err = short_reason(e, 160)
+        if fb_enabled("sport") and not d["fb"]:
+            try:
+                fb_video_publish(d["path"], d["caption"], "sport")
+                d["fb"] = True
+                bot_stats["fb_posts"] += 1
+            except Exception as e:
+                fb_err = short_reason(e, 160)
+    finally:
+        d["busy"] = False
+    if d["tg"] or d["fb"]:
+        if not d.get("learned"):
+            d["learned"] = True
+            learn_event("approve", d)
+    fb_on = fb_enabled("sport")
+    done = d["tg"] and (d["fb"] or not fb_on)
+    text = (f"{'✅ ተለጥፏል 🚀' if done else '⚠️ በከፊል ተሳክቷል'} ({brand_label('sport')})\n"
+            f"• Telegram: {'✅' if d['tg'] else '❌ ' + (tg_err or '')}\n"
+            f"• Facebook: {'✅' if d['fb'] else ('⚪ አልተዋቀረም' if not fb_on else '❌ ' + (fb_err or ''))}")
+    kb = None
+    if not done:
+        kb = types.InlineKeyboardMarkup()
+        kb.add(types.InlineKeyboardButton("🔁 ያልተሳካውን እንደገና ሞክር", callback_data=f"vk:{vid}"),
+               types.InlineKeyboardButton("❌ ሰርዝ", callback_data=f"vn:{vid}"))
+    try:
+        bot.edit_message_caption(text, chat_id, msg_id, reply_markup=kb)
+    except Exception:
+        bot.send_message(chat_id, text, reply_markup=kb)
+    if done:
+        with state_lock:
+            video_drafts.pop(vid, None)
+        shutil.rmtree(os.path.dirname(d["path"]), ignore_errors=True)
+
+
+def highlight_poll_once():
+    """New videos of the highlight channels -> goal / highlight clips of notable teams that are <= 60 s."""
+    made = 0
+    _hl_load()
+    for name, cid in highlight_channels():
+        try:
+            r = requests.get(f"https://www.youtube.com/feeds/videos.xml?channel_id={cid}", headers=_UA, timeout=20)
+            if r.status_code != 200:
+                continue
+            root = ET.fromstring(r.content)
+            ns = {"a": "http://www.w3.org/2005/Atom", "yt": "http://www.youtube.com/xml/schemas/2015"}
+            for en in root.findall("a:entry", ns)[:8]:
+                vid = en.findtext("yt:videoId", default="", namespaces=ns)
+                title = en.findtext("a:title", default="", namespaces=ns)
+                low = title.lower()
+                if not vid or vid in _hl_seen:
+                    continue
+                _hl_mark(vid)
+                if any(b in low for b in HL_BAD) or not any(g in low for g in HL_GOOD):
+                    continue
+                if os.environ.get("SPORT_HIGHLIGHT_ALL", "0") != "1" and not any(f.lower() in low for f in sport_favorites()):
+                    continue
+                if in_quiet_hours():
+                    continue
+                ok, msg = prepare_video_draft(f"https://www.youtube.com/watch?v={vid}", name)
+                log.info("highlight %s: %s %s", vid, ok, msg)
+                if ok:
+                    made += 1
+                if made >= 2:
+                    return made
+        except Exception as e:
+            log.info("highlight feed %s failed: %s", name, short_reason(e, 100))
+    return made
+
+
+def highlight_loop():
+    time.sleep(240)
+    while True:
+        try:
+            highlight_poll_once()
+        except Exception as e:
+            log.warning("highlight loop error: %s", e)
+        time.sleep(max(5, int(os.environ.get("SPORT_HIGHLIGHT_INTERVAL_MIN", "20"))) * 60)
+
+
+def start_sport_engine():
+    if os.environ.get("SPORT_ENGINE", "1") != "0":
+        threading.Thread(target=sport_engine_loop, daemon=True, name="sport-engine").start()
+    if os.environ.get("SPORT_HIGHLIGHTS", "1") != "0" and highlight_channels():
+        threading.Thread(target=highlight_loop, daemon=True, name="sport-highlights").start()
+    log.info("Sport engine started (leagues: %s)", ",".join(sport_leagues()))
 
 
 # ----------------------------------------------------------------------------
@@ -2989,6 +4105,7 @@ def approve_short_upload(chat_id, msg_id, sid):
     try:
         vid = yt_upload_short(d["path"], d["title"], d["description"], d["tags"])
         bot_stats["yt_uploads"] += 1
+        learn_track({"brand": "media", "headline": d["title"], "topic": "other"}, yt_id=vid)
         with state_lock:
             shorts_drafts.pop(sid, None)
         shutil.rmtree(os.path.dirname(d["path"]), ignore_errors=True)
@@ -3237,9 +4354,16 @@ def _insight_series(js):
     return pts
 
 
+def _fb_err_text(e):
+    return short_reason(e, 110) + (" — " + fb_error_hint(e) if fb_error_hint(e) else "")
+
+
 def fb_window(brand, days):
-    """Facebook page numbers for a window of `days` days (read-only insights) + the latest posts with counters."""
-    out = {"_ok": False, "totals": {}, "series": {}, "posts": []}
+    """Facebook page numbers for a window of `days` days. Three layers so SOMETHING always shows up:
+    1) page fields (fans / followers) 2) Insights metrics (reach, views, engagement, new followers)
+    3) the page's own posts (reactions / comments / shares per post and per day) - works with plain page tokens.
+    `_notes` explains every layer that failed (shown on the dashboard)."""
+    out = {"_ok": False, "totals": {}, "series": {}, "posts": [], "_notes": []}
     if not fb_enabled(brand):
         out["_err"] = "no token"
         return out
@@ -3250,8 +4374,21 @@ def fb_window(brand, days):
     except FBError as e:
         out.update(_err=short_reason(e, 100), _hint=fb_error_hint(e))
         return out
+    t = out["totals"]
+    # layer 1: followers / fans straight from the page object
+    try:
+        pg = _fb_request("GET", pid, params={"fields": "fan_count,followers_count"}, timeout=40, brand=brand)
+        if isinstance(pg.get("followers_count"), int):
+            t["followers"] = pg["followers_count"]
+        if isinstance(pg.get("fan_count"), int):
+            t["likes"] = pg["fan_count"]
+            t.setdefault("followers", pg["fan_count"])
+    except FBError as e:
+        out["_notes"].append("Page fans: " + _fb_err_text(e))
+    # layer 2: Insights
     now = int(time.time())
     since = now - max(days, 2) * 86400 if days else now - 8 * 86400
+    fails = 0
     for metric, label, mode, key in FB_INSIGHT_CANDIDATES:
         try:
             js = _fb_request("GET", f"{pid}/insights", params={"metric": metric, "period": "day", "since": since,
@@ -3261,28 +4398,53 @@ def fb_window(brand, days):
                 continue
             out["series"][key] = pts
             if mode == "last":
-                out["totals"][key] = pts[-1][1]
+                t[key] = pts[-1][1]
             elif days == 1:
-                out["totals"][key] = pts[-1][1]  # the latest full day Meta reports
+                t[key] = pts[-1][1]  # the latest full day Meta reports
             else:
-                out["totals"][key] = sum(v for _, v in pts[-days:]) if days else sum(v for _, v in pts)
+                t[key] = sum(v for _, v in pts[-days:]) if days else sum(v for _, v in pts)
         except FBError as e:
+            fails += 1
             log.info("insight %s unavailable: %s", metric, e)
-    rich = ("message,created_time,permalink_url,reactions.summary(total_count).limit(0),"
-            "comments.summary(total_count).limit(0),shares")
-    for fields in (rich, "message,created_time,permalink_url"):
+            if fails == 1:
+                out["_notes"].append(f"Insights ({metric}): " + short_reason(e, 110))
+    # layer 3: the page's posts with their counters
+    rich = ("message,created_time,permalink_url,shares,reactions.summary(total_count).limit(0),"
+            "comments.summary(total_count).limit(0)")
+    posts_raw, last_err = [], None
+    for edge, fields in (("posts", rich), ("published_posts", rich), ("feed", rich), ("posts", "message,created_time")):
         try:
-            posts = _fb_request("GET", f"{pid}/posts", params={"fields": fields, "limit": 6}, timeout=40,
-                                brand=brand).get("data", [])
-            for p in posts:
-                react = ((p.get("reactions") or {}).get("summary") or {}).get("total_count", 0)
-                comm = ((p.get("comments") or {}).get("summary") or {}).get("total_count", 0)
-                shares = (p.get("shares") or {}).get("count", 0)
-                out["posts"].append({"date": (p.get("created_time") or "")[:10], "reactions": react, "comments": comm,
-                                     "shares": shares, "text": re.sub(r"\s+", " ", p.get("message") or "(ያለ ጽሑፍ)")[:48]})
-            break
+            posts_raw = _fb_request("GET", f"{pid}/{edge}", params={"fields": fields, "limit": 40}, timeout=45,
+                                    brand=brand).get("data", [])
+            if posts_raw:
+                break
         except FBError as e:
-            log.info("posts query failed: %s", short_reason(e, 80))
+            last_err = e
+    if not posts_raw and last_err is not None:
+        out["_notes"].append("Posts: " + _fb_err_text(last_err))
+    day_eng, tot_r = {}, [0, 0, 0, 0]
+    cutoff = (addis_now() - timedelta(days=days if days else 7)).strftime("%Y-%m-%d")
+    for p in posts_raw:
+        react = ((p.get("reactions") or {}).get("summary") or {}).get("total_count", 0) or 0
+        comm = ((p.get("comments") or {}).get("summary") or {}).get("total_count", 0) or 0
+        shares = (p.get("shares") or {}).get("count", 0) or 0
+        date = (p.get("created_time") or "")[:10]
+        rec = {"id": p.get("id"), "date": date, "reactions": react, "comments": comm, "shares": shares,
+               "text": re.sub(r"\s+", " ", p.get("message") or "(ያለ ጽሑፍ)")[:48]}
+        if len(out["posts"]) < 6:
+            out["posts"].append(rec)
+        if date >= cutoff:
+            tot_r[0] += 1
+            tot_r[1] += react
+            tot_r[2] += comm
+            tot_r[3] += shares
+            day_eng[date[5:]] = day_eng.get(date[5:], 0) + react + comm + shares
+    if posts_raw:
+        t["posts_n"], t["reactions"], t["comments"], t["shares"] = tot_r
+        out["series"]["post_engagement"] = sorted(day_eng.items())
+        if "engagement" not in t:
+            t["engagement"] = tot_r[1] + tot_r[2] + tot_r[3]
+            out["_notes"].append("Engagement ከፖስቶች ድምር (reactions+comments+shares) ነው የተሰላው")
     return out
 
 
@@ -3291,56 +4453,74 @@ def _sign(n):
 
 
 def section_brand(brand, tf):
-    """Dashboard section for ሰከላ ሚዲያ / ሰከላ ስፖርት (Telegram + Facebook)."""
+    """Dashboard section for ሰከላ ሚዲያ / ሰከላ ስፖርት: Telegram AND Facebook Page numbers together."""
     label, days = TIMEFRAMES[tf]
     b = BRANDS[brand]
     sec = {"title": f"{b['name_en']} — {label}", "brand": brand, "kpis": [], "bars": [], "bars_title": "", "chart": "h",
            "facts": [], "notes": []}
+    win_days = days if days else 7
+    win_txt = "latest day" if days == 1 else f"{win_days} days"
+    short = "1d" if days == 1 else f"{win_days}d"
+    # ---- Telegram
     tg = tg_member_count(b["tg"])
     if tg is not None:
         hist_record(f"tg:{brand}", tg)
         d = hist_delta(f"tg:{brand}", tg, max(days, 1))
-        sec["kpis"].append(("Telegram members", f"{tg:,}", _sign(d[0]) + (f" / {d[1]}d" if d else "") if d else ""))
+        sec["kpis"].append(("Telegram members", f"{tg:,}", _sign(d[0]) if d else ""))
         sec["facts"].append(f"Telegram {b['tg']}: {tg:,} members" + (f", change {_sign(d[0])} over {d[1]} day(s)" if d else ""))
     else:
-        sec["notes"].append("Telegram ቁጥር ማምጣት አልተቻለም (ቦቱ አድሚን መሆን አለበት)")
-    fb = fb_window(brand, days if days else 7)
-    if fb["_ok"]:
-        t = fb["totals"]
-        if "followers" in t:
-            hist_record(f"fb:{brand}:followers", t["followers"])
-            d = hist_delta(f"fb:{brand}:followers", t["followers"], max(days, 1))
-            sec["kpis"].append(("Facebook followers", f"{t['followers']:,}", _sign(d[0]) if d else ""))
-            sec["facts"].append(f"Facebook page followers: {t['followers']:,}" + (f", change {_sign(d[0])} over {d[1]} day(s)" if d else ""))
-        win = "latest day" if days == 1 else f"{days or 7} days"
-        for key, lbl in (("reach", "Reach"), ("views", "Views"), ("engagement", "Engagement"), ("new_follows", "New followers")):
-            if key in t:
-                sec["kpis"].append((f"{lbl} ({'1d' if days == 1 else str(days or 7) + 'd'})", f"{t[key]:,}", ""))
-                sec["facts"].append(f"Facebook {lbl.lower()} ({win}): {t[key]:,}")
-        ser = fb["series"].get("views") or fb["series"].get("reach") or []
-        if tf == "last":
-            posts = fb["posts"][:6]
-            if posts:
-                sec["bars_title"] = "Latest posts — reactions + comments + shares"
-                sec["bars"] = [(f"{p['date'][5:]} {p['text']}", p["reactions"] + p["comments"] + p["shares"]) for p in posts]
-                p0 = posts[0]
-                sec["kpis"] = [("Latest post", p0["date"], ""), ("Reactions", f"{p0['reactions']:,}", ""),
-                               ("Comments", f"{p0['comments']:,}", ""), ("Shares", f"{p0['shares']:,}", "")] + sec["kpis"][:2]
-                sec["facts"].append(f"Latest Facebook post ({p0['date']}): {p0['reactions']} reactions, "
-                                    f"{p0['comments']} comments, {p0['shares']} shares")
-        elif len(ser) >= 3:
-            sec["chart"] = "v"
-            sec["bars_title"] = ("Facebook daily views" if fb["series"].get("views") else "Facebook daily reach")
-            sec["bars"] = ser[-(days if days else 7):] if days > 1 else ser[-7:]
-        else:
-            sec["bars_title"] = "Facebook — key numbers"
-            sec["bars"] = [(lbl, t[k]) for k, lbl in (("views", "Views"), ("reach", "Reach"),
-                                                      ("engagement", "Engagement"), ("new_follows", "New followers"))
-                           if k in t]
-        if not any(k in t for k in ("reach", "views", "engagement")):
-            sec["notes"].append("Facebook Insights አልተገኙም (read_insights ፈቃድ ሊጎድል ይችላል)")
-    else:
+        sec["notes"].append("Telegram ቁጥር ማምጣት አልተቻለም (ቦቱ የቻናሉ አድሚን መሆን አለበት)")
+    # ---- Facebook
+    fb = fb_window(brand, win_days)
+    if not fb["_ok"]:
         sec["notes"].append("Facebook አልተገናኘም: " + (fb.get("_err") or "token") + (" — " + fb["_hint"] if fb.get("_hint") else ""))
+        return sec
+    t = fb["totals"]
+    if "followers" in t:
+        hist_record(f"fb:{brand}:followers", t["followers"])
+        d = hist_delta(f"fb:{brand}:followers", t["followers"], max(days, 1))
+        sec["kpis"].append(("FB followers", f"{t['followers']:,}", _sign(d[0]) if d else ""))
+        sec["facts"].append(f"Facebook page followers: {t['followers']:,}" + (f", change {_sign(d[0])} over {d[1]} day(s)" if d else ""))
+    if "likes" in t and t.get("likes") != t.get("followers"):
+        sec["kpis"].append(("Page likes", f"{t['likes']:,}", ""))
+    for key, lbl in (("reach", "Reach"), ("views", "Views / Impressions"), ("engagement", "Engaged"), ("new_follows", "New followers")):
+        if key in t:
+            sec["kpis"].append((f"{lbl} ({short})", f"{t[key]:,}", ""))
+            sec["facts"].append(f"Facebook {lbl.lower()} ({win_txt}): {t[key]:,}")
+    if "posts_n" in t:
+        sec["kpis"].append((f"Posts ({short})", f"{t['posts_n']:,}", ""))
+        sec["kpis"].append((f"Reactions ({short})", f"{t['reactions']:,}", ""))
+        sec["kpis"].append((f"Comments / Shares ({short})", f"{t['comments']:,} / {t['shares']:,}", ""))
+        sec["facts"].append(f"Facebook posts in {win_txt}: {t['posts_n']} posts, {t['reactions']} reactions, "
+                            f"{t['comments']} comments, {t['shares']} shares")
+    posts = fb["posts"]
+    if tf == "last":
+        if posts:
+            p0 = posts[0]
+            sec["kpis"] = sec["kpis"][:1] + [("Latest post", p0["date"], ""), ("Reactions", f"{p0['reactions']:,}", ""),
+                                             ("Comments", f"{p0['comments']:,}", ""), ("Shares", f"{p0['shares']:,}", "")]
+            sec["bars_title"] = "Latest posts — reactions + comments + shares"
+            sec["bars"] = [(f"{p['date'][5:]} {p['text']}", p["reactions"] + p["comments"] + p["shares"]) for p in posts]
+            sec["facts"].append(f"Latest Facebook post ({p0['date']}, \"{p0['text']}\"): {p0['reactions']} reactions, "
+                                f"{p0['comments']} comments, {p0['shares']} shares")
+        else:
+            sec["notes"].append("የቅርብ ፖስት አልተገኘም")
+    else:
+        ser = fb["series"].get("views") or fb["series"].get("reach")
+        title = "Facebook daily views" if fb["series"].get("views") else "Facebook daily reach"
+        if not ser or len(ser) < 3:
+            ser, title = fb["series"].get("post_engagement"), "Facebook engagement per day (from posts)"
+        if ser and len(ser) >= 3:
+            sec["chart"], sec["bars_title"], sec["bars"] = "v", title, ser[-(win_days if win_days > 1 else 7):]
+        else:
+            rows = [(lbl, t[k]) for k, lbl in (("views", "Views"), ("reach", "Reach"), ("engagement", "Engaged"),
+                                                ("reactions", "Reactions"), ("comments", "Comments"),
+                                                ("shares", "Shares"), ("new_follows", "New followers")) if k in t]
+            sec["bars_title"], sec["bars"] = "Facebook — key numbers", rows
+    if not any(k in t for k in ("reach", "views", "engagement", "posts_n", "followers")):
+        sec["notes"].append("Facebook ቁጥሮች አልተገኙም — Page token ላይ read_insights + pages_read_engagement ፈቃድ ያስፈልጋል")
+    for n in fb["_notes"][:2]:
+        sec["notes"].append(n)
     return sec
 
 
@@ -3520,23 +4700,30 @@ def render_dashboard_png(secs, heading, sub):
 
 
 AN_INSIGHT_PROMPT = (
-    "You are the social-media analyst of ሄኖክ (owner of ሰከላ ሚዲያ, ሰከላ ስፖርት and YouTube channels). Using ONLY the "
-    "numbers below, write 4-6 short insights in natural Amharic: what is strongest, what is weakest, how the numbers "
-    "changed (only if a change is given), and ONE concrete action Henok should take next (format, topic or posting "
-    "idea). Never invent or estimate a number. If a metric is missing say so in one short line. Speak to ሄኖክ in "
-    "masculine singular (አንተ). Use '•' bullets, plain text, no markdown, no more than 140 words.\n\nPeriod: {period}\n"
-    "NUMBERS:\n{facts}"
+    "You are the social-media growth analyst of ሄኖክ (owner of ሰከላ ሚዲያ, ሰከላ ስፖርት and YouTube channels). Using ONLY "
+    "the numbers below, write a short growth note in natural, fluent Amharic with EXACTLY these two headed parts:\n"
+    "📈 ምን ጥሩ እየሠራ ነው?  - 2-3 '•' bullets: the strongest numbers, growth, best post or topic.\n"
+    "💡 ምን ይሻሻል?  - 2-3 '•' bullets: the weakest numbers or gaps, each with ONE concrete action (post format, topic, "
+    "timing, hook) Henok can try next.\n"
+    "Never invent or estimate a number; if a metric is missing say so in one short line. Speak to ሄኖክ in masculine "
+    "singular (አንተ). Plain text, no markdown, at most 150 words.\n\nPeriod: {period}\nNUMBERS:\n{facts}"
 )
 
 
 def an_insights(secs, period):
     facts = "\n".join(f for sec in secs for f in sec["facts"])
+    try:
+        lf = learn_summary_facts()
+        if lf and facts:
+            facts += "\n" + lf
+    except NameError:
+        pass
     if not facts:
         return "ℹ️ ለዚህ ምርጫ ቁጥሮች አልተገኙም — ከላይ ያሉትን ማስታወሻዎች (ግንኙነት/ፈቃድ) አረጋግጥ።"
     text, _ = llm_write(AN_INSIGHT_PROMPT.replace("{period}", period).replace("{facts}", facts), max_tokens=900,
                         temperature=0.4, models=NEWS_WRITER_MODELS)
     if text:
-        return "💡 ግንዛቤ (Insights)\n" + text
+        return text if "📈" in text else "📈 ግንዛቤ\n" + text
     return "📊 ቁጥሮች\n" + "\n".join("• " + f for f in facts.splitlines())
 
 
@@ -4401,6 +5588,9 @@ HELP_TEXT = (
     "📊 /analytics — በቁልፍ ብቻ ምረጥ: ብራንድ/YouTube + ዛሬ/7/30 ቀን/የቅርብ ቪዲዮ → PNG ዳሽቦርድ + ግንዛቤ (ጠቃሚ ለውጥ ሲኖር በራሴ አሳውቅሃለሁ)\n"
     "🎨 /image — ሎጎ ወይም ምስል (ወይም «ሎጎ ስራልኝ» ብለህ ጻፍ) → 4-5 ስሪቶች ከበርካታ AI ሞተሮች → ምርጡን ምረጥ\n"
     "🖌 /canva — ከ Canva ጋር ግባ እና የቅርብ ዲዛይኖችን እይ\n"
+    "🧠 /rules — ቋሚ ህጎችህን እይ/ሰርዝ፤ ወይም በቀጥታ ጻፍ: «ከዛሬ ጀምሮ የኢኮኖሚ ዜና አብዛ» (ቦቱ ከ ✅/❌/✏️ ውሳኔዎችህ ራሱ ይማራል)\n"
+    "📅 /schedule — የዛሬና የነገ ጨዋታዎች ፕሮግራም ረቂቅ\n"
+    "🎬 /highlight — የጎል ቪዲዮ ሊንክ (≤60 ሰከንድ) → የቪዲዮ ረቂቅ\n"
     "✂️ /shorts — ረጅም ቪዲዮ (YouTube ሊንክ ወይም ፋይል) → 9:16 Shorts → ✅ ስትነካ YouTube ላይ\n"
     "🎙 ድምፅ ላክልኝ (እስከ 5 ደቂቃ) — ትራንስክሪፕት + ማጠቃለያ + Action Items\n"
     "🎬 ቪዲዮ (እስከ 18MB) — ትንታኔ + 3 ቫይራል ክሊፖች + ✂️ መቁረጫ ቁልፍ\n"
@@ -4470,6 +5660,64 @@ def cmd_image(message):
         awaiting_topic[uid] = "image"
     bot.send_message(chat_id, "🎨 እሺ ሄኖክ — ምን ልሥራልህ? የፈለግከውን ምስል ወይም ሎጎ በአማርኛ ወይም በእንግሊዝኛ ግለጽልኝ "
                               "(ለምሳሌ «የሰከላ ስፖርት ሎጎ፣ እግር ኳስ እና አረንጓዴ-ወርቃማ ቀለም»)። ለመሰረዝ /cancel")
+
+
+@bot.message_handler(commands=["rules", "learn"])
+@private_owner_only
+def cmd_rules(message):
+    chat_id = message.chat.id
+    parts = (message.text or "").split(None, 2)
+    if len(parts) >= 2 and parts[1].lower() == "add" and len(parts) == 3:
+        r = learn_add_rule(parts[2])
+        bot.send_message(chat_id, f"✅ ህጉ ተቀምጧል — ከዚህ በኋላ በራሴ እተገብረዋለሁ፤ ኮድ መቀየር አያስፈልግም።\n«{r['rule']}»")
+        return
+    if len(parts) >= 2 and parts[1].lower() == "clear":
+        with _learn_lock:
+            L = learn_load()
+            L["rules"].clear()
+            L["boosts"].clear()
+        learn_touch(important=True)
+        bot.send_message(chat_id, "🗑 ሁሉም ህጎች ተሰርዘዋል።")
+        return
+    text, kb = learn_rules_message()
+    bot.send_message(chat_id, text, reply_markup=kb)
+
+
+@bot.message_handler(commands=["schedule", "matchday"])
+@private_owner_only
+def cmd_schedule(message):
+    chat_id = message.chat.id
+    ack = send_progress(chat_id, "📅 የዛሬና የነገ ጨዋታዎችን እያመጣሁ ነው...")
+    try:
+        sent = build_matchday(0, force=True)
+        sent = build_matchday(1, force=True) or sent
+        drop_message(chat_id, ack)
+        if not sent:
+            bot.send_message(chat_id, "ሄኖክ፣ በተከታተልናቸው ሊጎች ዛሬ/ነገ ጨዋታ አላገኘሁም (ወይም ESPN አልተገኘም)።")
+    except Exception as e:
+        deliver(chat_id, ack, f"ሄኖክ፣ ፕሮግራሙን ማምጣት አልተቻለም 😅 ({short_reason(e)})")
+
+
+@bot.message_handler(commands=["highlight", "clip"])
+@private_owner_only
+def cmd_highlight(message):
+    chat_id, uid = message.chat.id, message.from_user.id
+    m = re.search(r"https?://\S+", message.text or "")
+    if not m:
+        with state_lock:
+            awaiting_topic[uid] = "highlight"
+        bot.send_message(chat_id, "🎬 እሺ ሄኖክ — የጎል/ሃይላይት ቪዲዮ (YouTube ወዘተ) ሊንክ ላክልኝ፤ እስከ 60 ሰከንድ መሆን አለበት። ለመሰረዝ /cancel")
+        return
+    run_highlight(chat_id, m.group(0))
+
+
+def run_highlight(chat_id, url):
+    ack = send_progress(chat_id, "🎬 ቪዲዮውን እያወረድኩ እና የአማርኛ መግለጫ እያዘጋጀሁ ነው (ከ1-2 ደቂቃ)...")
+    ok, msg = prepare_video_draft(url, chat_id=chat_id)
+    if ok:
+        drop_message(chat_id, ack)
+    else:
+        deliver(chat_id, ack, f"ሄኖክ፣ ቪዲዮውን ማዘጋጀት አልተቻለም 😕\n{msg}")
 
 
 @bot.message_handler(commands=["canva"])
@@ -4662,6 +5910,24 @@ def _yt_status_lines():
     return lines
 
 
+def _engine_status_lines():
+    with _learn_lock:
+        L = learn_load()
+        n_rules, n_ev, n_pend = len(L["rules"]), len(L["events"]), len([p for p in L["pending"] if not p["done"]])
+        bk = (L.get("backup") or {}).get("ts", 0)
+    lines = ["🧠 ራስ-ትምህርት:", f"  ✅ {n_rules} ህጎች · {n_ev} ውሳኔዎች · {n_pend} ፖስቶች ውጤታቸው እየተጠበቀ ነው",
+             "  💾 Backup: " + (datetime.fromtimestamp(bk, timezone.utc).strftime("%Y-%m-%d %H:%M UTC") if bk else "ገና አልተላከም (ህግ ሲጨምር ይላካል)"),
+             "⚽ Sport Engine:"]
+    try:
+        ms = refresh_schedule()
+        lines.append(f"  ✅ ESPN ተገናኝቷል — {len(ms)} ጨዋታዎች (ትናንት-ነገ) በ {len(sport_leagues())} ሊጎች" if ms else
+                     "  ⚠️ ESPN ጨዋታ አላመጣም (ዛሬ ጨዋታ ላይኖር ይችላል ወይም አልተገናኘም)")
+    except Exception as e:
+        lines.append(f"  ❌ ESPN: {short_reason(e, 100)}")
+    lines.append(f"  🎬 Highlight ቻናሎች: {', '.join(n for n, _ in highlight_channels()) or 'አልተዋቀሩም'}")
+    return lines
+
+
 def _image_status_lines():
     lines = ["🎨 Image Studio (/image):", "  ✅ Pollinations flux + turbo (ያለ ቁልፍ)",
              ("  ✅ Gemini Imagen (GEMINI_API_KEY)" if GEMINI_API_KEY else "  ⚪ Gemini Imagen — GEMINI_API_KEY የለም"),
@@ -4694,6 +5960,8 @@ def cmd_ai_status(message):
         lines += _canva_status_lines()
         lines.append("")
         lines += _image_status_lines()
+        lines.append("")
+        lines += _engine_status_lines()
         font = find_ethiopic_font() if PIL_OK else None
         lines.append("\n🖼 የካርድ ርዕስ ፊደል (Ethiopic font): " + ("✅ ተገኝቷል" if font else "❌ የለም — NotoSansEthiopic-Bold.ttf ኮሚት አድርግ"))
         lines.append(f"👤 Owner ID: {OWNER_ID}")
@@ -4787,11 +6055,35 @@ def on_callback(call):
         elif data.startswith("no:"):
             did = data.split(":", 1)[1]
             with state_lock:
-                drafts.pop(did, None)
+                dd = drafts.pop(did, None)
+            if dd:
+                learn_event("cancel", dd)
             bot.edit_message_text("❌ ተሰርዟል — ምንም አልተለጠፈም።", chat_id, msg_id)
 
         elif data == "noop":
             return
+
+        elif data.startswith("vk:"):
+            approve_video(chat_id, msg_id, data.split(":", 1)[1])
+
+        elif data.startswith("vn:"):
+            with state_lock:
+                vd = video_drafts.pop(data.split(":", 1)[1], None)
+            if vd:
+                learn_event("cancel", vd)
+                shutil.rmtree(os.path.dirname(vd["path"]), ignore_errors=True)
+            try:
+                bot.edit_message_caption("❌ ተሰርዟል — ምንም አልተለጠፈም።", chat_id, msg_id)
+            except Exception:
+                bot.send_message(chat_id, "❌ ተሰርዟል — ምንም አልተለጠፈም።")
+
+        elif data.startswith("rl:"):  # delete a standing rule
+            ok = learn_delete_rule(data.split(":", 1)[1])
+            text, kb = learn_rules_message()
+            try:
+                bot.edit_message_text(("🗑 ህጉ ተሰርዟል\n\n" if ok else "") + text, chat_id, msg_id, reply_markup=kb)
+            except Exception:
+                bot.send_message(chat_id, text, reply_markup=kb)
 
         elif data == "an:m":  # analytics: back to the platform menu
             show_analytics_menu(chat_id, msg_id)
@@ -4898,6 +6190,15 @@ def handle_text(message):
     if pending_mode == "image":
         run_image_studio(chat_id, text)
         return
+    if pending_mode == "highlight":
+        mm = re.search(r"https?://\S+", text)
+        if mm:
+            run_highlight(chat_id, mm.group(0))
+        else:
+            bot.send_message(chat_id, "ሄኖክ፣ ሊንክ (https://...) ላክልኝ ወይም /cancel።")
+            with state_lock:
+                awaiting_topic[uid] = "highlight"
+        return
     if pending_mode == "shorts":
         m = re.search(r"https?://\S+", text)
         if not m or not is_youtube_url(m.group(0)):
@@ -4916,6 +6217,18 @@ def handle_text(message):
         return
     if is_thanks(text):
         bot.send_message(chat_id, "ምንም አይደለም ሄኖክ! 🙌 ሌላ ነገር ካለ ንገረኝ።")
+        return
+
+    low_t = text.strip().lower()
+    if any(low_t.startswith(t.lower()) for t in RULE_TRIGGERS):  # "ከዛሬ ጀምሮ የኢኮኖሚ ዜና አብዛ" -> permanent rule
+        with Typing(chat_id):
+            r = learn_add_rule(re.sub(r"^(ህግ|ሕግ|rule)\s*[:፦]\s*", "", text.strip(), flags=re.I))
+        extra = ""
+        if r.get("topic") and r.get("direction"):
+            extra = f"\n📊 ርዕስ «{TOPIC_AM.get(r['topic'], r['topic'])}» " + ("ይጨመራል" if r["direction"] == "more" else "ይቀነሳል")
+        if r.get("team"):
+            extra += f"\n⚽ ክለብ «{r['team']}» ወደ ክትትል ዝርዝር ተጨምሯል"
+        bot.send_message(chat_id, f"✅ ህጉ ለዘላለም ተቀምጧል — ኮድ መቀየር አያስፈልግም።\n«{r['rule']}»{extra}\n\n/rules ብለህ ማየት ወይም መሰረዝ ትችላለህ።")
         return
 
     if has_any(text, IMAGE_TRIGGERS):  # "ሎጎ ስራልኝ" / "ምስል ስራልኝ" -> multi-engine image studio
@@ -4981,7 +6294,9 @@ def main():
         threading.Thread(target=find_ethiopic_font, daemon=True).start()
     if OPENROUTER_API_KEY:  # verify model slugs once at startup (also warms the cache)
         threading.Thread(target=get_openrouter_models, daemon=True).start()
+    start_learning()  # self-learning memory (agent_learning.json) + Telegram backup/restore
     start_hunter()   # proactive breaking-news hunter
+    start_sport_engine()  # matchday schedules, live goal / HT / FT alerts, 60 s highlight drafts
     start_alerts()   # proactive analytics alerts
 
     try:
@@ -4997,6 +6312,9 @@ def main():
             types.BotCommand("analytics", "ዳሽቦርድ — ብራንድ እና ጊዜ በቁልፍ ምረጥ"),
             types.BotCommand("image", "ሎጎ / ምስል — 4-5 ስሪቶች ከብዙ AI ሞተሮች"),
             types.BotCommand("canva", "ከ Canva ጋር ግባ"),
+            types.BotCommand("rules", "ቋሚ ህጎች እና ራስ-ትምህርት"),
+            types.BotCommand("schedule", "የዛሬ/ነገ ጨዋታዎች ፕሮግራም"),
+            types.BotCommand("highlight", "የጎል ቪዲዮ ሊንክ → ረቂቅ"),
             types.BotCommand("shorts", "ረጅም ቪዲዮ → 9:16 Shorts"),
             types.BotCommand("ai_status", "የ AI፣ ቻናል፣ YouTube እና Facebook ሁኔታ"),
             types.BotCommand("cancel", "ሰርዝ"),
