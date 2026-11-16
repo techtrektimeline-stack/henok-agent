@@ -934,10 +934,6 @@ def sekela_hub_keyboard():
         types.InlineKeyboardButton("⚽ ሰከላ ስፖርት (Sport)", callback_data="hub:sport"),
     )
     kb.add(
-        types.InlineKeyboardButton("☕ ሰከላ ኮፊ ታይም", callback_data="hub:coffee"),
-        types.InlineKeyboardButton("🤍 ሰከላ በጎ (እርዳታ/አፋልጉኝ)", callback_data="hub:bego"),
-    )
-    kb.add(
         types.InlineKeyboardButton("📊 Analytics", callback_data="hub:an"),
         types.InlineKeyboardButton("🎨 Image / Canva", callback_data="hub:img"),
     )
@@ -953,6 +949,10 @@ def sekela_media_keyboard():
     kb.add(
         types.InlineKeyboardButton("🔔 ሰበር ዜና (Breaking)", callback_data="hub:media:break"),
         types.InlineKeyboardButton("📰 ዋና ዜናዎች", callback_data="hub:media:news"),
+    )
+    kb.add(
+        types.InlineKeyboardButton("☕ ሰከላ ኮፊ ታይም", callback_data="hub:coffee"),
+        types.InlineKeyboardButton("🤍 ሰከላ በጎ (እርዳታ/አፋልጉኝ)", callback_data="hub:bego"),
     )
     kb.add(
         types.InlineKeyboardButton("📝 ፈጣን ካርድ + ፖስት", callback_data="hub:media:fast"),
@@ -1342,9 +1342,11 @@ def amharic_story_lines(stories):
     if not stories:
         return {}
     listing = "\n".join(f"{i}|{s['title']}|{s['summary']}" for i, s in enumerate(stories, 1))
-    prompt = ("Translate these news items into Amharic news style: headline max 8 words, summary ONE sentence. "
-              "Output exactly one line per item in the format N|<headline>|<summary> and nothing else.\n" + listing)
-    text, _ = llm_write(prompt, system=NEWSROOM_SYSTEM, max_tokens=1500, temperature=0.3, models=NEWS_WRITER_MODELS)
+    sys_tr = ("You are a professional Ethiopian newsroom translator. Translate EVERY item into natural, fluent Amharic "
+              "(Ethiopic script). Keep exact format `N|<headline>|<summary>` — one line per item, nothing else.")
+    prompt = ("Translate ALL items below into Amharic news style (headline max 8 words, summary 1 complete sentence). "
+              "Do NOT skip any item and do NOT leave English sentences untranslated.\n" + listing)
+    text, _ = llm_write(prompt, system=sys_tr, max_tokens=2800, temperature=0.2, allow_gemini=True, models=NEWS_WRITER_MODELS)
     out = {}
     for ln in (text or "").splitlines():
         m = re.match(r"^\s*(\d+)\s*\|(.+?)\|(.+)$", ln)
@@ -1363,10 +1365,14 @@ def detect_brand(text):
 def run_news(chat_id, label, topic, brand=None, segment=None):
     start = time.time()
     brand = brand or detect_brand(topic)
+    ack_id = send_progress(chat_id, f"⏳ {label} — ዋና ዋና ዜናዎችን እየፈተሽኩ ነው (ከ15-35 ሰከንድ)...")
     try:
         with Typing(chat_id):
             feed_items = fetch_feed_items(brand, max_age_hours=24, per_feed=5)
             trends = fetch_google_trends(max_age_hours=24) if brand == "media" else []
+            if brand == "media":
+                trends = [t for t in trends if not has_any(t["title"], SPORT_WORDS)]
+                feed_items = [it for it in feed_items if not has_any(it["title"], SPORT_WORDS)]
             feeds_txt = feed_items_text(feed_items + trends)
             stories, sources = scan_stories(topic, hours=24, n=4, feeds=feeds_txt)
             if not stories and (feed_items or trends):
@@ -1385,7 +1391,7 @@ def run_news(chat_id, label, topic, brand=None, segment=None):
         kb = types.InlineKeyboardMarkup()
         if not stories:
             kb.add(types.InlineKeyboardButton("📝 ስለ ርዕሱ በቀጥታ ፖስት አዘጋጅ", callback_data=f"mk:{nid}"))
-            deliver(chat_id, None, f"ሄኖክ፣ ስለ «{label}» ከታማኝ ምንጮች አዲስ ዜና አሁን አልተገኘም። "
+            deliver(chat_id, ack_id, f"ሄኖክ፣ ስለ «{label}» ከታማኝ ምንጮች አዲስ ዜና አሁን አልተገኘም። "
                                    "ርዕሱን በቀጥታ ወደ ፖስት መቀየር ትችላለህ 👇\n\n" + took(start), kb)
             return
         lines = [f"📰 {label} — ዋና ዋና ዜናዎች (ባለፉት 24 ሰዓታት)", "━━━━━━━━━━━━"]
@@ -1396,10 +1402,10 @@ def run_news(chat_id, label, topic, brand=None, segment=None):
             kb.add(types.InlineKeyboardButton(f"{NUM_EMOJI[i - 1]} ካርድ + ፖስት አዘጋጅ", callback_data=f"st:{nid}:{i - 1}"))
         kb.add(types.InlineKeyboardButton("📝 ሌላ ርዕስ በቀጥታ ፖስት አድርግ", callback_data=f"mk:{nid}"))
         body = "\n\n".join(lines) + "\n\n" + took(start)
-        deliver(chat_id, None, body, kb)
+        deliver(chat_id, ack_id, body, kb)
     except Exception as e:
         log.error("news failed: %s", e)
-        deliver(chat_id, None, "ሄኖክ፣ ዜናውን አሁን ማምጣት አልቻልኩም 😅 ጥቂት ቆይተህ እንደገና ሞክር።")
+        deliver(chat_id, ack_id, "ሄኖክ፣ ዜናውን አሁን ማምጣት አልቻልኩም 😅 ጥቂት ቆይተህ እንደገና ሞክር።")
 
 
 # ----------------------------------------------------------------------------
@@ -1978,7 +1984,7 @@ def build_draft(topic, facts=None, sources=None, allow_fallback=True, brand=None
     if unverified and not allow_fallback:
         return None
     rich = len((facts or "").split()) >= 60
-    best, best_score, extra = None, None, ""
+    best, best_score, extra, last_text = None, None, "", ""
     if segment == "bego":
         brief_tpl = BEGO_BRIEF
     elif segment == "coffee":
@@ -1986,7 +1992,7 @@ def build_draft(topic, facts=None, sources=None, allow_fallback=True, brand=None
     else:
         brief_tpl = NEWS_BRIEF
     src_hint = resolve_source("", facts or "", sources, False) if (segment == "bego" and sources) else "ሰከላ በጎ (ከተላከው መረጃ)"
-    for attempt in range(3):
+    for attempt in range(2):
         brief = (brief_tpl.replace("{topic}", topic)
                  .replace("{brand_note}", BRANDS[brand]["brief_note"])
                  .replace("{facts}", facts or topic or "(none)")
@@ -1997,8 +2003,22 @@ def build_draft(topic, facts=None, sources=None, allow_fallback=True, brand=None
                                  allow_gemini=True, models=NEWS_WRITER_MODELS)
         if not text:
             continue
+        last_text = text
         pkg = parse_package(text)
         built = assemble_news_post(pkg, facts or "", sources, unverified and segment != "bego", brand, segment=segment)
+        if not built and allow_fallback:
+            paras = [p.strip() for p in re.split(r"\n\s*\n", text.strip()) if p.strip()]
+            if paras:
+                pkg = {
+                    "headline": clean_headline(paras[0], max_words=7) or clean_headline(topic, max_words=7) or "ሰበር ዜና",
+                    "lead": paras[0],
+                    "context": " ".join(paras[1:3]) if len(paras) > 1 else paras[0],
+                    "official": "NONE",
+                    "source": "",
+                    "image": topic,
+                    "tags": "",
+                }
+                built = assemble_news_post(pkg, facts or "", sources, unverified and segment != "bego", brand, segment=segment)
         if not built:
             continue
         longs = long_sentences(pkg)
@@ -2018,7 +2038,7 @@ def build_draft(topic, facts=None, sources=None, allow_fallback=True, brand=None
         log.error("news writer produced nothing (both OpenRouter and Gemini failed)")
         return None
     pkg, (post, headline) = best
-    fixed = proofread_pkg(pkg) if segment != "bego" else pkg
+    fixed = proofread_pkg(pkg) if (segment != "bego" and best_score and best_score > 0) else pkg
     if fixed is not pkg:
         rebuilt = assemble_news_post(fixed, facts or "", sources, unverified, brand, segment=segment)
         if rebuilt:
@@ -3106,7 +3126,7 @@ def fetch_google_trends(max_age_hours=24):
     ht = "{https://trends.google.com/trending/rss}"
     out = []
     now_utc = datetime.now(timezone.utc)
-    for geo in ("ET", "US"):
+    for geo in ("ET",):
         try:
             r = requests.get(f"https://trends.google.com/trending/rss?geo={geo}", timeout=10,
                              headers={"User-Agent": "Mozilla/5.0 SekelaNewsBot"})
@@ -3265,14 +3285,11 @@ def hunt_once(manual=False, min_importance=None, brand="media", force_strict=Non
             return [s for s in lst if (min_imp is None or s["importance"] >= min_imp)
                     and not is_seen(f"{s['title']} {s['summary']}")]
 
-        stories, scan_sources = scan_stories(focus, hours=6 if brand == "sport" else 12, n=8, feeds=feeds_txt)
-        fresh = unseen(stories, threshold)
-        if not fresh:
-            stories24, src24 = scan_stories(focus, hours=24, n=8, feeds=feeds_txt)
-            if src24:
-                scan_sources = src24
-            stories = stories or stories24
-            fresh = unseen(stories24, threshold) or unseen(stories24)
+        if brand == "media":
+            rss_pool = [it for it in rss_pool if not has_any(it["title"], SPORT_WORDS)]
+            feeds_txt = feed_items_text(rss_pool)
+        stories, scan_sources = scan_stories(focus, hours=24, n=8, feeds=feeds_txt)
+        fresh = unseen(stories, threshold) or unseen(stories)
         if not fresh and rss_pool:
             fresh = unseen(stories_from_feeds(rss_pool, n=10))
         if not fresh and manual:
@@ -3317,7 +3334,7 @@ def hunt_once(manual=False, min_importance=None, brand="media", force_strict=Non
 
 
 def hunter_loop(brand):
-    time.sleep(90 if brand == "media" else 240)
+    time.sleep(15 if brand == "media" else 75)
     interval_env = "HUNT_INTERVAL_MIN" if brand == "media" else "HUNT_SPORT_INTERVAL_MIN"
     while True:
         try:
