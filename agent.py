@@ -1446,20 +1446,47 @@ def pollinations_url(prompt):
             f"?width=1080&height=1350&nologo=true&seed={int(time.time())}")
 
 
-def fetch_image(prompt, attempts=3):
-    """Download the AI background bytes (4:5 portrait). Returns bytes or None."""
+def _fallback_backdrop(brand="media", segment=None, width=1080, height=1350):
+    """Clean branded dark gradient backdrop if all external image generators fail."""
+    if not PIL_OK:
+        return None
+    key = "coffee" if segment == "coffee" else brand
+    th = CARD_THEMES.get(key, CARD_THEMES["media"])
+    img = Image.new("RGB", (width, height), th["deep"])
+    d = ImageDraw.Draw(img)
+    r0, g0, b0 = th["main"]
+    r1, g1, b1 = th["deep"]
+    for y in range(height):
+        k = (y / height) ** 0.85
+        d.line([(0, y), (width, y)], fill=(
+            int(r0 * (1 - k) * 0.55 + r1 * k),
+            int(g0 * (1 - k) * 0.55 + g1 * k),
+            int(b0 * (1 - k) * 0.55 + b1 * k),
+        ))
+    out = io.BytesIO()
+    img.save(out, "JPEG", quality=90)
+    return out.getvalue()
+
+
+def fetch_image(prompt, attempts=2, brand="media", segment=None):
+    """Fast AI background: Pollinations (25s timeout) -> Gemini Imagen fallback -> branded gradient backdrop."""
     url = pollinations_url(prompt)
     for i in range(attempts):
         try:
-            r = requests.get(url, timeout=110)
+            r = requests.get(url, timeout=25)
             ctype = r.headers.get("Content-Type", "")
             if r.status_code == 200 and ctype.startswith("image/") and len(r.content) > 2000:
                 return r.content
             log.warning("Pollinations attempt %d: HTTP %s %s", i + 1, r.status_code, ctype)
         except Exception as e:
             log.warning("Pollinations attempt %d failed: %s", i + 1, e)
-        time.sleep(3)
-    return None
+        time.sleep(2)
+    if GEMINI_API_KEY:
+        try:
+            return gen_gemini_image(prompt)
+        except Exception as e:
+            log.warning("Gemini image fallback failed: %s", short_reason(e, 100))
+    return _fallback_backdrop(brand=brand, segment=segment)
 
 
 _PHOTO_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; SekelaNewsBot/1.0; +https://t.me/sekelamediaET)"}
@@ -1967,8 +1994,23 @@ def build_draft(topic, facts=None, sources=None, allow_fallback=True, brand=None
     else:
         brand = brand or detect_brand(topic)
     sources = list(sources or [])
+    photo_urls = list(photo_urls or [])
     if not facts:
         facts, sources = research_for(topic)
+    if not facts:
+        # Fast RSS / Google Trends fallback so /post still gets real <24h stories & photos
+        pool = fetch_feed_items(brand, max_age_hours=24, per_feed=4)
+        if brand == "media":
+            pool += fetch_google_trends(max_age_hours=24)
+        if pool:
+            kws = [w for w in re.findall(r"[A-Za-z0-9ሀ-፼]{3,}", topic.lower()) if w not in STOP_KEYS]
+            matched = [it for it in pool if any(k in it["title"].lower() for k in kws)] if kws else []
+            picks = (matched or pool)[:4]
+            facts = "\n".join(f"- {it['title']} [{it['source']}]" for it in picks)
+            sources = [(it["source"], it["link"]) for it in picks if it.get("link")]
+            photo_urls = [it["link"] for it in picks if it.get("link")] + photo_urls
+            if not story_image:
+                story_image = next((it.get("image") for it in picks if it.get("image")), None)
     unverified = not facts
     if unverified and not allow_fallback:
         return None
@@ -2013,7 +2055,7 @@ def build_draft(topic, facts=None, sources=None, allow_fallback=True, brand=None
         if rebuilt:
             pkg, (post, headline) = fixed, rebuilt
     real = find_real_photo(list(photo_urls or []) + [u for _, u in sources[:4]], story_image)
-    bg = real or fetch_image(build_image_prompt(pkg.get("image"), brand, segment=segment))
+    bg = real or fetch_image(build_image_prompt(pkg.get("image"), brand, segment=segment), brand=brand, segment=segment)
     badge = COFFEE_BADGE if segment == "coffee" else BRANDS[brand]["badge"]
     card = compose_card(bg, headline, badge, ai=not real, brand=brand, segment=segment) if bg else None
     bot_stats["drafts"] += 1
