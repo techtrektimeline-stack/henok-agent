@@ -1368,16 +1368,19 @@ def run_news(chat_id, label, topic, brand=None, segment=None):
     ack_id = send_progress(chat_id, f"⏳ {label} — ዋና ዋና ዜናዎችን እየፈተሽኩ ነው (ከ15-35 ሰከንድ)...")
     try:
         with Typing(chat_id):
+            tg_items = fetch_tg_channel_items(brand, max_age_hours=24, per_channel=3)
             feed_items = fetch_feed_items(brand, max_age_hours=24, per_feed=5)
             trends = fetch_google_trends(max_age_hours=24) if brand == "media" else []
             if brand == "media":
+                tg_items = [it for it in tg_items if not has_any(it["title"], SPORT_WORDS)]
                 trends = [t for t in trends if not has_any(t["title"], SPORT_WORDS)]
                 feed_items = [it for it in feed_items if not has_any(it["title"], SPORT_WORDS)]
-            feeds_txt = feed_items_text(feed_items + trends)
+            primary_pool = tg_items + feed_items
+            feeds_txt = feed_items_text(primary_pool + trends[:6])
             stories, sources = scan_stories(topic, hours=24, n=4, feeds=feeds_txt)
-            if not stories and (feed_items or trends):
+            if not stories and (primary_pool or trends):
                 kws = [w for w in re.findall(r"[A-Za-z0-9ሀ-፼]{3,}", topic.lower()) if w not in STOP_KEYS]
-                pool = feed_items + trends
+                pool = primary_pool or trends
                 matched = [it for it in pool if any(k in it["title"].lower() for k in kws)] if kws else []
                 stories = stories_from_feeds(matched or pool, n=4)
                 if not sources:
@@ -3155,6 +3158,77 @@ def fetch_google_trends(max_age_hours=24):
     return out
 
 
+
+ETH_TG_CHANNELS = os.environ.get(
+    "ETH_TG_CHANNELS",
+    "tikvahethiopia,ethio_mereja,fanabora,BBCAmharic,addisstandard,alainamharic,ebcnews,ShegerFM102_1"
+)
+SPORT_TG_CHANNELS = os.environ.get(
+    "SPORT_TG_CHANNELS",
+    "tikvahethsport,ethiosport,433"
+)
+
+
+def _fetch_one_tg_channel(handle, max_age_hours=24, per_channel=3):
+    handle = handle.strip().lstrip("@")
+    if not handle:
+        return []
+    out = []
+    now_utc = datetime.now(timezone.utc)
+    try:
+        r = requests.get(f"https://t.me/s/{handle}", timeout=10,
+                         headers={"User-Agent": "Mozilla/5.0 (compatible; SekelaNewsBot/1.0)"})
+        if r.status_code != 200 or "tgme_widget_message_wrap" not in r.text:
+            return []
+        blocks = r.text.split("<div class=\"tgme_widget_message_wrap")[1:]
+        for blk in reversed(blocks[-12:]):
+            mp = re.search(r'data-post="([^"]+)"', blk)
+            mt = re.search(r'<time[^>]+datetime="([^"]+)"', blk)
+            mx = re.search(r'<div class="tgme_widget_message_text[^"]*"[^>]*>(.*?)</div>', blk, re.S)
+            if not mx:
+                continue
+            age_h = 6.0
+            if mt:
+                try:
+                    dt = datetime.fromisoformat(mt.group(1).replace("Z", "+00:00"))
+                    age_h = (now_utc - dt).total_seconds() / 3600.0
+                    if age_h > max_age_hours:
+                        continue
+                except Exception:
+                    pass
+            txt = re.sub(r"<br\s*/?>", " ", mx.group(1))
+            txt = re.sub(r"<[^>]+>", " ", txt)
+            txt = re.sub(r"\s+", " ", html_lib.unescape(txt)).strip()
+            if len(txt) < 25:
+                continue
+            mimg = re.search(r"tgme_widget_message_photo_wrap[^>]+background-image:url\(['\"]([^'\"]+)['\"]\)", blk)
+            link = f"https://t.me/{mp.group(1)}" if mp else f"https://t.me/s/{handle}"
+            out.append({
+                "source": f"TG @{handle}",
+                "title": txt[:180],
+                "link": link,
+                "image": mimg.group(1) if mimg else None,
+                "age_h": round(age_h, 1),
+            })
+            if len(out) >= per_channel:
+                break
+    except Exception as e:
+        log.info("TG scrape @%s skipped: %s", handle, short_reason(e, 70))
+    return out
+
+
+def fetch_tg_channel_items(brand="media", max_age_hours=24, per_channel=3):
+    raw = ETH_TG_CHANNELS if brand == "media" else SPORT_TG_CHANNELS
+    handles = [h.strip() for h in raw.split(",") if h.strip()]
+    if not handles:
+        return []
+    out = []
+    with ThreadPoolExecutor(max_workers=min(6, len(handles))) as ex:
+        for rows in ex.map(lambda h: _fetch_one_tg_channel(h, max_age_hours, per_channel), handles):
+            out.extend(rows)
+    return out
+
+
 def fetch_feed_items(brand="media", max_age_hours=24, per_feed=5):
     env_name = "NEWS_RSS_FEEDS" if brand == "media" else "SPORT_RSS_FEEDS"
     spec = os.environ.get(env_name, DEFAULT_FEEDS[brand])
@@ -3276,9 +3350,10 @@ def hunt_once(manual=False, min_importance=None, brand="media", force_strict=Non
         if note:
             focus += " " + note
 
+        tg_items = fetch_tg_channel_items(brand, max_age_hours=24, per_channel=3)
         feed_items = fetch_feed_items(brand, max_age_hours=24, per_feed=5)
         trends = fetch_google_trends(max_age_hours=24) if brand == "media" else []
-        rss_pool = feed_items + trends
+        rss_pool = tg_items + feed_items + trends[:5]
         feeds_txt = feed_items_text(rss_pool)
 
         def unseen(lst, min_imp=None):
