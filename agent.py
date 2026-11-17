@@ -33,6 +33,7 @@ import hashlib
 import io
 import html as html_lib
 import json
+import math
 import logging
 import os
 import random
@@ -167,10 +168,10 @@ def brand_footer(brand):
 
 
 OPENROUTER_BASE_MODELS = [m.strip() for m in os.environ.get(
-    "OPENROUTER_MODELS", "anthropic/claude-haiku-5.5,openai/gpt-4o-mini,deepseek/deepseek-chat").split(",")
+    "OPENROUTER_MODELS", "openai/gpt-4o-mini,anthropic/claude-haiku-5.5,deepseek/deepseek-chat").split(",")
     if m.strip()]
 NEWS_WRITER_MODELS = [m.strip() for m in os.environ.get(
-    "NEWS_WRITER_MODELS", "anthropic/claude-haiku-5.5,openai/gpt-4o-mini,deepseek/deepseek-chat").split(",")
+    "NEWS_WRITER_MODELS", "openai/gpt-4o-mini,anthropic/claude-haiku-5.5,deepseek/deepseek-chat").split(",")
     if m.strip()]
 NEWS_ALLOW_GEMINI = os.environ.get("NEWS_ALLOW_GEMINI", "1").strip() != "0"
 OPENROUTER_EXTRA_RULES = (("anthropic/claude", "haiku"), ("x-ai/grok", "mini"))
@@ -1049,6 +1050,7 @@ NEWSROOM_SYSTEM = (
     "singular subjects take singular verbs («ሚኒስቴሩ አስታውቋል»). Consistent tense inside each paragraph.\n"
     "- RICH AND SPECIFIC: give who, what, where, when, numbers, names, background, why it matters to Ethiopians, and "
     "what happens next — strictly from the notes. Never invent facts, phone numbers, bank accounts, or quotes.\n"
+    "- ORIGINAL REWRITE RULE: NEVER copy or lightly paraphrase BBC Amharic, Fana, or any source wording. Extract ONLY the verified facts and rewrite 100% originally in Sekela's own voice with richer background context (4-6 clear sentences) and a short 2-line punchy card headline.\n"
     "- Neutral third person; NEVER address anyone directly (never ሄኖክ/አንተ/እኛ).\n"
     "- Plain text, no markdown, no emojis inside paragraphs; keep widely used Latin terms (AI, Bitcoin, TikTok, clubs/players)."
 )
@@ -1737,69 +1739,147 @@ def _draw_bold_shadow(draw, x, baseline, text, f_eth, f_lat, fill, shadow=True):
         _draw_mixed(draw, x + dx, baseline + dy, text, f_eth, f_lat, fill)
 
 
+def _draw_sekela_s_emblem(draw, x, y, h, accent):
+    """Draws the interlocking geometric Sekela S emblem in pure vector polygons."""
+    w = int(h * 0.72)
+    s = max(10, int(h * 0.20))
+    # Upper-left curve in brand accent
+    draw.rounded_rectangle([x, y, x + w, y + s], radius=s // 2, fill=accent + (255,))
+    draw.polygon([
+        (x + int(w * 0.14), y + int(h * 0.20)),
+        (x + int(w * 0.14) + s, y + int(h * 0.14)),
+        (x + int(w * 0.62), y + int(h * 0.56)),
+        (x + int(w * 0.62) - s, y + int(h * 0.62)),
+    ], fill=accent + (255,))
+    # Lower-right curve in crisp white
+    draw.polygon([
+        (x + int(w * 0.38), y + int(h * 0.36)),
+        (x + int(w * 0.38) + s, y + int(h * 0.30)),
+        (x + int(w * 0.86), y + int(h * 0.78)),
+        (x + int(w * 0.86) - s, y + int(h * 0.84)),
+    ], fill=(255, 255, 255, 255))
+    draw.rounded_rectangle([x, y + h - s, x + w, y + h], radius=s // 2, fill=(255, 255, 255, 255))
+    return w
+
+
 def compose_card(bg_bytes, headline, badge=None, ai=True, width=1080, height=1350, brand="media", segment=None):
-    """1080x1350 (4:5 portrait) card for Media, Sport, Coffee Time, or Bego."""
+    """1080x1350 (4:5 portrait) v6 card: Matte Charcoal #141518, upper ~75% photo, compact cosine fade, 2-line bold hook."""
     if not PIL_OK or not bg_bytes or not headline:
         return None
     eth_path = find_ethiopic_font()
     if not eth_path:
         return None
-    theme_key = segment if segment in ("coffee", "bego") else brand
-    theme = CARD_THEMES.get(theme_key, CARD_THEMES["media"])
+    CHARCOAL = (20, 21, 24)
+    accents = {"media": (200, 16, 46), "sport": (0, 135, 81), "coffee": (200, 125, 50), "bego": (214, 175, 62)}
+    sub_labels = {"media": "MEDIA", "sport": "SPORT", "coffee": "COFFEE", "bego": "BEGO"}
+    default_badges = {"media": "ሰከላ ዜና", "sport": "ሰከላ ስፖርት", "coffee": "ሰከላ ኮፊ ታይም", "bego": "ሰከላ በጎ"}
+    key = segment if segment in ("coffee", "bego") else brand
+    accent = accents.get(key, accents["media"])
+    sub_en = sub_labels.get(key, "MEDIA")
+    badge_txt = badge or default_badges.get(key, "ሰከላ ዜና")
+    brand_am = BRANDS.get(brand, BRANDS["media"]).get("name", "ሰከላ ሚዲያ")
+    handle = BRANDS.get(brand, BRANDS["media"]).get("tg_handle", "@sekelamediaET")
+
     try:
         W, H = width, height
-        img = Image.open(io.BytesIO(bg_bytes)).convert("RGB")
-        img = _cover_crop_resize(img, W, H)
-        img = ImageEnhance.Contrast(img).enhance(1.07)
-        img = _apply_seamless_gradient(img, start_ratio=0.56, tint=theme["deep"], max_alpha=245)
-        draw = ImageDraw.Draw(img, "RGBA")
+        canvas = Image.new("RGBA", (W, H), CHARCOAL + (255,))
+        margin, max_w = 54, W - 124
 
-        margin, max_w = 56, W - 112
-        start_fs = 114 if segment in ("coffee", "bego") else 102
-        fs, lines = start_fs, []
-        for fs in range(start_fs, 55, -4):
+        # Fit headline cleanly into max 2-3 punchy lines (prefer 2 large lines)
+        fs, lines = 84, []
+        for fs in range(86, 52, -4):
             f_eth, f_lat = ImageFont.truetype(eth_path, fs), _latin_font(fs)
-            lines = _wrap(headline, f_eth, f_lat, max_w)
-            if len(lines) <= 3 and all(_measure(ln, f_eth, f_lat) <= max_w for ln in lines):
+            lines = _wrap(headline, f_eth, f_lat, max_w - 36)
+            if len(lines) <= 2 and all(_measure(ln, f_eth, f_lat) <= max_w - 36 for ln in lines):
                 break
-        line_h = int(fs * 1.18)
-        badge_h = 56
-        badge_y = H - 46 - badge_h
-        y0 = badge_y - 36 - line_h * len(lines)
+        if len(lines) > 3:
+            lines = lines[:3]
+        line_h = int(fs * 1.24)
+        total_text_h = len(lines) * line_h
+        hy = H - 78 - total_text_h - 14
+        pill_y = hy - 66
 
-        draw.rounded_rectangle([margin, y0 - 28, margin + 124, y0 - 17], radius=5, fill=theme["accent"] + (255,))
+        # Place photo in upper ~75% with compact cosine fade right above badge -> solid #141518
+        photo_h = min(H, hy + 45)
+        src_im = Image.open(io.BytesIO(bg_bytes)).convert("RGB")
+        photo = _cover_crop_resize(src_im, W, photo_h)
+        photo = ImageEnhance.Contrast(photo).enhance(1.06).convert("RGBA")
+        alpha_mask = Image.new("L", (W, photo_h), 255)
+        ap = alpha_mask.load()
+        fade_start = max(0, pill_y - 110)
+        for y in range(fade_start, photo_h):
+            t = (y - fade_start) / max(1, (photo_h - fade_start))
+            a = int(255 * 0.5 * (1.0 + math.cos(math.pi * t)))
+            for x in range(W):
+                ap[x, y] = a
+        photo.putalpha(alpha_mask)
+        canvas.paste(photo, (0, 0), photo)
+
+        # Gentle top feathered shadow for floating SEKELA logo
+        top_sh = Image.new("RGBA", (W, 180), (0, 0, 0, 0))
+        tp = top_sh.load()
+        for y in range(180):
+            a = int(160 * ((1.0 - y / 180.0) ** 1.5))
+            for x in range(W):
+                tp[x, y] = (CHARCOAL[0], CHARCOAL[1], CHARCOAL[2], a)
+        canvas.paste(top_sh, (0, 0), top_sh)
+        draw = ImageDraw.Draw(canvas, "RGBA")
+
+        # Top 8px brand stripe
+        draw.rectangle([0, 0, W, 8], fill=accent + (255,))
+
+        # Floating S + SEKELA + MEDIA/SPORT pill
+        sw = _draw_sekela_s_emblem(draw, 52, 38, 64, accent)
+        tx = 52 + sw + 16
+        f_logo = _latin_font(28)
+        f_sub = _latin_font(15)
+        draw.text((tx, 40), "SEKELA", font=f_logo, fill=(255, 255, 255, 255))
+        sb_w = int(f_sub.getlength(sub_en))
+        pw_sub, ph_sub = sb_w + 24, 24
+        draw.rounded_rectangle([tx, 74, tx + pw_sub, 74 + ph_sub], radius=ph_sub // 2, fill=accent + (255,))
+        draw.text((tx + 12, 78), sub_en, font=f_sub, fill=(255, 255, 255, 255))
+
+        # Category badge
+        b_eth, b_lat = ImageFont.truetype(eth_path, 28), _latin_font(26)
+        bw = int(_measure(badge_txt, b_eth, b_lat)) + 40
+        pill_h = 46
+        draw.rounded_rectangle([margin, pill_y, margin + bw, pill_y + pill_h], radius=10, fill=accent + (255,))
+        _draw_mixed(draw, margin + 20, pill_y + 33, badge_txt, b_eth, b_lat, (255, 255, 255, 255))
+
+        # Vertical brand bar + Extra-bold Hook
+        bar_h = max(40, total_text_h - 14)
+        draw.rounded_rectangle([margin, hy + 10, margin + 12, hy + 10 + bar_h], radius=6, fill=accent + (255,))
         f_eth, f_lat = ImageFont.truetype(eth_path, fs), _latin_font(fs)
         for i, ln in enumerate(lines):
-            base = y0 + i * line_h + int(fs * 0.96)
-            accent_line = len(lines) > 1 and i == len(lines) - 1
-            color = theme["accent"] + (255,) if accent_line else (255, 252, 245, 255)
-            _draw_bold_shadow(draw, margin, base, ln, f_eth, f_lat, color)
+            base = hy + i * line_h + int(fs * 0.92)
+            _draw_bold_shadow(draw, margin + 36, base, ln, f_eth, f_lat, (255, 255, 255, 255))
 
-        b_eth, b_lat = ImageFont.truetype(eth_path, 30), _latin_font(28)
-        if not badge:
-            badge = COFFEE_BADGE if segment == "coffee" else (BEGO_BADGE if segment == "bego" else BRANDS[brand]["badge"])
-        bw = int(_measure(badge, b_eth, b_lat)) + 44
-        draw.rounded_rectangle([margin, badge_y, margin + bw, badge_y + badge_h], radius=28,
-                               fill=theme["main"] + (248,), outline=theme["gold"] + (255,), width=2)
-        _draw_mixed(draw, margin + 22, badge_y + 39, badge, b_eth, b_lat, (255, 255, 255, 255))
+        # Clean bottom social footer (no divider line)
+        f_foot_lat = _latin_font(22)
+        f_foot_eth = ImageFont.truetype(eth_path, 24)
+        draw.ellipse([margin, H - 54, margin + 28, H - 26], fill=(42, 171, 238, 255))
+        draw.polygon([(margin + 6, H - 40), (margin + 21, H - 47), (margin + 17, H - 33), (margin + 12, H - 38)],
+                     fill=(255, 255, 255, 255))
+        draw.ellipse([margin + 36, H - 54, margin + 64, H - 26], fill=(24, 119, 242, 255))
+        draw.text((margin + 46, H - 51), "f", font=_latin_font(21), fill=(255, 255, 255, 255))
+        draw.text((margin + 76, H - 51), handle, font=f_foot_lat, fill=(195, 202, 215, 255))
 
-        handle = BRANDS[brand].get("tg_handle", "@sekelamediaET")
-        _draw_social_footer(draw, W - margin, badge_y + badge_h // 2, handle)
+        rw = int(_measure(brand_am, f_foot_eth, f_foot_lat))
+        _draw_mixed(draw, W - margin - rw, H - 31, brand_am, f_foot_eth, f_foot_lat, (195, 202, 215, 255))
 
         if AI_LABEL and ai:
-            a_font = _latin_font(20)
-            label = "AI illustration"
-            lw = int(a_font.getlength(label)) + 26
-            draw.rounded_rectangle([W - margin - lw + 16, 32, W - 40, 32 + 34], radius=17, fill=(0, 0, 0, 115))
-            draw.text((W - margin - lw + 29, 32 + 24), label, font=a_font, fill=(255, 255, 255, 210), anchor="ls")
+            a_font = _latin_font(18)
+            label = "AI"
+            lw = int(a_font.getlength(label)) + 22
+            draw.rounded_rectangle([W - margin - lw, 36, W - margin, 36 + 28], radius=14, fill=(0, 0, 0, 110))
+            draw.text((W - margin - lw + 11, 41), label, font=a_font, fill=(255, 255, 255, 190))
 
         out = io.BytesIO()
-        img.save(out, "JPEG", quality=92, optimize=True)
+        canvas.convert("RGB").save(out, "JPEG", quality=92, optimize=True)
         return out.getvalue()
     except Exception as e:
         log.error("card composition failed: %s", e)
         return None
-
 
 def _as_photo(data):
     bio = io.BytesIO(data)
@@ -2827,12 +2907,12 @@ HUNT_HEADERS = {
     "coffee": "☕ ሄኖክ፣ አዲስ የሰከላ ኮፊ ታይም ቫይራል ታሪክ አዘጋጅቼልሃለሁ! ፖስት እናድርገው?",
 }
 HUNT_FOCUS = {
-    "media": ("Ethiopia & Global: Ethiopian state/independent outlets (Fana, EBC, ENA, Addis Standard, Borkena, "
-              "Capital, Addis Fortune, Sheger FM), social media/activist conversations (TikTok, YouTube, X, public "
-              "Facebook pages, Tikvah, Gursha, Behaja), Google Trends, economy/birr/jobs, AI/tech updates, Addis Ababa "
-              "local life, diplomacy, and international stories mentioning Ethiopia or major global events"),
-    "sport": ("Football and sport that Ethiopian fans care about, with LIVE results and goals from matches played in the "
-              "last hours (scorer, minute, scoreline, teams), 3-4-3 / 433 style football stories and transfers"),
+    "media": ("Ethiopia & Global: Ethiopian PM/government official pages & ministries, state/independent outlets (Fana, EBC, ENA, "
+              "Addis Standard, Borkena, Capital, Addis Fortune, Sheger FM), Ethiopian activists & social media (TikTok, YouTube, X, "
+              "public Facebook pages, Tikvah, Gursha, Behaja), economy/birr/jobs, AI/tech updates, Addis Ababa local life, and major global events"),
+    "sport": ("Men's top-flight football (Arsenal, Man United, Man City, Liverpool, Chelsea, Real Madrid, Barcelona, Premier League, "
+              "Champions League, La Liga), LiveScore live results/standings/fixtures/announcements, Ethiopian sports media & Arsenal/ManUtd "
+              "Ethiopian fan communities, plus Ethiopian athletics. EXCLUDE obscure women's club transfers."),
 }
 
 PRIORITY_TOPICS = ("economy", "tech", "addis", "diplomacy", "social", "culture", "coffee")
@@ -3161,11 +3241,11 @@ def fetch_google_trends(max_age_hours=24):
 
 ETH_TG_CHANNELS = os.environ.get(
     "ETH_TG_CHANNELS",
-    "tikvahethiopia,ethio_mereja,fanabora,BBCAmharic,addisstandard,alainamharic,ebcnews,ShegerFM102_1"
+    "tikvahethiopia,ethio_mereja,fanabora,BBCAmharic,addisstandard,alainamharic,ebcnews,ShegerFM102_1,PMOEthiopia,ENA_Ethiopia"
 )
 SPORT_TG_CHANNELS = os.environ.get(
     "SPORT_TG_CHANNELS",
-    "tikvahethsport,ethiosport,433"
+    "tikvahethsport,ethiosport,433,Arsenal_Ethiopia,ManUtd_Ethiopia"
 )
 
 
@@ -3324,8 +3404,8 @@ def hunt_once(manual=False, min_importance=None, brand="media", force_strict=Non
         daily = hunt_daily[brand]
         if daily["date"] != today:
             daily.update(date=today, count=0)
-        cap = int(os.environ.get("HUNT_MAX_PER_DAY", "24") if brand == "media"
-                  else os.environ.get("HUNT_SPORT_MAX_PER_DAY", "16"))
+        cap = int(os.environ.get("HUNT_MAX_PER_DAY", "35") if brand == "media"
+                  else os.environ.get("HUNT_SPORT_MAX_PER_DAY", "25"))
         if not manual and daily["count"] >= cap:
             return "cap"
         threshold = min_importance if min_importance is not None else int(os.environ.get("HUNT_MIN_IMPORTANCE", "5"))
@@ -3362,7 +3442,10 @@ def hunt_once(manual=False, min_importance=None, brand="media", force_strict=Non
 
         if brand == "media":
             rss_pool = [it for it in rss_pool if not has_any(it["title"], SPORT_WORDS)]
-            feeds_txt = feed_items_text(rss_pool)
+        else:
+            _wom_skip = ("women's super league", "wsl", "man city women", "manchester city women", "arsenal women", "chelsea women", "barcelona femeni")
+            rss_pool = [it for it in rss_pool if not any(w in it["title"].lower() for w in _wom_skip) or "ethiopia" in it["title"].lower()]
+        feeds_txt = feed_items_text(rss_pool)
         stories, scan_sources = scan_stories(focus, hours=24, n=8, feeds=feeds_txt)
         fresh = unseen(stories, threshold) or unseen(stories)
         if not fresh and rss_pool:
@@ -3423,7 +3506,7 @@ def hunter_loop(brand):
                 log.info("hunt %s: %s (daily=%d)", brand, st, daily_n)
         except Exception as e:
             log.error("hunter loop error (%s): %s", brand, e)
-        time.sleep(max(5, int(os.environ.get(interval_env, "30" if brand == "media" else "40"))) * 60)
+        time.sleep(max(5, int(os.environ.get(interval_env, "18" if brand == "media" else "20"))) * 60)
 
 
 def start_hunter():
