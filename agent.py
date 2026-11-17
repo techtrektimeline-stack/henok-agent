@@ -168,10 +168,10 @@ def brand_footer(brand):
 
 
 OPENROUTER_BASE_MODELS = [m.strip() for m in os.environ.get(
-    "OPENROUTER_MODELS", "openai/gpt-4o-mini,anthropic/claude-haiku-5.5,deepseek/deepseek-chat").split(",")
+    "OPENROUTER_MODELS", "openai/gpt-4o-mini,anthropic/claude-haiku-4.5,deepseek/deepseek-chat").split(",")
     if m.strip()]
 NEWS_WRITER_MODELS = [m.strip() for m in os.environ.get(
-    "NEWS_WRITER_MODELS", "openai/gpt-4o-mini,anthropic/claude-haiku-5.5,deepseek/deepseek-chat").split(",")
+    "NEWS_WRITER_MODELS", "openai/gpt-4o-mini,anthropic/claude-haiku-4.5,deepseek/deepseek-chat").split(",")
     if m.strip()]
 NEWS_ALLOW_GEMINI = os.environ.get("NEWS_ALLOW_GEMINI", "1").strip() != "0"
 OPENROUTER_EXTRA_RULES = (("anthropic/claude", "haiku"), ("x-ai/grok", "mini"))
@@ -544,6 +544,20 @@ class GeminiError(Exception):
     pass
 
 
+_last_ai_error = {"or": "", "gm": "", "hunt": ""}
+
+
+def _ai_error_hint():
+    parts = []
+    if _last_ai_error.get("hunt"):
+        parts.append("Desk: " + _last_ai_error["hunt"])
+    if _last_ai_error.get("or"):
+        parts.append("OpenRouter: " + _last_ai_error["or"])
+    if _last_ai_error.get("gm"):
+        parts.append("Gemini: " + _last_ai_error["gm"])
+    return ("\n🔍 ምክንያት: " + " | ".join(parts)) if parts else ""
+
+
 def _gemini_call(model, payload, retries=3, timeout=GEMINI_TIMEOUT):
     url = f"{GEMINI_BASE}/models/{model}:generateContent"
     headers = {"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"}
@@ -645,12 +659,14 @@ def gemini_generate(contents, system=None, grounding=False, temperature=0.8, max
     for model in gemini_active_models():
         try:
             text, sources = _extract(_gemini_call(model, payload))
+            _last_ai_error["gm"] = ""
             return text, sources, model
         except Exception as e:
             last_err = e
             log.warning("Gemini model failed: %s", e)
             if "HTTP 404" in str(e):
                 _gm_bad.add(model)
+    _last_ai_error["gm"] = short_reason(last_err, 90)
     raise GeminiError(f"all Gemini models failed: {last_err}")
 
 
@@ -846,6 +862,7 @@ def openrouter_chat(messages, max_tokens=1800, temperature=0.8, models=None):
                 timeout=90,
             )
             if r.status_code in (401, 402):
+                _last_ai_error["or"] = f"HTTP {r.status_code} (key/credits)"
                 log.warning("OpenRouter %s (key/credits problem) - switching to Gemini", r.status_code)
                 return None, None
             if r.status_code != 200:
@@ -854,8 +871,10 @@ def openrouter_chat(messages, max_tokens=1800, temperature=0.8, models=None):
             txt = txt.strip()
             if not txt:
                 raise RuntimeError(f"{model} returned empty text")
+            _last_ai_error["or"] = ""
             return txt, model
         except Exception as e:
+            _last_ai_error["or"] = short_reason(e, 90)
             log.warning("OpenRouter model failed: %s", e)
     return None, None
 
@@ -2241,7 +2260,7 @@ def run_post(chat_id, label, topic, context_text=None, context_sources=None, bra
         d = build_draft(topic, facts=context_text, sources=context_sources, allow_fallback=True, brand=brand,
                         photo_urls=photo_urls, story_image=story_image, segment=segment, custom_photo=custom_photo)
         if not d:
-            deliver(chat_id, ack_id, "ሄኖክ፣ ዜናውን አሁን ማዘጋጀት አልቻልኩም 😕 ጥቂት ቆይተህ ደግመህ ሞክር።")
+            deliver(chat_id, ack_id, "ሄኖክ፣ ዜናውን አሁን ማዘጋጀት አልቻልኩም 😕 ጥቂት ቆይተህ ደግመህ ሞክር።" + _ai_error_hint())
             return
         if segment == "coffee":
             head = "☕ የሰከላ ኮፊ ታይም ረቂቅ ዝግጁ ነው!"
@@ -2264,7 +2283,7 @@ def run_fast_post(chat_id, brand="media"):
     if status == "sent":
         drop_message(chat_id, ack)
         return
-    deliver(chat_id, ack, "ሄኖክ፣ አሁን ፈጣን ካርድ ማዘጋጀት አልተቻለም 😕 እባክህ የራስህን ርዕስ ጻፍ ወይም ቆይተህ ሞክር።\n\n" + took(start))
+    deliver(chat_id, ack, "ሄኖክ፣ አሁን ፈጣን ካርድ ማዘጋጀት አልተቻለም 😕 እባክህ የራስህን ርዕስ ጻፍ ወይም ቆይተህ ሞክር።" + _ai_error_hint() + "\n\n" + took(start))
 
 
 def run_coffee_auto(chat_id, custom_topic=None):
@@ -3398,6 +3417,7 @@ def hunt_once(manual=False, min_importance=None, brand="media", force_strict=Non
     if not lock.acquire(blocking=False):
         return "busy"
     try:
+        _last_ai_error["hunt"] = ""
         if not GEMINI_API_KEY and not OPENROUTER_API_KEY:
             return "nokey"
         today = addis_now().strftime("%Y-%m-%d")
@@ -3485,6 +3505,7 @@ def hunt_once(manual=False, min_importance=None, brand="media", force_strict=Non
         del offer_log[:-12]
         return "sent"
     except Exception as e:
+        _last_ai_error["hunt"] = short_reason(e, 90)
         log.error("hunt failed (%s): %s", brand, e)
         return "failed"
     finally:
@@ -6199,7 +6220,8 @@ def _manual_hunt(chat_id, brand, min_importance=5):
         "nokey": "GEMINI_API_KEY / OPENROUTER_API_KEY አልተሞላም።",
         "cap": "የዛሬው የዜና ገደብ ደርሷል።",
     }
-    deliver(chat_id, ack_id, msgs.get(status, msgs["failed"]) + "\n\n" + took(start))
+    hint = _ai_error_hint() if status == "failed" else ""
+    deliver(chat_id, ack_id, msgs.get(status, msgs["failed"]) + hint + "\n\n" + took(start))
 
 
 @bot.message_handler(commands=["breaking", "hunt"])
