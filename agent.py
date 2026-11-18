@@ -164,7 +164,8 @@ def fb_enabled(brand="media"):
 def brand_footer(brand):
     b = BRANDS[brand]
     return ("🔗 ፈጣን እና ታማኝ መረጃ ለማግኘት ይቀላቀሉን:\n"
-            f"Telegram: {b['tg_link']}\nFacebook: {b['fb_link']}")
+            f"Telegram: {b['tg_link']}\nFacebook: {b['fb_link']}\n"
+            "📩 ጥቆማ / መረጃ ለመላክ: https://t.me/HenokAssistantBot?start=tip")
 
 
 OPENROUTER_BASE_MODELS = [m.strip() for m in os.environ.get(
@@ -520,6 +521,63 @@ def is_private(chat):
     return getattr(chat, "type", None) == "private"
 
 
+_tip_waiters = {}
+_tip_box = {}
+
+
+def _handle_public_tip(message):
+    user = getattr(message, "from_user", None)
+    if not user:
+        return False
+    uid, chat_id = user.id, message.chat.id
+    txt = (getattr(message, "text", None) or getattr(message, "caption", None) or "").strip()
+    low = txt.lower()
+    now = time.time()
+    # Prune expired waiters (>30m)
+    for k in [k for k, ts in list(_tip_waiters.items()) if now - ts > 1800]:
+        _tip_waiters.pop(k, None)
+    if low.startswith("/start tip") or low == "/tip":
+        _tip_waiters[uid] = now
+        bot.send_message(
+            chat_id,
+            "🙏 እንኳን ወደ **ሰከላ ሚዲያ የጥቆማ መስመር** በደህና መጡ!\n\n"
+            "ዜና፣ የአደጋ/ክስተት ፎቶ ወይም ቪዲዮ፣ ወይም የ«አፋልጉኝ / እርዳታ» መልእክትዎን "
+            "አሁን እዚህ ይላኩልን — በቀጥታ ለአርታዒ ቡድናችን ይደርሳል።"
+        )
+        return True
+    if uid not in _tip_waiters:
+        return False
+    _tip_waiters.pop(uid, None)
+    sender = (getattr(user, "first_name", "") or "") + (f" (@{user.username})" if getattr(user, "username", None) else f" (ID:{uid})")
+    tid = uuid.uuid4().hex[:10]
+    photo_id = message.photo[-1].file_id if getattr(message, "photo", None) else None
+    video_id = message.video.file_id if getattr(message, "video", None) else None
+    _tip_box[tid] = {"text": txt, "photo_id": photo_id, "video_id": video_id, "sender": sender.strip(), "ts": now}
+    if len(_tip_box) > 30:
+        for k in sorted(_tip_box, key=lambda x: _tip_box[x]["ts"])[:-20]:
+            _tip_box.pop(k, None)
+    kb = types.InlineKeyboardMarkup()
+    kb.add(
+        types.InlineKeyboardButton("📝 ወደ ዜና ረቂቅ ቀይር", callback_data=f"tpn:{tid}"),
+        types.InlineKeyboardButton("🤍 ወደ ሰከላ በጎ ቀይር", callback_data=f"tpb:{tid}"),
+    )
+    if video_id:
+        kb.add(types.InlineKeyboardButton("🎬 ቪዲዮውን ብራንድ አድርገህ አዘጋጅ", callback_data=f"tpv:{tid}"))
+    kb.add(types.InlineKeyboardButton("❌ አልፈው", callback_data=f"tpx:{tid}"))
+    summary = f"📩 **አዲስ የህዝብ ጥቆማ ደርሷል!**\n👤 ላኪ: {sender.strip()}\n\n{txt or '(ጽሑፍ የለውም)'}"
+    try:
+        if photo_id:
+            bot.send_photo(OWNER_ID, photo_id, caption=summary[:1020], reply_markup=kb)
+        elif video_id:
+            bot.send_video(OWNER_ID, video_id, caption=summary[:1020], reply_markup=kb)
+        else:
+            bot.send_message(OWNER_ID, summary[:4000], reply_markup=kb)
+    except Exception as e:
+        log.warning("tip relay failed: %s", e)
+    bot.send_message(chat_id, "✅ እናመሰግናለን! መረጃዎ ለሰከላ ሚዲያ አርታዒ ቡድን ደርሷል።")
+    return True
+
+
 def private_owner_only(func):
     @functools.wraps(func)
     def wrapper(message, *a, **kw):
@@ -527,6 +585,8 @@ def private_owner_only(func):
             return
         user = getattr(message, "from_user", None)
         if user is None or user.id != OWNER_ID:
+            if _handle_public_tip(message):
+                return
             try:
                 bot.send_message(message.chat.id, "ይህ የሄኖክ የግል ቦት ነው 🔒")
             except Exception:
@@ -596,7 +656,7 @@ def _extract(data):
 _gm_lock = threading.Lock()
 _gm_cache = {"ts": 0.0, "models": None}
 _gm_bad = set()
-GEMINI_PREFERRED = ["gemini-2.0-flash", "gemini-flash-latest", "gemini-2.5-flash", "gemini-2.5-pro", "gemini-pro-latest"]
+GEMINI_PREFERRED = ["gemini-2.5-flash", "gemini-flash-latest", "gemini-2.0-flash", "gemini-2.5-pro", "gemini-pro-latest"]
 _GEMINI_SKIP = re.compile(r"omni|image|imagen|tts|live|audio|embed|thinking|exp|preview|lite|8b|robotics|computer|"
                           r"learnlm|gemma|aqa|veo", re.I)
 
@@ -666,6 +726,15 @@ def gemini_generate(contents, system=None, grounding=False, temperature=0.8, max
             log.warning("Gemini model failed: %s", e)
             if "HTTP 404" in str(e):
                 _gm_bad.add(model)
+    if grounding and last_err and "HTTP 400" in str(last_err):
+        payload.pop("tools", None)
+        for model in gemini_active_models():
+            try:
+                text, sources = _extract(_gemini_call(model, payload))
+                _last_ai_error["gm"] = ""
+                return text, sources, model
+            except Exception as e:
+                last_err = e
     _last_ai_error["gm"] = short_reason(last_err, 90)
     raise GeminiError(f"all Gemini models failed: {last_err}")
 
@@ -834,14 +903,23 @@ def get_openrouter_models(force=False):
     return list(models)
 
 
+OPENROUTER_FREE_MODELS = [
+    "meta-llama/llama-3.3-70b-instruct:free",
+    "deepseek/deepseek-chat-v3-0324:free",
+    "google/gemini-2.0-flash-exp:free",
+    "openrouter/free",
+]
+
+
 def ordered_openrouter_models(prefer=None):
     base = get_openrouter_models()
-    if not prefer:
-        return base
     with _or_lock:
         ids = _or_cache.get("ids")
+    free = [m for m in OPENROUTER_FREE_MODELS if (ids is None or m in ids) and m not in base]
+    if not prefer:
+        return base + free
     first = [m for m in prefer if ids is None or m in ids]
-    return first + [m for m in base if m not in first]
+    return first + [m for m in base if m not in first] + [m for m in free if m not in first]
 
 
 def openrouter_chat(messages, max_tokens=1800, temperature=0.8, models=None):
@@ -861,10 +939,14 @@ def openrouter_chat(messages, max_tokens=1800, temperature=0.8, models=None):
                       "max_tokens": max_tokens},
                 timeout=90,
             )
-            if r.status_code in (401, 402):
-                _last_ai_error["or"] = f"HTTP {r.status_code} (key/credits)"
-                log.warning("OpenRouter %s (key/credits problem) - switching to Gemini", r.status_code)
+            if r.status_code == 401:
+                _last_ai_error["or"] = "HTTP 401 (bad key)"
+                log.warning("OpenRouter 401 (bad key) - switching to Gemini")
                 return None, None
+            if r.status_code == 402:
+                _last_ai_error["or"] = "HTTP 402 (no credits)"
+                log.warning("OpenRouter 402 on %s - trying free models", model)
+                continue
             if r.status_code != 200:
                 raise RuntimeError(f"{model} HTTP {r.status_code}: {r.text[:160]}")
             txt = ((r.json().get("choices") or [{}])[0].get("message") or {}).get("content") or ""
@@ -1295,15 +1377,15 @@ def assemble_news_post(pkg, facts="", sources=None, unverified=False, brand="med
         return None
     if segment == "bego":
         src = (pkg.get("source") or "").strip() or "ሰከላ በጎ (ከተላከው መረጃ)"
-        lead_icon = "🤍"
+        head_line = f"🤍 {headline}"
     elif segment == "coffee":
         src = resolve_source(pkg.get("source"), facts, sources, unverified)
-        lead_icon = "☕"
+        head_line = f"☕ {headline}"
     else:
         src = resolve_source(pkg.get("source"), facts, sources, unverified)
-        lead_icon = "🔴"
+        head_line = f"{headline}\n#Ethiopia #ኢትዮጵያ"
     tags = " ".join(build_tags(brand, pkg.get("tags"), headline, segment=segment))
-    parts = [f"{lead_icon} {headline}", lead, context]
+    parts = [head_line, lead, context]
     if official:
         parts.append(official)
     parts += [f"📌 ምንጭ፡ {src}", brand_footer(brand), tags]
@@ -1313,19 +1395,21 @@ def assemble_news_post(pkg, facts="", sources=None, unverified=False, brand="med
 STORY_PROMPT = (
     "Current Addis Ababa date/time: {now_eat} (UTC: {now_utc}).\n"
     "Search the web NOW and find {n} engaging, timely stories from the last {hours} hours about: {focus}\n"
-    "FRESHNESS RULE: Prefer stories from the last 1-24 hours. Do NOT restrict only to breaking news — include "
-    "engaging daily news, viral social media conversations, football scores/standings/transfers, and local updates.\n"
-    "MULTI-PLATFORM COVERAGE (prioritize private media & social voices, NOT just state TV):\n"
-    "1) Ethiopian private/independent media, Telegram channels, YouTubers, TikTokers, Facebook pages (Tikvah, Gursha, "
-    "Behaja, Addis Standard, Sheger FM, Borkena, Capital Ethiopia, Fana, EBC, BBC/DW/VOA Amharic).\n"
-    "2) Viral Ethiopian & global stories (economy, Addis Ababa life, AI/tech, entertainment, diaspora, diplomacy).\n"
-    "3) Football & Sport: Ethiopia national team (Walias), CAF/AFCON/WC qualifiers, Premier League, Champions League, "
-    "transfers, points/standings, and Ethiopian sport pages.\n"
+    "MULTI-DESK COVERAGE (include ALL relevant pillars, not just breaking news):\n"
+    "1) Ethiopian Ministries (~22 ministries: Health, Education, Finance, Foreign Affairs, Transport, MInT, Trade, Agriculture, "
+    "Justice, Peace, Labor, Tourism, Water & Energy, Urban) + Public Utilities (Ethio Telecom, Ethiopian Electric Utility "
+    "power outage/maintenance notices, AAWSA water alerts, NBE, Ethiopian Airlines, Immigration/Passport, Addis Mayor).\n"
+    "2) Social Media & Creators: TikTok Creative Awards / vote leads, viral TikTokers, YouTubers, Instagram, X/Twitter "
+    "Ethiopian commentators & private media (Tikvah, Getu Temesgen, Zehabesha, Rosha TV, Gursha, Sheger FM, Addis Standard).\n"
+    "3) Peaceful Community & Faith Updates: Ethiopian Orthodox Tewahedo Church & Islamic Affairs announcements, holidays, charity.\n"
+    "4) Global, Ethiopian TVs & Sport: EBC/Fana/Walta/Arts TV/EBS/Asham/fast Facebook news pages, viral TikTok debates "
+    "(turn trending discussions into original news), US/UK/EU/Asia/China-Ethiopia relations, ANY new AI, software, app, gadget, or tech announcement/launch worldwide (not just articles — turn new product/model/software releases and trending tech discussions into news), BeSoccer/ESPN Football "
+    "(pre-match previews, live goals, post-match reactions for EPL/UCL/Walias), Ethiopian Athletics/Running & Boxing.\n"
     "SAFETY FILTER (STRICT): NEVER include anything that incites ethnic or religious conflict, hate speech, or violence.\n"
     "{feeds}"
     "Return {n} stories, ONE per line, in EXACTLY this format (English):\n"
     "STORY|<importance 1-10>|<headline, max 14 words>|<outlet/platform names, comma separated>|<one sentence with the key fact>\n"
-    "Importance: 8-10 = major breaking/viral/match story, 4-7 = strong daily, social, or transfer story."
+    "Importance: 8-10 = major breaking/viral/utility/match story, 4-7 = strong daily, ministry, creator, or global story."
 )
 _STORY_RE = re.compile(r"^\s*STORY\s*\|\s*(\d+)\s*\|(.*?)\|(.*?)\|(.*)$")
 
@@ -1578,11 +1662,59 @@ def _wiki_real_photo(query):
     return None
 
 
-def find_real_photo(urls, direct_image=None, max_pages=5, topic_hint=None):
+def _compose_photo_collage(photo_bytes_list, width=1080, height=1350):
+    """Blends 2-4 real news/social photos into a crisp editorial grid so multi-photo stories shine."""
+    if not PIL_OK or len(photo_bytes_list) < 2:
+        return photo_bytes_list[0] if photo_bytes_list else None
+    try:
+        ims = [Image.open(io.BytesIO(b)).convert("RGB") for b in photo_bytes_list[:4]]
+        W, H = width, height
+        gap = 6
+        canvas = Image.new("RGB", (W, H), (20, 21, 24))
+        n = len(ims)
+        if n == 2:
+            w1 = (W - gap) // 2
+            canvas.paste(_cover_crop_resize(ims[0], w1, H), (0, 0))
+            canvas.paste(_cover_crop_resize(ims[1], W - w1 - gap, H), (w1 + gap, 0))
+        elif n == 3:
+            h1 = int(H * 0.56)
+            h2 = H - h1 - gap
+            w2 = (W - gap) // 2
+            canvas.paste(_cover_crop_resize(ims[0], W, h1), (0, 0))
+            canvas.paste(_cover_crop_resize(ims[1], w2, h2), (0, h1 + gap))
+            canvas.paste(_cover_crop_resize(ims[2], W - w2 - gap, h2), (w2 + gap, h1 + gap))
+        else:
+            w2, h2 = (W - gap) // 2, (H - gap) // 2
+            canvas.paste(_cover_crop_resize(ims[0], w2, h2), (0, 0))
+            canvas.paste(_cover_crop_resize(ims[1], W - w2 - gap, h2), (w2 + gap, 0))
+            canvas.paste(_cover_crop_resize(ims[2], w2, H - h2 - gap), (0, h2 + gap))
+            canvas.paste(_cover_crop_resize(ims[3], W - w2 - gap, H - h2 - gap), (w2 + gap, h2 + gap))
+        canvas = ImageEnhance.Contrast(canvas).enhance(1.04)
+        out = io.BytesIO()
+        canvas.save(out, "JPEG", quality=92)
+        return out.getvalue()
+    except Exception as e:
+        log.info("collage build failed: %s", short_reason(e, 70))
+        return photo_bytes_list[0]
+
+
+def find_real_photo(urls, direct_image=None, max_pages=5, topic_hint=None, extra_images=None):
+    cand_imgs = []
     if direct_image:
-        b = download_photo(direct_image)
-        if b:
-            return b
+        cand_imgs.append(direct_image)
+    for u in (extra_images or []):
+        if u and u not in cand_imgs:
+            cand_imgs.append(u)
+    if cand_imgs:
+        downloaded = []
+        for u in cand_imgs[:4]:
+            b = download_photo(u)
+            if b:
+                downloaded.append(b)
+        if len(downloaded) >= 2:
+            return _compose_photo_collage(downloaded)
+        if downloaded:
+            return downloaded[0]
     seen, pages = set(), 0
     for u in urls or []:
         if not u or u in seen or pages >= max_pages:
@@ -1793,26 +1925,17 @@ def _draw_bold_shadow(draw, x, baseline, text, f_eth, f_lat, fill, shadow=True):
 
 
 def _draw_sekela_s_emblem(draw, x, y, h, accent):
-    """Draws the interlocking geometric Sekela S emblem in pure vector polygons."""
-    w = int(h * 0.72)
-    s = max(10, int(h * 0.20))
-    # Upper-left curve in brand accent
-    draw.rounded_rectangle([x, y, x + w, y + s], radius=s // 2, fill=accent + (255,))
-    draw.polygon([
-        (x + int(w * 0.14), y + int(h * 0.20)),
-        (x + int(w * 0.14) + s, y + int(h * 0.14)),
-        (x + int(w * 0.62), y + int(h * 0.56)),
-        (x + int(w * 0.62) - s, y + int(h * 0.62)),
-    ], fill=accent + (255,))
-    # Lower-right curve in crisp white
-    draw.polygon([
-        (x + int(w * 0.38), y + int(h * 0.36)),
-        (x + int(w * 0.38) + s, y + int(h * 0.30)),
-        (x + int(w * 0.86), y + int(h * 0.78)),
-        (x + int(w * 0.86) - s, y + int(h * 0.84)),
-    ], fill=(255, 255, 255, 255))
-    draw.rounded_rectangle([x, y + h - s, x + w, y + h], radius=s // 2, fill=(255, 255, 255, 255))
-    return w
+    """Draws a crisp rounded Sekela S badge with bold geometric S and clean border."""
+    s = h
+    r = max(12, int(s * 0.24))
+    draw.rounded_rectangle([x, y, x + s, y + s], radius=r, fill=accent + (255,), outline=(255, 255, 255, 210), width=2)
+    f_s = _latin_font(int(s * 0.68))
+    bbox = f_s.getbbox("S")
+    tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+    tx = x + (s - tw) // 2 - bbox[0]
+    ty = y + (s - th) // 2 - bbox[1]
+    draw.text((tx, ty), "S", font=f_s, fill=(255, 255, 255, 255))
+    return s
 
 
 def compose_card(bg_bytes, headline, badge=None, ai=True, width=1080, height=1350, brand="media", segment=None):
@@ -1838,32 +1961,33 @@ def compose_card(bg_bytes, headline, badge=None, ai=True, width=1080, height=135
         canvas = Image.new("RGBA", (W, H), CHARCOAL + (255,))
         margin, max_w = 54, W - 124
 
-        # Fit headline cleanly into max 2-3 punchy lines (prefer 2 large lines)
-        fs, lines = 84, []
-        for fs in range(86, 52, -4):
+        # Fit headline into max 2 punchy, large lines that rise cleanly from right above the footer
+        fs, lines = 92, []
+        for fs in range(98, 52, -4):
             f_eth, f_lat = ImageFont.truetype(eth_path, fs), _latin_font(fs)
-            lines = _wrap(headline, f_eth, f_lat, max_w - 36)
-            if len(lines) <= 2 and all(_measure(ln, f_eth, f_lat) <= max_w - 36 for ln in lines):
+            lines = _wrap(headline, f_eth, f_lat, max_w - 28)
+            if len(lines) <= 2 and all(_measure(ln, f_eth, f_lat) <= max_w - 28 for ln in lines):
                 break
-        if len(lines) > 3:
-            lines = lines[:3]
+        if len(lines) > 2:
+            lines = lines[:2]
         line_h = int(fs * 1.24)
         total_text_h = len(lines) * line_h
-        # Raise hook slightly below center (~60-66% down) instead of bottom-most
-        hy = min(H - 250 - total_text_h, max(int(H * 0.56), int(H * 0.62) - total_text_h // 2))
-        pill_y = hy - 66
+        hy = H - 104 - total_text_h
+        pill_y = hy - 64
 
-        # Full-bleed photo across 1080x1350 with soft, translucent gradual scrim so image shows through naturally
+        # Full-bleed studio-graded photo (vibrant color, crisp sharpness, balanced contrast)
         src_im = Image.open(io.BytesIO(bg_bytes)).convert("RGB")
         photo = _cover_crop_resize(src_im, W, H)
-        photo = ImageEnhance.Contrast(photo).enhance(1.06).convert("RGBA")
+        photo = ImageEnhance.Color(photo).enhance(1.12)
+        photo = ImageEnhance.Contrast(photo).enhance(1.08)
+        photo = ImageEnhance.Sharpness(photo).enhance(1.10).convert("RGBA")
         canvas.paste(photo, (0, 0))
 
         scrim = Image.new("RGBA", (W, H), (0, 0, 0, 0))
         sp = scrim.load()
-        fade_start = max(0, pill_y - 200)
-        fade_end = min(H, hy + total_text_h + 70)
-        max_scrim = 188  # Soft translucent charcoal (~74%), never heavy opaque black
+        fade_start = max(int(H * 0.44), pill_y - 120)
+        fade_end = min(H, hy + total_text_h + 28)
+        max_scrim = 224  # Rich dark charcoal gradient (~88%) behind text so photo shows subtly & text pops
         for y in range(fade_start, H):
             if y < fade_end:
                 t = (y - fade_start) / max(1, (fade_end - fade_start))
@@ -1909,9 +2033,11 @@ def compose_card(bg_bytes, headline, badge=None, ai=True, width=1080, height=135
         bar_h = max(40, total_text_h - 14)
         draw.rounded_rectangle([margin, hy + 10, margin + 12, hy + 10 + bar_h], radius=6, fill=accent + (255,))
         f_eth, f_lat = ImageFont.truetype(eth_path, fs), _latin_font(fs)
+        hook_colors = [(255, 255, 255, 255), (255, 212, 72, 255)]
         for i, ln in enumerate(lines):
             base = hy + i * line_h + int(fs * 0.92)
-            _draw_bold_shadow(draw, margin + 36, base, ln, f_eth, f_lat, (255, 255, 255, 255))
+            col = hook_colors[i % len(hook_colors)]
+            _draw_bold_shadow(draw, margin + 36, base, ln, f_eth, f_lat, col)
 
         # Clean bottom social footer (no divider line)
         f_foot_lat = _latin_font(22)
@@ -2100,11 +2226,11 @@ def fb_analytics_text(brand="media", metrics=None):
 # ----------------------------------------------------------------------------
 # Post package: guaranteed 1080x1350 card + copy -> preview -> approval -> TG + FB
 # ----------------------------------------------------------------------------
-def _resolve_card_bg(pkg_image, brand, segment, photo_urls=None, story_image=None, sources=None, custom_photo=None):
+def _resolve_card_bg(pkg_image, brand, segment, photo_urls=None, story_image=None, sources=None, custom_photo=None, extra_images=None):
     """Priority: 1) custom_photo / real source photo -> 2) Gemini Imagen -> 3) Pollinations 20s -> 4) Branded backdrop."""
     if custom_photo:
         return custom_photo, True, False
-    real = find_real_photo(list(photo_urls or []) + [u for _, u in (sources or [])[:5]], story_image, topic_hint=pkg_image)
+    real = find_real_photo(list(photo_urls or []) + [u for _, u in (sources or [])[:5]], story_image, topic_hint=pkg_image, extra_images=extra_images)
     if real:
         return real, True, False
     ai_bg, is_ai = fetch_image(build_image_prompt(pkg_image, brand, segment=segment), brand=brand, segment=segment)
@@ -2114,7 +2240,7 @@ def _resolve_card_bg(pkg_image, brand, segment, photo_urls=None, story_image=Non
 
 
 def build_draft(topic, facts=None, sources=None, allow_fallback=True, brand=None, photo_urls=None, story_image=None,
-                segment=None, custom_photo=None):
+                segment=None, custom_photo=None, extra_images=None):
     if segment in ("coffee", "bego"):
         brand = "media"
     else:
@@ -2185,7 +2311,7 @@ def build_draft(topic, facts=None, sources=None, allow_fallback=True, brand=None
         rebuilt = assemble_news_post(fixed, facts or "", sources, unverified, brand, segment=segment)
         if rebuilt:
             pkg, (post, headline) = fixed, rebuilt
-    bg, is_real, is_ai = _resolve_card_bg(pkg.get("image"), brand, segment, photo_urls, story_image, sources, custom_photo)
+    bg, is_real, is_ai = _resolve_card_bg(pkg.get("image"), brand, segment, photo_urls, story_image, sources, custom_photo, extra_images=extra_images)
     badge = COFFEE_BADGE if segment == "coffee" else (BEGO_BADGE if segment == "bego" else BRANDS[brand]["badge"])
     card = compose_card(bg, headline, badge, ai=is_ai, brand=brand, segment=segment) if bg else None
     bot_stats["drafts"] += 1
@@ -2976,12 +3102,12 @@ HUNT_FOCUS = {
 
 PRIORITY_TOPICS = ("economy", "tech", "addis", "diplomacy", "social", "culture", "coffee")
 TOPIC_DESK = {
-    "economy": "Economy, Business & Jobs (ኢኮኖሚ/ንግድ/ስራ): birr, prices, trade, investment, banks, coffee, job/opportunity alerts",
-    "tech": "Technology, AI & Social Platforms (ቴክኖሎጂ): AI, Meta/Facebook/TikTok changes, telecom, startups, digital Ethiopia",
-    "addis": "Addis Ababa & Local Incidents: corridor projects, city updates, roads, airports, housing, local community news",
-    "diplomacy": "Diplomacy & Global Ethiopia News: Ethiopia's foreign relations, international coverage mentioning Ethiopia, AU, summits",
-    "social": "Ethiopian social/activist/creator trends: viral TikTok, YouTube, X & Facebook discussions, diaspora commentary",
-    "culture": "Culture & tourism: festivals, music, film, heritage, holidays",
+    "economy": "Economy, NBE, Ministries & Business: National Bank (NBE), Finance/Trade/Agriculture/Revenue/Labor ministries, birr, banks, jobs",
+    "tech": "ALL AI, Software & Tech Launches: ANY new AI model/tool/app/software/hardware announcement worldwide (OpenAI, Gemini, Claude, DeepSeek, Grok, Qwen, Mistral, Runway, Cursor, Meta, Apple, Google, Microsoft) + Ethio Telecom, Telebirr, MInT, startups",
+    "addis": "Addis Ababa, Utilities & Public Alerts: EEU power outage schedules, AAWSA water notices, roads, Immigration/Passport, Ethiopian Airlines, Mayor",
+    "diplomacy": "Diplomacy & Global News: US, UK, Europe, Asia, China-US-Ethiopia ties, AU, Foreign Affairs, major world events",
+    "social": "TikTok, YouTube, X & Creator Trends: TikTok Creative Awards/leaderboards, YouTubers, Instagram, X/Twitter activists, private media",
+    "culture": "Culture, Faith & Community: Ethiopian Orthodox & Islamic community announcements, holidays, music, film, tourism (strictly peaceful)",
     "coffee": "Sekela Coffee Time: surprising, funny, educational, or weird-but-true viral human-interest stories from ANY field",
 }
 TOPIC_WHEEL = ["economy", "tech", "coffee", "addis", "diplomacy", "social", "economy", "culture", "coffee", "tech", "diplomacy", "addis"]
@@ -3081,7 +3207,7 @@ DEFAULT_FEEDS = {
         "Capital Ethiopia|https://www.capitalethiopia.com/feed/,"
         "Addis Fortune|https://addisfortune.news/feed/,"
         "The Reporter Ethiopia|https://www.thereporterethiopia.com/feed/,"
-        "Ethio Negari|https://ethionegari.com/feed/"
+        "Ethio Negari|https://ethionegari.com/feed/,Zehabesha|https://zehabesha.com/feed/,OpenAI News|https://openai.com/news/rss.xml,TechCrunch AI|https://techcrunch.com/category/artificial-intelligence/feed/,The Verge AI|https://www.theverge.com/rss/ai-artificial-intelligence/index.xml,Hacker News|https://hnrss.org/frontpage,HuggingFace Blog|https://huggingface.co/blog/feed.xml,Product Hunt|https://www.producthunt.com/feed,Ars Technica|https://feeds.arstechnica.com/arstechnica/technology-lab"
     ),
     "sport": (
         "BBC Sport|https://feeds.bbci.co.uk/sport/football/rss.xml,"
@@ -3300,7 +3426,11 @@ def fetch_google_trends(max_age_hours=24):
 
 ETH_TG_CHANNELS = os.environ.get(
     "ETH_TG_CHANNELS",
-    "tikvahethiopia,ethio_mereja,fanabora,BBCAmharic,addisstandard,alainamharic,ebcnews,ShegerFM102_1,PMOEthiopia,ENA_Ethiopia"
+    "tikvahethiopia,ethio_mereja,GetuTemesgen,zehabesha,RoshaTV,fanabora,NBE_Ethiopia,MoE_Ethiopia,"
+    "PMOEthiopia,AdanechAbiebie,HOPREthiopia,ethiotelecom,EthiopianElectricUtility,AAWSA_Official,"
+    "flyethiopian,MohEthiopia,mfaethiopia,MInTEthiopia,MoF_Ethiopia,ICS_Ethiopia,EOTC_TV,"
+    "EthiopianIslamicAffairs,ShegerFM102_1,AhaduFM943,BisratFM1011,BBCAmharic,addisstandard,"
+    "alainamharic,ebcnews,ENA_Ethiopia"
 )
 SPORT_TG_CHANNELS = os.environ.get(
     "SPORT_TG_CHANNELS",
@@ -3340,13 +3470,14 @@ def _fetch_one_tg_channel(handle, max_age_hours=24, per_channel=3):
             txt = re.sub(r"\s+", " ", html_lib.unescape(txt)).strip()
             if len(txt) < 25:
                 continue
-            mimg = re.search(r"tgme_widget_message_photo_wrap[^>]+background-image:url\(['\"]([^'\"]+)['\"]\)", blk)
+            imgs = re.findall(r"tgme_widget_message_photo_wrap[^>]+background-image:url\(['\"]([^'\"]+)['\"]\)", blk)
             link = f"https://t.me/{mp.group(1)}" if mp else f"https://t.me/s/{handle}"
             out.append({
                 "source": f"TG @{handle}",
                 "title": txt[:180],
                 "link": link,
-                "image": mimg.group(1) if mimg else None,
+                "image": imgs[0] if imgs else None,
+                "images": imgs[:4],
                 "age_h": round(age_h, 1),
             })
             if len(out) >= per_channel:
@@ -3397,7 +3528,7 @@ def feed_items_text(items, limit=32):
 
 def stories_from_feeds(items, n=8):
     return [{"importance": 6, "title": i["title"], "outlets": i["source"], "summary": i["title"],
-             "link": i.get("link"), "image": i.get("image")} for i in items[:n]]
+             "link": i.get("link"), "image": i.get("image"), "images": i.get("images") or []} for i in items[:n]]
 
 
 def _outlet_key(story):
@@ -3455,6 +3586,20 @@ def pick_story(fresh, brand, desk=None, strict=False):
     return chosen
 
 
+_UNSAFE_INCITEMENT = re.compile(
+    r"(kill\s+(?:all|every)\s+(?:amhara|oromo|tigray|muslim|christian|orthodox)|"
+    r"ethnic\s+cleansing|genocide\s+call|burn\s+(?:church|mosque)|"
+    r"በዘር\s*ማጥፋት|መስጊድ\s*አቃጥሉ|ቤተክርስቲያን\s*አቃጥሉ)", re.I
+)
+
+
+def safety_gate_check(text):
+    """Editorial Balance Gate: allows ministries, utilities, social/creators & faith updates; blocks ONLY ethnic/religious hate/incitement."""
+    if not text:
+        return False
+    return not bool(_UNSAFE_INCITEMENT.search(text))
+
+
 def hunt_once(manual=False, min_importance=None, brand="media", force_strict=None):
     """Proactive & manual news scan. Never skips silently if Gemini search fails — immediately falls back to RSS + Google Trends."""
     lock = hunt_locks[brand]
@@ -3494,7 +3639,8 @@ def hunt_once(manual=False, min_importance=None, brand="media", force_strict=Non
         tg_items = fetch_tg_channel_items(brand, max_age_hours=24, per_channel=3)
         feed_items = fetch_feed_items(brand, max_age_hours=24, per_feed=5)
         trends = fetch_google_trends(max_age_hours=24) if brand == "media" else []
-        rss_pool = tg_items + feed_items + trends[:5]
+        besoccer_items = fetch_besoccer_items(max_items=8) if brand == "sport" else []
+        rss_pool = tg_items + feed_items + besoccer_items + trends[:5]
         feeds_txt = feed_items_text(rss_pool)
 
         def unseen(lst, min_imp=None):
@@ -3510,7 +3656,7 @@ def hunt_once(manual=False, min_importance=None, brand="media", force_strict=Non
         stories, scan_sources = scan_stories(focus, hours=24, n=10, feeds=feeds_txt)
         # Always merge scan_stories + live TG/RSS/Trends stories so we never stall on 1 item
         feed_stories = stories_from_feeds(rss_pool, n=25) if rss_pool else []
-        combined = list(stories) + feed_stories
+        combined = [s for s in (list(stories) + feed_stories) if safety_gate_check(f"{s.get('title','')} {s.get('summary','')}")]
         fresh = unseen(combined, threshold) or unseen(combined)
         if not fresh and manual:
             fresh = combined[:12]
@@ -3532,11 +3678,16 @@ def hunt_once(manual=False, min_importance=None, brand="media", force_strict=Non
         topic = f"{story['title']}. {story['summary']}"
         # Inherit matching real link/image from rss_pool if scan_stories omitted them
         s_keys = story_keys(topic)
-        best_match_img, best_match_links = story.get("image"), ([story["link"]] if story.get("link") else [])
+        best_match_img = story.get("image")
+        best_extra_imgs = list(story.get("images") or [])
+        best_match_links = [story["link"]] if story.get("link") else []
         for it in rss_pool:
             if len(s_keys & story_keys(it.get("title", ""))) >= 2:
                 if not best_match_img and it.get("image"):
                     best_match_img = it["image"]
+                for im_u in (it.get("images") or []):
+                    if im_u and im_u not in best_extra_imgs:
+                        best_extra_imgs.append(im_u)
                 if it.get("link") and it["link"] not in best_match_links:
                     best_match_links.append(it["link"])
         facts, sources = research_for(topic)
@@ -3544,7 +3695,7 @@ def hunt_once(manual=False, min_importance=None, brand="media", force_strict=Non
             facts = f"{story['title']}. {story['summary']} (Reported by: {story['outlets']})"
             sources = scan_sources or ([(story['outlets'] or "Sekela Media Desk", story.get("link") or BRANDS[brand]["tg_link"])])
         d = build_draft(topic, facts=facts, sources=sources, allow_fallback=True, brand=brand,
-                        photo_urls=best_match_links, story_image=best_match_img, segment=segment)
+                        photo_urls=best_match_links, story_image=best_match_img, segment=segment, extra_images=best_extra_imgs)
         if not d:
             return "failed"
         hdr = HUNT_HEADERS["coffee"] if segment == "coffee" else HUNT_HEADERS[brand]
@@ -3638,6 +3789,41 @@ def fmt_eat(dt_utc):
 def sport_leagues():
     raw = os.environ.get("SPORT_LEAGUES", "")
     return [x.strip() for x in raw.split(",") if x.strip()] or list(ESPN_LEAGUES)
+
+
+def fetch_besoccer_items(max_items=8):
+    """Scrapes BeSoccer livescore/today page for live scores, upcoming big matches, and match stories."""
+    out = []
+    for url in ("https://www.besoccer.com/livescore", "https://www.besoccer.com/"):
+        try:
+            r = requests.get(url, headers=_PHOTO_HEADERS, timeout=(5, 10))
+            if r.status_code != 200:
+                continue
+            html = r.text[:350000]
+            # Extract match links & titles like /match/arsenal/manchester-united/...
+            seen_m = set()
+            for m in re.finditer(r'href="(https?://www\.besoccer\.com/match/[^"]+)"[^>]*>(.*?)</a>', html, re.S | re.I):
+                href = m.group(1)
+                if href in seen_m:
+                    continue
+                txt = re.sub(r"<[^>]+>", " ", m.group(2))
+                txt = re.sub(r"\s+", " ", html_lib.unescape(txt)).strip()
+                if len(txt) < 6 or len(txt) > 120:
+                    continue
+                seen_m.add(href)
+                out.append({
+                    "source": "BeSoccer",
+                    "title": f"Match Update: {txt}",
+                    "link": href,
+                    "image": None,
+                    "images": [],
+                    "age_h": 1.0,
+                })
+                if len(out) >= max_items:
+                    return out
+        except Exception as e:
+            log.info("BeSoccer fetch skipped: %s", short_reason(e, 70))
+    return out
 
 
 def espn_scoreboard(league, dates=None):
@@ -4148,13 +4334,59 @@ def yt_video_info(url):
         return y.extract_info(url, download=False)
 
 
-def normalize_highlight(ffmpeg, src, out, max_sec):
+def _sekela_video_overlay(brand="media", width=1280, height=720):
+    """Generates a transparent PNG watermark/badge overlay so every video carries Sekela branding."""
+    if not PIL_OK:
+        return None
+    try:
+        ov = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(ov, "RGBA")
+        accent = (0, 135, 81) if brand == "sport" else (200, 16, 46)
+        sub_en = "SPORT" if brand == "sport" else "MEDIA"
+        handle = BRANDS.get(brand, BRANDS["media"]).get("tg_handle", "@sekelamediaET")
+        sw = _draw_sekela_s_emblem(draw, 28, 24, 46, accent)
+        f_logo = _latin_font(22)
+        f_sub = _latin_font(12)
+        tx = 28 + sw + 12
+        draw.text((tx, 24), "SEKELA", font=f_logo, fill=(255, 255, 255, 240))
+        sb_w = int(f_sub.getlength(sub_en))
+        draw.rounded_rectangle([tx, 50, tx + sb_w + 18, 69], radius=9, fill=accent + (235,))
+        draw.text((tx + 9, 53), sub_en, font=f_sub, fill=(255, 255, 255, 255))
+        f_foot = _latin_font(18)
+        fw = int(f_foot.getlength(handle))
+        draw.rounded_rectangle([width - fw - 44, height - 46, width - 22, height - 18], radius=12, fill=(20, 21, 24, 175))
+        draw.text((width - fw - 33, height - 42), handle, font=f_foot, fill=(255, 255, 255, 235))
+        p_ov = os.path.join(tempfile.gettempdir(), f"sekela_vid_ov_{brand}_{width}x{height}.png")
+        ov.save(p_ov, "PNG")
+        return p_ov
+    except Exception:
+        return None
+
+
+def normalize_highlight(ffmpeg, src, out, max_sec, brand="sport"):
     for crf in ("26", "32"):
-        cmd = [ffmpeg, "-y", "-i", src, "-t", str(max_sec), "-vf",
-               "scale=w='min(iw,1280)':h='min(ih,1280)':force_original_aspect_ratio=decrease:force_divisible_by=2",
-               "-c:v", "libx264", "-preset", "veryfast", "-crf", crf, "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k",
-               "-movflags", "+faststart", out]
+        ov_path = _sekela_video_overlay(brand=brand, width=1280, height=720)
+        if ov_path and os.path.isfile(ov_path):
+            cmd = [
+                ffmpeg, "-y", "-i", src, "-i", ov_path, "-t", str(max_sec),
+                "-filter_complex",
+                "[0:v]scale=w='min(iw,1280)':h='min(ih,1280)':force_original_aspect_ratio=decrease:force_divisible_by=2[v];"
+                "[1:v][v]scale2ref=w=iw:h=ih[ov][base];[base][ov]overlay=0:0",
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", crf, "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k",
+                "-movflags", "+faststart", out
+            ]
+        else:
+            cmd = [ffmpeg, "-y", "-i", src, "-t", str(max_sec), "-vf",
+                   "scale=w='min(iw,1280)':h='min(ih,1280)':force_original_aspect_ratio=decrease:force_divisible_by=2",
+                   "-c:v", "libx264", "-preset", "veryfast", "-crf", crf, "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k",
+                   "-movflags", "+faststart", out]
         r = subprocess.run(cmd, capture_output=True, timeout=420)
+        if r.returncode != 0 and ov_path:
+            cmd = [ffmpeg, "-y", "-i", src, "-t", str(max_sec), "-vf",
+                   "scale=w='min(iw,1280)':h='min(ih,1280)':force_original_aspect_ratio=decrease:force_divisible_by=2",
+                   "-c:v", "libx264", "-preset", "veryfast", "-crf", crf, "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k",
+                   "-movflags", "+faststart", out]
+            r = subprocess.run(cmd, capture_output=True, timeout=420)
         if r.returncode != 0 or not os.path.isfile(out):
             raise RuntimeError("ffmpeg failed: " + r.stderr.decode("utf-8", "ignore")[-160:])
         if os.path.getsize(out) < 48 * 1024 * 1024:
@@ -5666,6 +5898,65 @@ def analyze_voice(data, mime):
     if not analysis:
         analysis = "⚠️ ማጠቃለያውን አሁን ማዘጋጀት አልተቻለም — ሙሉ ትራንስክሪፕቱ ከታች ነው።"
     return analysis + "\n\n━━━━━━━━━━━━\n📝 ሙሉ ትራንስክሪፕት:\n" + transcript
+
+
+@bot.callback_query_handler(func=lambda c: c.data and c.data.startswith(("tpn:", "tpb:", "tpv:", "tpx:")))
+def on_tip_action(call):
+    if call.from_user.id != OWNER_ID:
+        bot.answer_callback_query(call.id, "የግል ነው")
+        return
+    act, tid = call.data.split(":", 1)
+    tip = _tip_box.get(tid)
+    if act == "tpx":
+        _tip_box.pop(tid, None)
+        bot.answer_callback_query(call.id, "ተሰርዟል")
+        drop_message(call.message.chat.id, call.message.message_id)
+        return
+    if not tip:
+        bot.answer_callback_query(call.id, "ጥቆማው አልተገኘም")
+        return
+    bot.answer_callback_query(call.id, "እየተዘጋጀ ነው...")
+    txt = tip.get("text") or "የተላከ የህዝብ ጥቆማ"
+    photo_bytes = None
+    if tip.get("photo_id"):
+        try:
+            photo_bytes = bot.download_file(bot.get_file(tip["photo_id"]).file_path)
+        except Exception:
+            photo_bytes = None
+    if act == "tpb":
+        threading.Thread(target=run_bego_draft, args=(call.message.chat.id, txt, photo_bytes), daemon=True).start()
+    elif act == "tpn":
+        threading.Thread(target=run_post, args=(call.message.chat.id, "📩 የህዝብ ጥቆማ", txt[:120]),
+                         kwargs={"context_text": txt, "context_sources": [("የህዝብ ጥቆማ", BRANDS["media"]["tg_link"])],
+                                 "brand": "media", "custom_photo": photo_bytes}, daemon=True).start()
+    elif act == "tpv" and tip.get("video_id"):
+        def _prep_tip_vid():
+            workdir = tempfile.mkdtemp(prefix="tipv-")
+            try:
+                ffmpeg = get_ffmpeg()
+                if not ffmpeg:
+                    bot.send_message(call.message.chat.id, "ffmpeg አልተገኘም")
+                    return
+                raw_v = bot.download_file(bot.get_file(tip["video_id"]).file_path)
+                src_p = os.path.join(workdir, "in.mp4")
+                out_p = os.path.join(workdir, "branded.mp4")
+                with open(src_p, "wb") as f:
+                    f.write(raw_v)
+                normalize_highlight(ffmpeg, src_p, out_p, 60, brand="media")
+                cap = f"{txt[:400]}\n#Ethiopia #ኢትዮጵያ\n\n{brand_footer('media')}\n\n#SekelaMedia #ሰከላሚዲያ"[:1020]
+                vid = uuid.uuid4().hex[:10]
+                with state_lock:
+                    video_drafts[vid] = {"path": out_p, "caption": cap, "headline": txt[:60], "busy": False,
+                                         "tg": False, "fb": False, "topic": "tip_video", "brand": "media",
+                                         "ts": time.time(), "url": ""}
+                kb = types.InlineKeyboardMarkup()
+                kb.add(types.InlineKeyboardButton("✅ አጽድቅና ፖስት አድርግ", callback_data=f"vk:{vid}"),
+                       types.InlineKeyboardButton("❌ ሰርዝ", callback_data=f"vn:{vid}"))
+                with open(out_p, "rb") as vf:
+                    bot.send_video(call.message.chat.id, vf, caption=cap, reply_markup=kb, supports_streaming=True, timeout=180)
+            except Exception as e:
+                bot.send_message(call.message.chat.id, f"ቪዲዮውን ማዘጋጀት አልተቻለም: {short_reason(e, 120)}")
+        threading.Thread(target=_prep_tip_vid, daemon=True).start()
 
 
 @bot.message_handler(content_types=["voice", "audio", "video", "video_note", "photo", "document"])
