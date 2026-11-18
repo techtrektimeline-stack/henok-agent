@@ -996,7 +996,7 @@ def polish_amharic(text):
         "number, score, hashtag, name and the structure/emojis exactly as they are. Do not add or remove facts. "
         "Plain text only, no markdown. Output only the rewritten text.\n\n" + text
     )
-    out, _ = llm_write(prompt, allow_gemini=False, max_tokens=4000, temperature=0.4)
+    out, _ = llm_write(prompt, allow_gemini=True, max_tokens=4000, temperature=0.4)
     if out and len(out) > len(text) * 0.5:
         return out
     return text
@@ -1144,7 +1144,7 @@ NEWSROOM_SYSTEM = (
     "and 'ሰከላ በጎ'. You THINK in Amharic and write with Sekela's own distinctive, authoritative, vivid Addis Ababa "
     "journalistic voice - combining the warmth and clarity of Zehabesha, Gursha, Getu Temesgen and Tikvah.\n"
     "NATIVE-VOICE RULES (highest priority):\n"
-    "- ZERO literal English-to-Amharic calques. Put time/place naturally («ማክሰኞ ዕለት በአዲስ አበባ ...») and end sentences "
+    "- ZERO literal English-to-Amharic calques or broken idioms (NEVER translate 'ruled out' as 'ፍርድ' or 'by' as 'ባይ'; write crystal-clear natural Amharic like 'ከውድድሩ ውጪ ሊሆን ነው', 'በይፋ አረጋገጠ'). Put time/place naturally («ማክሰኞ ዕለት በአዲስ አበባ ...») and end sentences "
     "with strong verbs («አስታውቋል», «ይፋ አድርጓል», «ተፈራርመዋል», «አሻቅቧል», «ወርዷል», «ተጠናቋል»).\n"
     "- Connect sentences smoothly («በተጨማሪም», «ይህም», «ከዚህ ቀደም», «በሌላ በኩል», «በመሆኑም», «ይሁን እንጂ»). Mostly 12-22 words "
     "per sentence, never more than 26.\n"
@@ -1164,7 +1164,7 @@ NEWS_BRIEF = (
     "Topic: {topic}\n{brand_note}\n\n[RESEARCH NOTES]\n{facts}\n\n{mode_note}"
     "SEO: naturally include the main high-search keyword in the headline and hook.\n"
     "Return EXACTLY these blocks and nothing else:\n"
-    "===HEADLINE===\n4-7 words: bold, factual, scroll-stopping headline for a 4:5 photo card; no quotes, no emoji, no full stop.\n"
+    "===HEADLINE===\n4-6 words: crystal-clear, grammatically natural, curiosity-sparking Amharic hook that captures attention and makes readers want to read the full story; no quotes, no emoji, no full stop, ZERO awkward literal translations.\n"
     "===LEAD===\nThe hook: 1-2 vivid sentences (25-45 words) answering who, what, where and when.\n"
     "===CONTEXT===\nThe full story: 4-6 connected sentences (80-130 words) with key figures, names, background, reactions "
     "and what comes next.\n"
@@ -1672,34 +1672,51 @@ def _wiki_real_photo(query):
     return None
 
 
+def _fit_panel(im, pw, ph, bg=(20, 21, 24)):
+    """Fits an image into a panel without chopping off text/documents or faces."""
+    w, h = im.size
+    panel_ratio = pw / max(1, ph)
+    img_ratio = w / max(1, h)
+    # If aspect ratios are close, gentle cover-crop; if very different (e.g. wide/document), contain cleanly on dark frame
+    if max(panel_ratio / img_ratio, img_ratio / panel_ratio) <= 1.55:
+        return _cover_crop_resize(im, pw, ph)
+    scale = min(pw / max(1, w), ph / max(1, h))
+    nw, nh = max(1, int(w * scale)), max(1, int(h * scale))
+    resized = im.resize((nw, nh), Image.LANCZOS)
+    frame = Image.new("RGB", (pw, ph), bg)
+    frame.paste(resized, ((pw - nw) // 2, (ph - nh) // 2))
+    return frame
+
+
 def _compose_photo_collage(photo_bytes_list, width=1080, height=1350):
-    """Blends 2-4 real news/social photos into a crisp editorial grid so multi-photo stories shine."""
+    """Blends 2-4 real photos cleanly in the upper ~68% zone so faces & documents stay visible above the headline."""
     if not PIL_OK or len(photo_bytes_list) < 2:
         return photo_bytes_list[0] if photo_bytes_list else None
     try:
         ims = [Image.open(io.BytesIO(b)).convert("RGB") for b in photo_bytes_list[:4]]
         W, H = width, height
-        gap = 6
-        canvas = Image.new("RGB", (W, H), (20, 21, 24))
+        top_h = int(H * 0.68)  # Keep all multi-photo content safely above the lower headline/shadow zone
+        gap = 8
+        canvas = Image.new("RGB", (W, H), (18, 20, 24))
         n = len(ims)
         if n == 2:
             w1 = (W - gap) // 2
-            canvas.paste(_cover_crop_resize(ims[0], w1, H), (0, 0))
-            canvas.paste(_cover_crop_resize(ims[1], W - w1 - gap, H), (w1 + gap, 0))
+            canvas.paste(_fit_panel(ims[0], w1, top_h), (0, 0))
+            canvas.paste(_fit_panel(ims[1], W - w1 - gap, top_h), (w1 + gap, 0))
         elif n == 3:
-            h1 = int(H * 0.56)
-            h2 = H - h1 - gap
+            h1 = int(top_h * 0.54)
+            h2 = top_h - h1 - gap
             w2 = (W - gap) // 2
-            canvas.paste(_cover_crop_resize(ims[0], W, h1), (0, 0))
-            canvas.paste(_cover_crop_resize(ims[1], w2, h2), (0, h1 + gap))
-            canvas.paste(_cover_crop_resize(ims[2], W - w2 - gap, h2), (w2 + gap, h1 + gap))
+            canvas.paste(_fit_panel(ims[0], W, h1), (0, 0))
+            canvas.paste(_fit_panel(ims[1], w2, h2), (0, h1 + gap))
+            canvas.paste(_fit_panel(ims[2], W - w2 - gap, h2), (w2 + gap, h1 + gap))
         else:
-            w2, h2 = (W - gap) // 2, (H - gap) // 2
-            canvas.paste(_cover_crop_resize(ims[0], w2, h2), (0, 0))
-            canvas.paste(_cover_crop_resize(ims[1], W - w2 - gap, h2), (w2 + gap, 0))
-            canvas.paste(_cover_crop_resize(ims[2], w2, H - h2 - gap), (0, h2 + gap))
-            canvas.paste(_cover_crop_resize(ims[3], W - w2 - gap, H - h2 - gap), (w2 + gap, h2 + gap))
-        canvas = ImageEnhance.Contrast(canvas).enhance(1.04)
+            w2, h2 = (W - gap) // 2, (top_h - gap) // 2
+            canvas.paste(_fit_panel(ims[0], w2, h2), (0, 0))
+            canvas.paste(_fit_panel(ims[1], W - w2 - gap, h2), (w2 + gap, 0))
+            canvas.paste(_fit_panel(ims[2], w2, top_h - h2 - gap), (0, h2 + gap))
+            canvas.paste(_fit_panel(ims[3], W - w2 - gap, top_h - h2 - gap), (w2 + gap, h2 + gap))
+        canvas = ImageEnhance.Contrast(canvas).enhance(1.05)
         out = io.BytesIO()
         canvas.save(out, "JPEG", quality=92)
         return out.getvalue()
@@ -1963,7 +1980,7 @@ def compose_card(bg_bytes, headline, badge=None, ai=True, width=1080, height=135
     accent = accents.get(key, accents["media"])
     sub_en = sub_labels.get(key, "MEDIA")
     badge_txt = badge or default_badges.get(key, "ሰከላ ዜና")
-    brand_am = BRANDS.get(brand, BRANDS["media"]).get("name", "ሰከላ ሚዲያ")
+    brand_am = BRANDS.get(brand, BRANDS["media"]).get("name_am", "ሰከላ ሚዲያ")
     handle = BRANDS.get(brand, BRANDS["media"]).get("tg_handle", "@sekelamediaET")
 
     try:
@@ -1995,9 +2012,9 @@ def compose_card(bg_bytes, headline, badge=None, ai=True, width=1080, height=135
 
         scrim = Image.new("RGBA", (W, H), (0, 0, 0, 0))
         sp = scrim.load()
-        fade_start = max(int(H * 0.44), pill_y - 120)
+        fade_start = max(int(H * 0.40), pill_y - 140)
         fade_end = min(H, hy + total_text_h + 28)
-        max_scrim = 242  # Deep dark editorial scrim (~95%) so white Amharic text pops cleanly
+        max_scrim = 250  # Rich deep charcoal scrim (~98%) so text pops on bright photos & documents
         for y in range(fade_start, H):
             if y < fade_end:
                 t = (y - fade_start) / max(1, (fade_end - fade_start))
@@ -2021,15 +2038,13 @@ def compose_card(bg_bytes, headline, badge=None, ai=True, width=1080, height=135
         # Top 8px brand stripe
         draw.rectangle([0, 0, W, 8], fill=accent + (255,))
 
-        # Clean editorial SEKELA + MEDIA/SPORT badge (no awkward drawn S)
-        tx = 54
-        f_logo = _latin_font(32)
-        f_sub = _latin_font(16)
-        draw.text((tx, 38), "SEKELA", font=f_logo, fill=(255, 255, 255, 255))
-        sb_w = int(f_sub.getlength(sub_en))
-        pw_sub, ph_sub = sb_w + 26, 26
-        draw.rounded_rectangle([tx, 76, tx + pw_sub, 76 + ph_sub], radius=ph_sub // 2, fill=accent + (255,))
-        draw.text((tx + 13, 80), sub_en, font=f_sub, fill=(255, 255, 255, 255))
+        # Clean brand-only top-left header ("ሰከላ ሚዲያ" / "ሰከላ ስፖርት") with crisp dark pill backing
+        f_top_eth = ImageFont.truetype(eth_path, 26)
+        f_top_lat = _latin_font(24)
+        top_tw = int(_measure(brand_am, f_top_eth, f_top_lat))
+        draw.rounded_rectangle([50, 34, 50 + top_tw + 32, 82], radius=12, fill=(16, 18, 22, 185))
+        draw.rounded_rectangle([50, 34, 58, 82], radius=4, fill=accent + (255,))
+        _draw_mixed(draw, 70, 68, brand_am, f_top_eth, f_top_lat, (255, 255, 255, 255))
 
         # Category badge
         b_eth, b_lat = ImageFont.truetype(eth_path, 28), _latin_font(26)
