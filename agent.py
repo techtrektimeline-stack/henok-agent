@@ -4176,32 +4176,40 @@ TABLE_ALIASES = {
 }
 
 
+def _safe_int(val, default=0):
+    try:
+        return int(float(val)) if val is not None else default
+    except Exception:
+        return default
+
+
 def espn_standings(league="eng.1", top=10):
     try:
         r = requests.get(f"https://site.api.espn.com/apis/v2/sports/soccer/{league}/standings",
-                         headers=_UA, timeout=(5, 15))
-        if r.status_code != 200:
-            return []
-        js = r.json()
-        groups = js.get("children") or [js]
-        rows = []
-        for g in groups:
-            for e in ((g.get("standings") or {}).get("entries") or []):
-                team = ((e.get("team") or {}).get("displayName") or "").strip()
-                stats = {s.get("name"): s.get("value") for s in (e.get("stats") or []) if s.get("name")}
-                if team:
-                    rows.append({
-                        "rank": int(stats.get("rank") or len(rows) + 1),
-                        "team": team,
-                        "gp": int(stats.get("gamesPlayed") or 0),
-                        "gd": int(stats.get("pointDifferential") or 0),
-                        "pts": int(stats.get("points") or 0),
-                    })
-        rows.sort(key=lambda x: (x["rank"], -x["pts"], -x["gd"]))
-        return rows[:top]
+                         headers=_PHOTO_HEADERS, timeout=(5, 15))
+        if r.status_code == 200:
+            js = r.json()
+            groups = js.get("children") or [js]
+            rows = []
+            for g in groups:
+                for e in ((g.get("standings") or {}).get("entries") or []):
+                    team = ((e.get("team") or {}).get("displayName") or "").strip()
+                    stats = {s.get("name"): (s.get("value") if s.get("value") is not None else s.get("displayValue"))
+                             for s in (e.get("stats") or []) if s.get("name")}
+                    if team:
+                        rows.append({
+                            "rank": _safe_int(stats.get("rank"), len(rows) + 1),
+                            "team": team,
+                            "gp": _safe_int(stats.get("gamesPlayed"), 0),
+                            "gd": _safe_int(stats.get("pointDifferential"), 0),
+                            "pts": _safe_int(stats.get("points"), 0),
+                        })
+            if rows:
+                rows.sort(key=lambda x: (x["rank"], -x["pts"], -x["gd"]))
+                return rows[:top]
     except Exception as e:
         log.info("ESPN standings %s failed: %s", league, short_reason(e, 80))
-        return []
+    return []
 
 
 def format_standings_post(league="eng.1", top=10):
@@ -6661,11 +6669,12 @@ def cmd_sport(message):
     _manual_hunt(message.chat.id, "sport")
 
 
-@bot.message_handler(commands=["table", "standings"])
+@bot.message_handler(commands=["table", "standings", "tableepl", "tablelaliga", "tableucl"])
 @private_owner_only
 def cmd_table(message):
     parts = (message.text or "").split()
-    arg = parts[1].lower() if len(parts) > 1 else "epl"
+    cmd0 = (parts[0] if parts else "").lstrip("/").lower()
+    arg = parts[1].lower() if len(parts) > 1 else (cmd0[5:] if cmd0.startswith("table") and len(cmd0) > 5 else "epl")
     league = TABLE_ALIASES.get(arg, arg if "." in arg else "eng.1")
     ack = send_progress(message.chat.id, "📊 የደረጃ ሰንጠረዥ እና ነጥቦችን እያመጣሁ ነው...")
     res = format_standings_post(league, top=10)
