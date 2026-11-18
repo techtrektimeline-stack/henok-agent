@@ -163,9 +163,10 @@ def fb_enabled(brand="media"):
 
 def brand_footer(brand):
     b = BRANDS[brand]
+    tip = os.environ.get("TIP_LINK", "").strip()
+    tip_line = f"\n📩 ጥቆማ / መረጃ ለመላክ: {tip}" if tip else ""
     return ("🔗 ፈጣን እና ታማኝ መረጃ ለማግኘት ይቀላቀሉን:\n"
-            f"Telegram: {b['tg_link']}\nFacebook: {b['fb_link']}\n"
-            "📩 ጥቆማ / መረጃ ለመላክ: https://t.me/HenokAssistantBot?start=tip")
+            f"Telegram: {b['tg_link']}\nFacebook: {b['fb_link']}" + tip_line)
 
 
 OPENROUTER_BASE_MODELS = [m.strip() for m in os.environ.get(
@@ -1147,7 +1148,7 @@ NEWSROOM_SYSTEM = (
     "with strong verbs («አስታውቋል», «ይፋ አድርጓል», «ተፈራርመዋል», «አሻቅቧል», «ወርዷል», «ተጠናቋል»).\n"
     "- Connect sentences smoothly («በተጨማሪም», «ይህም», «ከዚህ ቀደም», «በሌላ በኩል», «በመሆኑም», «ይሁን እንጂ»). Mostly 12-22 words "
     "per sentence, never more than 26.\n"
-    "- PERFECT GRAMMAR: plural/collective subjects take PLURAL verbs («ግጭቶች እየተባባሱ ናቸው», «ባለሥልጣናቱ አስታውቀዋል»), "
+    "- PERFECT GRAMMAR & HEADLINE ACCURACY: plural/collective subjects take PLURAL verbs («አምስት አሰልጣኞች ለቀቁ» or «ክለቡ አምስት አሰልጣኞችን አሰናበተ» — NEVER «አምስት አሰልጣኞችን ለቀቀ»), «ግጭቶች እየተባባሱ ናቸው», «ባለሥልጣናቱ አስታውቀዋል». Every paragraph MUST end with a complete sentence (።). "
     "singular subjects take singular verbs («ሚኒስቴሩ አስታውቋል»). Consistent tense inside each paragraph.\n"
     "- RICH AND SPECIFIC: give who, what, where, when, numbers, names, background, why it matters to Ethiopians, and "
     "what happens next — strictly from the notes. Never invent facts, phone numbers, bank accounts, or quotes.\n"
@@ -1364,9 +1365,18 @@ def long_sentences(pkg, limit=27):
     return [x for x in re.split(r"[።!?\n]+", txt) if len(x.split()) > limit]
 
 
+def _trim_complete_sentences(text):
+    t = (text or "").strip()
+    if not t or t[-1] in "።.!?":
+        return t
+    m = re.search(r"^(.*[።.!?])", t, re.S)
+    return m.group(1).strip() if m else t
+
+
 def assemble_news_post(pkg, facts="", sources=None, unverified=False, brand="media", segment=None):
-    lead, context = _para(pkg.get("lead")), _para(pkg.get("context"))
-    official = _para(pkg.get("official"))
+    lead = _trim_complete_sentences(_para(pkg.get("lead")))
+    context = _trim_complete_sentences(_para(pkg.get("context")))
+    official = _trim_complete_sentences(_para(pkg.get("official")))
     if official.strip(" .።").upper() in ("", "NONE", "N/A"):
         official = ""
     if not lead or not context:
@@ -1383,7 +1393,7 @@ def assemble_news_post(pkg, facts="", sources=None, unverified=False, brand="med
         head_line = f"☕ {headline}"
     else:
         src = resolve_source(pkg.get("source"), facts, sources, unverified)
-        head_line = f"{headline}\n#Ethiopia #ኢትዮጵያ"
+        head_line = f"{headline}\n#Ethiopia #ኢትዮጵያ" if brand == "media" else headline
     tags = " ".join(build_tags(brand, pkg.get("tags"), headline, segment=segment))
     parts = [head_line, lead, context]
     if official:
@@ -1972,7 +1982,7 @@ def compose_card(bg_bytes, headline, badge=None, ai=True, width=1080, height=135
             lines = lines[:2]
         line_h = int(fs * 1.24)
         total_text_h = len(lines) * line_h
-        hy = H - 104 - total_text_h
+        hy = H - 132 - total_text_h
         pill_y = hy - 64
 
         # Full-bleed studio-graded photo (vibrant color, crisp sharpness, balanced contrast)
@@ -1987,7 +1997,7 @@ def compose_card(bg_bytes, headline, badge=None, ai=True, width=1080, height=135
         sp = scrim.load()
         fade_start = max(int(H * 0.44), pill_y - 120)
         fade_end = min(H, hy + total_text_h + 28)
-        max_scrim = 224  # Rich dark charcoal gradient (~88%) behind text so photo shows subtly & text pops
+        max_scrim = 242  # Deep dark editorial scrim (~95%) so white Amharic text pops cleanly
         for y in range(fade_start, H):
             if y < fade_end:
                 t = (y - fade_start) / max(1, (fade_end - fade_start))
@@ -2011,16 +2021,15 @@ def compose_card(bg_bytes, headline, badge=None, ai=True, width=1080, height=135
         # Top 8px brand stripe
         draw.rectangle([0, 0, W, 8], fill=accent + (255,))
 
-        # Floating S + SEKELA + MEDIA/SPORT pill
-        sw = _draw_sekela_s_emblem(draw, 52, 38, 64, accent)
-        tx = 52 + sw + 16
-        f_logo = _latin_font(28)
-        f_sub = _latin_font(15)
-        draw.text((tx, 40), "SEKELA", font=f_logo, fill=(255, 255, 255, 255))
+        # Clean editorial SEKELA + MEDIA/SPORT badge (no awkward drawn S)
+        tx = 54
+        f_logo = _latin_font(32)
+        f_sub = _latin_font(16)
+        draw.text((tx, 38), "SEKELA", font=f_logo, fill=(255, 255, 255, 255))
         sb_w = int(f_sub.getlength(sub_en))
-        pw_sub, ph_sub = sb_w + 24, 24
-        draw.rounded_rectangle([tx, 74, tx + pw_sub, 74 + ph_sub], radius=ph_sub // 2, fill=accent + (255,))
-        draw.text((tx + 12, 78), sub_en, font=f_sub, fill=(255, 255, 255, 255))
+        pw_sub, ph_sub = sb_w + 26, 26
+        draw.rounded_rectangle([tx, 76, tx + pw_sub, 76 + ph_sub], radius=ph_sub // 2, fill=accent + (255,))
+        draw.text((tx + 13, 80), sub_en, font=f_sub, fill=(255, 255, 255, 255))
 
         # Category badge
         b_eth, b_lat = ImageFont.truetype(eth_path, 28), _latin_font(26)
@@ -2033,11 +2042,9 @@ def compose_card(bg_bytes, headline, badge=None, ai=True, width=1080, height=135
         bar_h = max(40, total_text_h - 14)
         draw.rounded_rectangle([margin, hy + 10, margin + 12, hy + 10 + bar_h], radius=6, fill=accent + (255,))
         f_eth, f_lat = ImageFont.truetype(eth_path, fs), _latin_font(fs)
-        hook_colors = [(255, 255, 255, 255), (255, 212, 72, 255)]
         for i, ln in enumerate(lines):
             base = hy + i * line_h + int(fs * 0.92)
-            col = hook_colors[i % len(hook_colors)]
-            _draw_bold_shadow(draw, margin + 36, base, ln, f_eth, f_lat, col)
+            _draw_bold_shadow(draw, margin + 36, base, ln, f_eth, f_lat, (255, 255, 255, 255))
 
         # Clean bottom social footer (no divider line)
         f_foot_lat = _latin_font(22)
