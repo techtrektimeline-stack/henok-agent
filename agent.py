@@ -1070,6 +1070,7 @@ NEWSROOM_SYSTEM = (
     "- RICH AND SPECIFIC: give who, what, where, when, numbers, names, background, why it matters to Ethiopians, and "
     "what happens next — strictly from the notes. Never invent facts, phone numbers, bank accounts, or quotes.\n"
     "- ORIGINAL REWRITE RULE: NEVER copy or lightly paraphrase BBC Amharic, Fana, or any source wording. Extract ONLY the verified facts and rewrite 100% originally in Sekela's own voice with richer background context (4-6 clear sentences) and a short 2-line punchy card headline.\n"
+    "- SAFETY RULE: NEVER write anything that incites ethnic or religious conflict, hate speech, or division.\n"
     "- Neutral third person; NEVER address anyone directly (never ሄኖክ/አንተ/እኛ).\n"
     "- Plain text, no markdown, no emojis inside paragraphs; keep widely used Latin terms (AI, Bitcoin, TikTok, clubs/players)."
 )
@@ -1311,21 +1312,20 @@ def assemble_news_post(pkg, facts="", sources=None, unverified=False, brand="med
 
 STORY_PROMPT = (
     "Current Addis Ababa date/time: {now_eat} (UTC: {now_utc}).\n"
-    "Search the web NOW and find the most important, trending and timely stories from the last {hours} hours about: {focus}\n"
-    "STRICT 24-HOUR FRESHNESS RULE: Check publication timestamps. Reject ANYTHING older than 24 hours (prefer last "
-    "2 to 12 hours). NEVER return 2-3 day old news.\n"
-    "MULTI-PLATFORM COVERAGE: Actively monitor ALL of these:\n"
-    "1) Ethiopian state/mainstream outlets (Fana BC, EBC, ENA, Walta) + independent outlets (Addis Standard, Borkena, "
-    "Capital Ethiopia, Addis Fortune, Sheger FM, DW/VOA/BBC Amharic).\n"
-    "2) Social media & activist/creator discussions (TikTok, YouTube, X/Twitter, public Facebook pages, Tikvah, "
-    "Gursha, Behaja, diaspora commentators).\n"
-    "3) International news mentioning Ethiopia + major global breaking news (economy, AI/tech, geopolitics, 3-4-3/433 football, viral culture).\n"
-    "BALANCE RULES: use BBC Amharic for AT MOST ONE story; at most ONE conflict/security story; prioritize economy, "
-    "tech/social updates, Addis Ababa local life, Ethiopian online conversations, diplomacy, and culture.\n"
+    "Search the web NOW and find {n} engaging, timely stories from the last {hours} hours about: {focus}\n"
+    "FRESHNESS RULE: Prefer stories from the last 1-24 hours. Do NOT restrict only to breaking news — include "
+    "engaging daily news, viral social media conversations, football scores/standings/transfers, and local updates.\n"
+    "MULTI-PLATFORM COVERAGE (prioritize private media & social voices, NOT just state TV):\n"
+    "1) Ethiopian private/independent media, Telegram channels, YouTubers, TikTokers, Facebook pages (Tikvah, Gursha, "
+    "Behaja, Addis Standard, Sheger FM, Borkena, Capital Ethiopia, Fana, EBC, BBC/DW/VOA Amharic).\n"
+    "2) Viral Ethiopian & global stories (economy, Addis Ababa life, AI/tech, entertainment, diaspora, diplomacy).\n"
+    "3) Football & Sport: Ethiopia national team (Walias), CAF/AFCON/WC qualifiers, Premier League, Champions League, "
+    "transfers, points/standings, and Ethiopian sport pages.\n"
+    "SAFETY FILTER (STRICT): NEVER include anything that incites ethnic or religious conflict, hate speech, or violence.\n"
     "{feeds}"
-    "Return {n} top stories, ONE per line, in EXACTLY this format (English):\n"
+    "Return {n} stories, ONE per line, in EXACTLY this format (English):\n"
     "STORY|<importance 1-10>|<headline, max 14 words>|<outlet/platform names, comma separated>|<one sentence with the key fact>\n"
-    "Importance: 8-10 = major breaking/viral story or decisive goal/transfer, 5-7 = strong daily/trending story."
+    "Importance: 8-10 = major breaking/viral/match story, 4-7 = strong daily, social, or transfer story."
 )
 _STORY_RE = re.compile(r"^\s*STORY\s*\|\s*(\d+)\s*\|(.*?)\|(.*?)\|(.*)$")
 
@@ -1506,40 +1506,45 @@ def fetch_image(prompt, brand="media", segment=None):
     return None, False
 
 
-_PHOTO_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; SekelaNewsBot/1.0; +https://t.me/sekelamediaET)"}
+_PHOTO_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+}
 _META_IMG = [
     re.compile(r'<meta[^>]+(?:property|name)\s*=\s*["\'](?:og:image(?::secure_url|:url)?|twitter:image(?::src)?)["\']'
                r'[^>]*?content\s*=\s*["\']([^"\']+)["\']', re.I),
     re.compile(r'<meta[^>]+content\s*=\s*["\']([^"\']+)["\'][^>]*?(?:property|name)\s*=\s*["\']'
                r'(?:og:image|twitter:image)["\']', re.I),
+    re.compile(r'"image"\s*:\s*\{?[^\}]*?"url"\s*:\s*"(https?://[^"]+)"', re.I),
+    re.compile(r'<img[^>]+(?:src|data-src)\s*=\s*["\'](https?://[^"\']+\.(?:jpg|jpeg|png|webp)[^"\']*)["\']', re.I),
 ]
 _BAD_IMG = re.compile(
     r"logo|favicon|placeholder|sprite|avatar|default[-_]?(?:image|thumb|share)|1x1|watermark|"
     r"gettyimages|shutterstock|alamy|istockphoto|depositphotos|123rf|dreamstime|"
-    r"thumbnail|small[-_]?img|crest|badge|150x|300x|400x|500x", re.I
+    r"small[-_]?img|crest|badge|150x150|100x100", re.I
 )
 
 
 def download_photo(url, referer=None):
-    """Photo Quality Gate: reject <600x400, watermarked, extreme-banner or blurry images."""
+    """Photo Quality Gate: accept real news/TG photos >=480x320, reject watermarks/icons/tiny thumbs."""
     try:
         if not url or _BAD_IMG.search(url):
             return None
         headers = dict(_PHOTO_HEADERS)
         if referer:
             headers["Referer"] = referer
-        r = requests.get(url, headers=headers, timeout=14)
-        if r.status_code != 200 or not r.headers.get("Content-Type", "").startswith("image/") or len(r.content) < 30000:
+        r = requests.get(url, headers=headers, timeout=14, allow_redirects=True)
+        if r.status_code != 200 or not r.headers.get("Content-Type", "").startswith("image/") or len(r.content) < 16000:
             return None
         if PIL_OK:
             im = Image.open(io.BytesIO(r.content))
             w, h = im.size
-            if w < 600 or h < 400:
+            if w < 480 or h < 320:
                 return None
-            if w / max(1, h) > 2.6 or h / max(1, w) > 2.6:
+            if w / max(1, h) > 2.8 or h / max(1, w) > 2.8:
                 return None
             edge_std = ImageStat.Stat(im.convert("L").resize((180, 180)).filter(ImageFilter.FIND_EDGES)).stddev[0]
-            if edge_std < 5.0:
+            if edge_std < 4.5:
                 return None
         return r.content
     except Exception as e:
@@ -1547,7 +1552,33 @@ def download_photo(url, referer=None):
         return None
 
 
-def find_real_photo(urls, direct_image=None, max_pages=3):
+def _wiki_real_photo(query):
+    try:
+        q = re.sub(r"[^A-Za-z0-9\s-]", " ", query or "").strip()
+        words = [w for w in q.split() if len(w) >= 3][:4]
+        if not words:
+            return None
+        r = requests.get(
+            "https://en.wikipedia.org/w/api.php",
+            params={"action": "query", "generator": "search", "gsrsearch": " ".join(words),
+                    "gsrlimit": 3, "prop": "pageimages", "pithumbsize": 1200, "format": "json"},
+            headers=_PHOTO_HEADERS, timeout=8,
+        )
+        if r.status_code != 200:
+            return None
+        pages = (r.json().get("query") or {}).get("pages") or {}
+        for pg in pages.values():
+            src_u = (pg.get("thumbnail") or {}).get("source")
+            if src_u:
+                b = download_photo(src_u)
+                if b:
+                    return b
+    except Exception:
+        pass
+    return None
+
+
+def find_real_photo(urls, direct_image=None, max_pages=5, topic_hint=None):
     if direct_image:
         b = download_photo(direct_image)
         if b:
@@ -1562,19 +1593,22 @@ def find_real_photo(urls, direct_image=None, max_pages=3):
             r = requests.get(u, headers=_PHOTO_HEADERS, timeout=10, allow_redirects=True)
             if r.status_code != 200 or "html" not in r.headers.get("Content-Type", ""):
                 continue
-            html = r.text[:200000]
+            html = r.text[:250000]
             for rx in _META_IMG:
-                m = rx.search(html)
-                if not m:
-                    continue
-                img = urljoin(r.url, html_lib.unescape(m.group(1)).strip())
-                if _BAD_IMG.search(img):
-                    continue
-                b = download_photo(img, referer=r.url)
-                if b:
-                    return b
+                for m in rx.finditer(html):
+                    img = urljoin(r.url, html_lib.unescape(m.group(1)).strip())
+                    if _BAD_IMG.search(img):
+                        continue
+                    b = download_photo(img, referer=r.url)
+                    if b:
+                        return b
+                    break
         except Exception as e:
             log.info("article page fetch failed: %s", short_reason(e, 80))
+    if topic_hint:
+        b = _wiki_real_photo(topic_hint)
+        if b:
+            return b
     return None
 
 
@@ -1815,24 +1849,30 @@ def compose_card(bg_bytes, headline, badge=None, ai=True, width=1080, height=135
             lines = lines[:3]
         line_h = int(fs * 1.24)
         total_text_h = len(lines) * line_h
-        hy = H - 78 - total_text_h - 14
+        # Raise hook slightly below center (~60-66% down) instead of bottom-most
+        hy = min(H - 250 - total_text_h, max(int(H * 0.56), int(H * 0.62) - total_text_h // 2))
         pill_y = hy - 66
 
-        # Place photo in upper ~75% with compact cosine fade right above badge -> solid #141518
-        photo_h = min(H, hy + 45)
+        # Full-bleed photo across 1080x1350 with soft, translucent gradual scrim so image shows through naturally
         src_im = Image.open(io.BytesIO(bg_bytes)).convert("RGB")
-        photo = _cover_crop_resize(src_im, W, photo_h)
+        photo = _cover_crop_resize(src_im, W, H)
         photo = ImageEnhance.Contrast(photo).enhance(1.06).convert("RGBA")
-        alpha_mask = Image.new("L", (W, photo_h), 255)
-        ap = alpha_mask.load()
-        fade_start = max(0, pill_y - 110)
-        for y in range(fade_start, photo_h):
-            t = (y - fade_start) / max(1, (photo_h - fade_start))
-            a = int(255 * 0.5 * (1.0 + math.cos(math.pi * t)))
+        canvas.paste(photo, (0, 0))
+
+        scrim = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        sp = scrim.load()
+        fade_start = max(0, pill_y - 200)
+        fade_end = min(H, hy + total_text_h + 70)
+        max_scrim = 188  # Soft translucent charcoal (~74%), never heavy opaque black
+        for y in range(fade_start, H):
+            if y < fade_end:
+                t = (y - fade_start) / max(1, (fade_end - fade_start))
+                a = int(max_scrim * (0.5 * (1.0 - math.cos(math.pi * t))))
+            else:
+                a = max_scrim
             for x in range(W):
-                ap[x, y] = a
-        photo.putalpha(alpha_mask)
-        canvas.paste(photo, (0, 0), photo)
+                sp[x, y] = (CHARCOAL[0], CHARCOAL[1], CHARCOAL[2], a)
+        canvas = Image.alpha_composite(canvas, scrim)
 
         # Gentle top feathered shadow for floating SEKELA logo
         top_sh = Image.new("RGBA", (W, 180), (0, 0, 0, 0))
@@ -2064,7 +2104,7 @@ def _resolve_card_bg(pkg_image, brand, segment, photo_urls=None, story_image=Non
     """Priority: 1) custom_photo / real source photo -> 2) Gemini Imagen -> 3) Pollinations 20s -> 4) Branded backdrop."""
     if custom_photo:
         return custom_photo, True, False
-    real = find_real_photo(list(photo_urls or []) + [u for _, u in (sources or [])[:4]], story_image)
+    real = find_real_photo(list(photo_urls or []) + [u for _, u in (sources or [])[:5]], story_image, topic_hint=pkg_image)
     if real:
         return real, True, False
     ai_bg, is_ai = fetch_image(build_image_prompt(pkg_image, brand, segment=segment), brand=brand, segment=segment)
@@ -3048,14 +3088,14 @@ DEFAULT_FEEDS = {
         "Sky Sports|https://www.skysports.com/rss/12040,"
         "The Guardian|https://www.theguardian.com/football/rss,"
         "ESPN FC|https://www.espn.com/espn/rss/soccer/news,"
+        "Goal Football|https://www.goal.com/feeds/en/news,"
         "BBC Athletics|https://feeds.bbci.co.uk/sport/athletics/rss.xml,"
-        "BBC Boxing|https://feeds.bbci.co.uk/sport/boxing/rss.xml,"
-        "BBC Women's Football|https://feeds.bbci.co.uk/sport/football/womens/rss.xml"
+        "BBC Boxing|https://feeds.bbci.co.uk/sport/boxing/rss.xml"
     ),
 }
 
 SEEN_FILE = os.environ.get("SEEN_FILE", os.path.join(tempfile.gettempdir(), "sekela_seen_stories.json"))
-SEEN_TTL = 48 * 3600
+SEEN_TTL = 14 * 3600
 _seen_lock = threading.Lock()
 _seen_items = None
 STOP_KEYS = {
@@ -3132,7 +3172,7 @@ def is_seen(text):
         for it in _seen_items:
             ik = set(it["keys"])
             shared = keys & ik
-            if len(shared) >= 3 or (len(shared) >= 2 and len(shared) / max(1, min(len(keys), len(ik))) >= 0.5):
+            if len(shared) >= 4 or (len(shared) >= 3 and len(shared) / max(1, min(len(keys), len(ik))) >= 0.6):
                 return True
     return False
 
@@ -3264,7 +3304,7 @@ ETH_TG_CHANNELS = os.environ.get(
 )
 SPORT_TG_CHANNELS = os.environ.get(
     "SPORT_TG_CHANNELS",
-    "tikvahethsport,ethiosport,433,Arsenal_Ethiopia,ManUtd_Ethiopia"
+    "tikvahethsport,ethiosport,433,FabrizioRomano,Arsenal_Ethiopia,ManUtd_Ethiopia,Ethiopian_Football"
 )
 
 
@@ -3362,7 +3402,11 @@ def stories_from_feeds(items, n=8):
 
 def _outlet_key(story):
     first = ((story.get("outlets") or "").split(",")[0]).strip().lower()
-    return first.split(" ")[0] if first else ""
+    if not first:
+        return ""
+    if first.startswith("tg @") or first.startswith("tg:"):
+        return first.replace(" ", "")
+    return first.split(" ")[0]
 
 
 def pick_story(fresh, brand, desk=None, strict=False):
@@ -3424,14 +3468,11 @@ def hunt_once(manual=False, min_importance=None, brand="media", force_strict=Non
         daily = hunt_daily[brand]
         if daily["date"] != today:
             daily.update(date=today, count=0)
-        cap = int(os.environ.get("HUNT_MAX_PER_DAY", "35") if brand == "media"
-                  else os.environ.get("HUNT_SPORT_MAX_PER_DAY", "25"))
+        cap = int(os.environ.get("HUNT_MAX_PER_DAY", "60") if brand == "media"
+                  else os.environ.get("HUNT_SPORT_MAX_PER_DAY", "40"))
         if not manual and daily["count"] >= cap:
             return "cap"
-        threshold = min_importance if min_importance is not None else int(os.environ.get("HUNT_MIN_IMPORTANCE", "5"))
-        recent_b = [b for _, b in offer_log[-3:]]
-        if not manual and brand == "sport" and len(recent_b) == 3 and all(b == "sport" for b in recent_b):
-            return "wait"
+        threshold = min_importance if min_importance is not None else int(os.environ.get("HUNT_MIN_IMPORTANCE", "4"))
         focus, desk, segment = HUNT_FOCUS[brand], None, None
         if brand == "media":
             wheel_topic = TOPIC_WHEEL[_wheel["media"] % len(TOPIC_WHEEL)]
@@ -3466,18 +3507,19 @@ def hunt_once(manual=False, min_importance=None, brand="media", force_strict=Non
             _wom_skip = ("women's super league", "wsl", "man city women", "manchester city women", "arsenal women", "chelsea women", "barcelona femeni")
             rss_pool = [it for it in rss_pool if not any(w in it["title"].lower() for w in _wom_skip) or "ethiopia" in it["title"].lower()]
         feeds_txt = feed_items_text(rss_pool)
-        stories, scan_sources = scan_stories(focus, hours=24, n=8, feeds=feeds_txt)
-        fresh = unseen(stories, threshold) or unseen(stories)
-        if not fresh and rss_pool:
-            fresh = unseen(stories_from_feeds(rss_pool, n=10))
+        stories, scan_sources = scan_stories(focus, hours=24, n=10, feeds=feeds_txt)
+        # Always merge scan_stories + live TG/RSS/Trends stories so we never stall on 1 item
+        feed_stories = stories_from_feeds(rss_pool, n=25) if rss_pool else []
+        combined = list(stories) + feed_stories
+        fresh = unseen(combined, threshold) or unseen(combined)
         if not fresh and manual:
-            fresh = stories or stories_from_feeds(rss_pool, n=6)
+            fresh = combined[:12]
         if not fresh:
             none_streak[brand] += 1
             return "none"
 
         use_strict = (force_strict if force_strict is not None
-                      else not (manual or daily["count"] == 0 or none_streak[brand] >= 2))
+                      else not (manual or daily["count"] == 0 or none_streak[brand] >= 1))
         story = pick_story(fresh, brand, desk, strict=use_strict)
         if story is None:
             story = pick_story(fresh, brand, desk, strict=False)
@@ -3488,13 +3530,21 @@ def hunt_once(manual=False, min_importance=None, brand="media", force_strict=Non
         mark_seen(f"{story['title']} {story['summary']}")
         start = time.time()
         topic = f"{story['title']}. {story['summary']}"
+        # Inherit matching real link/image from rss_pool if scan_stories omitted them
+        s_keys = story_keys(topic)
+        best_match_img, best_match_links = story.get("image"), ([story["link"]] if story.get("link") else [])
+        for it in rss_pool:
+            if len(s_keys & story_keys(it.get("title", ""))) >= 2:
+                if not best_match_img and it.get("image"):
+                    best_match_img = it["image"]
+                if it.get("link") and it["link"] not in best_match_links:
+                    best_match_links.append(it["link"])
         facts, sources = research_for(topic)
         if not facts:
             facts = f"{story['title']}. {story['summary']} (Reported by: {story['outlets']})"
             sources = scan_sources or ([(story['outlets'] or "Sekela Media Desk", story.get("link") or BRANDS[brand]["tg_link"])])
-        photo_urls = [story["link"]] if story.get("link") else []
         d = build_draft(topic, facts=facts, sources=sources, allow_fallback=True, brand=brand,
-                        photo_urls=photo_urls, story_image=story.get("image"), segment=segment)
+                        photo_urls=best_match_links, story_image=best_match_img, segment=segment)
         if not d:
             return "failed"
         hdr = HUNT_HEADERS["coffee"] if segment == "coffee" else HUNT_HEADERS[brand]
@@ -3527,7 +3577,7 @@ def hunter_loop(brand):
                 log.info("hunt %s: %s (daily=%d)", brand, st, daily_n)
         except Exception as e:
             log.error("hunter loop error (%s): %s", brand, e)
-        time.sleep(max(5, int(os.environ.get(interval_env, "18" if brand == "media" else "20"))) * 60)
+        time.sleep(max(3, int(os.environ.get(interval_env, "5" if brand == "media" else "6"))) * 60)
 
 
 def start_hunter():
@@ -3545,18 +3595,21 @@ def start_hunter():
 # Ethiopian-fan Sports Engine + 1080x1350 3-4-3 Match Result Cards
 # ----------------------------------------------------------------------------
 ESPN_LEAGUES = {"eng.1": "Premier League", "uefa.champions": "Champions League", "uefa.europa": "Europa League",
-                "esp.1": "La Liga", "ita.1": "Serie A", "ger.1": "Bundesliga", "fra.1": "Ligue 1"}
+                "esp.1": "La Liga", "ita.1": "Serie A", "ger.1": "Bundesliga", "fra.1": "Ligue 1",
+                "fifa.worldq.caf": "WC Qualifiers CAF", "caf.nations": "AFCON / CAF", "fifa.friendly": "International Friendly"}
 LEAGUE_AM = {"eng.1": "ፕሪሚየር ሊግ", "uefa.champions": "ቻምፒየንስ ሊግ", "uefa.europa": "ዩሮፓ ሊግ", "esp.1": "ላ ሊጋ",
-             "ita.1": "ሴሪኤ", "ger.1": "ቡንደስሊጋ", "fra.1": "ሊግ 1"}
+             "ita.1": "ሴሪኤ", "ger.1": "ቡንደስሊጋ", "fra.1": "ሊግ 1",
+             "fifa.worldq.caf": "የዓለም ዋንጫ ማጣሪያ (አፍሪካ)", "caf.nations": "የአፍሪካ ዋንጫ", "fifa.friendly": "ዓለም አቀፍ የወዳጅነት ጨዋታ"}
 LEAGUE_TAGS = {"eng.1": "#PremierLeague #ፕሪሚየርሊግ", "uefa.champions": "#ChampionsLeague #ቻምፒየንስሊግ",
                "uefa.europa": "#EuropaLeague", "esp.1": "#LaLiga #ላሊጋ", "ita.1": "#SerieA #ሴሪኤ",
-               "ger.1": "#Bundesliga", "fra.1": "#Ligue1"}
-TEAM_AM = {"manchester united": "ማንቸስተር ዩናይትድ", "manchester city": "ማንቸስተር ሲቲ", "arsenal": "አርሰናል", "chelsea": "ቼልሲ",
+               "ger.1": "#Bundesliga", "fra.1": "#Ligue1",
+               "fifa.worldq.caf": "#Walias #Ethiopia #CAF", "caf.nations": "#AFCON #Walias", "fifa.friendly": "#InternationalFriendly"}
+TEAM_AM = {"ethiopia": "ኢትዮጵያ (ዋልያዎቹ)", "manchester united": "ማንቸስተር ዩናይትድ", "manchester city": "ማንቸስተር ሲቲ", "arsenal": "አርሰናል", "chelsea": "ቼልሲ",
            "liverpool": "ሊቨርፑል", "tottenham": "ቶተንሃም", "newcastle": "ኒውካስል", "aston villa": "አስቶን ቪላ",
            "everton": "ኤቨርተን", "west ham": "ዌስትሃም", "brighton": "ብራይተን", "barcelona": "ባርሴሎና", "real madrid": "ሪያል ማድሪድ",
            "atletico": "አትሌቲኮ ማድሪድ", "bayern": "ባየርን ሙኒክ", "dortmund": "ቦሩሲያ ዶርትሙንድ", "paris saint": "ፓሪስ ሴንት ዠርሜን",
            "juventus": "ጁቬንቱስ", "inter": "ኢንተር ሚላን", "milan": "ኤሲ ሚላን", "napoli": "ናፖሊ", "roma": "ሮማ"}
-DEFAULT_FAVORITES = ["Arsenal", "Chelsea", "Liverpool", "Manchester United", "Manchester City", "Tottenham", "Newcastle",
+DEFAULT_FAVORITES = ["Ethiopia", "Arsenal", "Chelsea", "Liverpool", "Manchester United", "Manchester City", "Tottenham", "Newcastle",
                      "Barcelona", "Real Madrid", "Bayern", "Paris Saint", "Juventus", "Inter", "Milan", "Atletico", "Dortmund"]
 WEEKDAY_AM = ["ሰኞ", "ማክሰኞ", "ረቡዕ", "ሐሙስ", "ዓርብ", "ቅዳሜ", "እሁድ"]
 _sport_state = {}
@@ -3589,9 +3642,18 @@ def sport_leagues():
 
 def espn_scoreboard(league, dates=None):
     try:
-        r = requests.get(f"https://site.api.espn.com/apis/site/v2/sports/soccer/{league}/scoreboard",
-                         params={"dates": dates} if dates else None, headers=_UA, timeout=20)
-        if r.status_code != 200:
+        r = None
+        for attempt in (1, 2):
+            try:
+                resp = requests.get(f"https://site.api.espn.com/apis/site/v2/sports/soccer/{league}/scoreboard",
+                                    params={"dates": dates} if dates else None, headers=_UA, timeout=(5, 12))
+                if resp.status_code == 200:
+                    r = resp
+                    break
+            except requests.RequestException as e:
+                log.info("ESPN %s attempt %d failed: %s", league, attempt, short_reason(e, 80))
+            time.sleep(1)
+        if r is None:
             return []
         out = []
         for ev in r.json().get("events", []):
@@ -3679,15 +3741,27 @@ def refresh_schedule(force=False):
         return _sport_sched["matches"]
     base = datetime.now(timezone.utc)
     days = [(base + timedelta(days=d)).strftime("%Y%m%d") for d in (-1, 0, 1)]
+    jobs = [(lg, dstr) for lg in sport_leagues() for dstr in days]
     seen, allm = set(), []
-    for lg in sport_leagues():
-        for dstr in days:
-            for m in espn_scoreboard(lg, dstr):
+
+    def _one(job):
+        try:
+            return espn_scoreboard(job[0], job[1])
+        except Exception:
+            return []
+
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        for rows in ex.map(_one, jobs):
+            for m in rows:
                 if m["id"] not in seen:
                     seen.add(m["id"])
                     allm.append(m)
-    _sport_sched.update(ts=time.time(), matches=allm)
-    return allm
+    if allm:
+        _sport_sched.update(ts=time.time(), matches=allm)
+        return allm
+    _sport_sched["ts"] = time.time() - 3 * 3600 + 600
+    log.warning("ESPN schedule refresh returned nothing - keeping %d cached matches", len(_sport_sched["matches"]))
+    return _sport_sched["matches"]
 
 
 def _scorer_lines(m):
@@ -3847,6 +3921,13 @@ def _goal_line(g, m):
 
 
 def push_sport_alert(kind, m, headline, body, card_title=None, line1="", line2="", tags_extra=""):
+    try:
+        _push_sport_alert_impl(kind, m, headline, body, card_title, line1, line2, tags_extra)
+    except Exception as e:
+        log.warning("sport alert %s failed: %s", kind, short_reason(e, 120))
+
+
+def _push_sport_alert_impl(kind, m, headline, body, card_title=None, line1="", line2="", tags_extra=""):
     if in_quiet_hours() and kind in ("goal", "pre", "ht"):
         return
     today = addis_now().strftime("%Y-%m-%d")
@@ -3896,6 +3977,59 @@ def build_matchday(day_offset=0, force=False):
             "\n\n⏰ ሰዓቱ በምስራቅ አፍሪካ ሰዓት (EAT) ነው።")
     push_sport_alert("md", None, headline, body, tags_extra="#MatchDay #የዛሬጨዋታ #እግርኳስ")
     return True
+
+
+TABLE_ALIASES = {
+    "epl": "eng.1", "pl": "eng.1", "premier": "eng.1",
+    "laliga": "esp.1", "liga": "esp.1", "spain": "esp.1",
+    "seriea": "ita.1", "italy": "ita.1",
+    "bundesliga": "ger.1", "germany": "ger.1",
+    "ligue1": "fra.1", "france": "fra.1",
+    "ucl": "uefa.champions", "champions": "uefa.champions",
+    "uel": "uefa.europa", "europa": "uefa.europa",
+}
+
+
+def espn_standings(league="eng.1", top=10):
+    try:
+        r = requests.get(f"https://site.api.espn.com/apis/v2/sports/soccer/{league}/standings",
+                         headers=_UA, timeout=(5, 15))
+        if r.status_code != 200:
+            return []
+        js = r.json()
+        groups = js.get("children") or [js]
+        rows = []
+        for g in groups:
+            for e in ((g.get("standings") or {}).get("entries") or []):
+                team = ((e.get("team") or {}).get("displayName") or "").strip()
+                stats = {s.get("name"): s.get("value") for s in (e.get("stats") or []) if s.get("name")}
+                if team:
+                    rows.append({
+                        "rank": int(stats.get("rank") or len(rows) + 1),
+                        "team": team,
+                        "gp": int(stats.get("gamesPlayed") or 0),
+                        "gd": int(stats.get("pointDifferential") or 0),
+                        "pts": int(stats.get("points") or 0),
+                    })
+        rows.sort(key=lambda x: (x["rank"], -x["pts"], -x["gd"]))
+        return rows[:top]
+    except Exception as e:
+        log.info("ESPN standings %s failed: %s", league, short_reason(e, 80))
+        return []
+
+
+def format_standings_post(league="eng.1", top=10):
+    rows = espn_standings(league, top=top)
+    if not rows:
+        return None
+    lg_am = LEAGUE_AM.get(league, ESPN_LEAGUES.get(league, league))
+    lg_tag = LEAGUE_TAGS.get(league, "#Football")
+    lines = [f"📊 የ{lg_am} የደረጃ ሰንጠረዥ (Top {len(rows)})", ""]
+    for i, r in enumerate(rows, 1):
+        gd = f"+{r['gd']}" if r['gd'] > 0 else str(r['gd'])
+        lines.append(f"{i}. {team_am(r['team'])} — {r['pts']} ነጥብ ({r['gp']} ጨዋታ | GD {gd})")
+    lines += ["", "📌 ምንጭ፡ ESPN / Sekela Sport", brand_footer("sport"), f"{lg_tag} #SekelaSport #ሰከላስፖርት"]
+    return "\n".join(lines), f"የ{lg_am} የደረጃ ሰንጠረዥ"
 
 
 def sport_engine_tick():
@@ -6234,6 +6368,27 @@ def cmd_breaking(message):
 @private_owner_only
 def cmd_sport(message):
     _manual_hunt(message.chat.id, "sport")
+
+
+@bot.message_handler(commands=["table", "standings"])
+@private_owner_only
+def cmd_table(message):
+    parts = (message.text or "").split()
+    arg = parts[1].lower() if len(parts) > 1 else "epl"
+    league = TABLE_ALIASES.get(arg, arg if "." in arg else "eng.1")
+    ack = send_progress(message.chat.id, "📊 የደረጃ ሰንጠረዥ እና ነጥቦችን እያመጣሁ ነው...")
+    res = format_standings_post(league, top=10)
+    if not res:
+        deliver(message.chat.id, ack, "ሄኖክ፣ የደረጃ ሰንጠረዡን አሁን ማምጣት አልቻልኩም 😕 (ለምሳሌ: `/table epl`, `/table laliga`, `/table ucl`)")
+        return
+    post, headline = res
+    bg = _fallback_backdrop(brand="sport")
+    card = compose_card(bg, headline, badge="ሰከላ ስፖርት", ai=False, brand="sport")
+    d = {"post": post, "headline": headline, "image": card or bg, "card": bool(card),
+         "sources": [("ESPN", f"https://www.espn.com/soccer/standings/_/league/{league}")],
+         "unverified": False, "brand": "sport", "pkg": {}, "facts": post, "bg": bg, "real": False, "is_ai": False}
+    present_draft(message.chat.id, "📊 ሰንጠረዥ", d, "📊 የሊግ ደረጃ ሰንጠረዥ ረቂቅ ዝግጁ ነው!")
+    drop_message(message.chat.id, ack)
 
 
 def _gemini_status_lines():
