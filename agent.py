@@ -924,10 +924,17 @@ def ordered_openrouter_models(prefer=None):
     return first + [m for m in base if m not in first] + [m for m in free if m not in first]
 
 
+_or_no_credits = False
+
+
 def openrouter_chat(messages, max_tokens=1800, temperature=0.8, models=None):
+    global _or_no_credits
     if not OPENROUTER_API_KEY:
         return None, None
-    for model in ordered_openrouter_models(models):
+    cand_models = ordered_openrouter_models(models)
+    if _or_no_credits or os.environ.get("OPENROUTER_FREE_ONLY", "0") == "1":
+        cand_models = [m for m in cand_models if ":free" in m or m == "openrouter/free"]
+    for model in cand_models:
         try:
             r = requests.post(
                 f"{OPENROUTER_URL}/chat/completions",
@@ -946,9 +953,12 @@ def openrouter_chat(messages, max_tokens=1800, temperature=0.8, models=None):
                 log.warning("OpenRouter 401 (bad key) - switching to Gemini")
                 return None, None
             if r.status_code == 402:
+                _or_no_credits = True
                 _last_ai_error["or"] = "HTTP 402 (no credits)"
-                log.warning("OpenRouter 402 on %s - trying free models", model)
-                continue
+                log.warning("OpenRouter 402 on %s - switching to free models only", model)
+                if ":free" not in model and model != "openrouter/free":
+                    continue
+                return None, None
             if r.status_code != 200:
                 raise RuntimeError(f"{model} HTTP {r.status_code}: {r.text[:160]}")
             txt = ((r.json().get("choices") or [{}])[0].get("message") or {}).get("content") or ""
