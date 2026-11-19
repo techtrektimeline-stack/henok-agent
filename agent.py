@@ -69,6 +69,7 @@ except Exception:
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "").strip()
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "").strip()
 OWNER_ID = int(os.environ.get("OWNER_ID", "511440586"))
 PORT = int(os.environ.get("PORT", "10000"))
 RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "").strip()
@@ -984,6 +985,22 @@ def llm_write(user_text, history=None, system=None, allow_gemini=True, max_token
             return clean_md(text), f"gemini:{gmodel}"
         except Exception as e:
             log.error("Gemini fallback failed too: %s", e)
+    if GROQ_API_KEY:
+        try:
+            r = requests.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
+                json={"model": "llama-3.3-70b-versatile", "messages": messages,
+                      "temperature": temperature, "max_tokens": max_tokens},
+                timeout=60,
+            )
+            if r.status_code == 200:
+                txt = ((r.json().get("choices") or [{}])[0].get("message") or {}).get("content") or ""
+                if txt.strip():
+                    log.info("written by Groq llama-3.3-70b-versatile (fallback)")
+                    return clean_md(txt.strip()), "groq:llama-3.3-70b"
+        except Exception as e:
+            log.warning("Groq fallback failed: %s", e)
     return None, None
 
 
@@ -3735,9 +3752,13 @@ def hunt_once(manual=False, min_importance=None, brand="media", force_strict=Non
             _wom_skip = ("women's super league", "wsl", "man city women", "manchester city women", "arsenal women", "chelsea women", "barcelona femeni")
             rss_pool = [it for it in rss_pool if not any(w in it["title"].lower() for w in _wom_skip) or "ethiopia" in it["title"].lower()]
         feeds_txt = feed_items_text(rss_pool)
-        stories, scan_sources = scan_stories(focus, hours=24, n=10, feeds=feeds_txt)
-        # Always merge scan_stories + live TG/RSS/Trends stories so we never stall on 1 item
         feed_stories = stories_from_feeds(rss_pool, n=25) if rss_pool else []
+        unseen_feeds = unseen(feed_stories, threshold) or unseen(feed_stories)
+        # Save Gemini quota: only call scan_stories when feeds have <4 unseen items or on manual breaking/sport
+        if manual or len(unseen_feeds) < 4:
+            stories, scan_sources = scan_stories(focus, hours=24, n=10, feeds=feeds_txt)
+        else:
+            stories, scan_sources = [], []
         combined = [s for s in (list(stories) + feed_stories) if safety_gate_check(f"{s.get('title','')} {s.get('summary','')}")]
         fresh = unseen(combined, threshold) or unseen(combined)
         if not fresh and manual:
@@ -3772,10 +3793,15 @@ def hunt_once(manual=False, min_importance=None, brand="media", force_strict=Non
                         best_extra_imgs.append(im_u)
                 if it.get("link") and it["link"] not in best_match_links:
                     best_match_links.append(it["link"])
-        facts, sources = research_for(topic)
-        if not facts:
+        # Skip extra Gemini research call if TG/RSS item already has >=25 words of real context
+        if len(topic.split()) >= 25 and not manual:
             facts = f"{story['title']}. {story['summary']} (Reported by: {story['outlets']})"
             sources = scan_sources or ([(story['outlets'] or "Sekela Media Desk", story.get("link") or BRANDS[brand]["tg_link"])])
+        else:
+            facts, sources = research_for(topic)
+            if not facts:
+                facts = f"{story['title']}. {story['summary']} (Reported by: {story['outlets']})"
+                sources = scan_sources or ([(story['outlets'] or "Sekela Media Desk", story.get("link") or BRANDS[brand]["tg_link"])])
         d = build_draft(topic, facts=facts, sources=sources, allow_fallback=True, brand=brand,
                         photo_urls=best_match_links, story_image=best_match_img, segment=segment, extra_images=best_extra_imgs)
         if not d:
