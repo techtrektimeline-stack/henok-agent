@@ -1159,12 +1159,12 @@ NEWSROOM_SYSTEM = (
 )
 
 NEWS_BRIEF = (
-    "Write ONE Amharic news item from the research notes in Sekela's signature journalistic voice: bold headline -> "
+    "Write ONE Amharic news item from the research notes in Sekela's signature journalistic voice (CRITICAL: even if Topic and Research Notes are 100% in English, write HEADLINE, LEAD, and CONTEXT 100% in natural Amharic Ethiopic script — NEVER output English sentences): bold headline -> "
     "hook -> full explanation -> sources.\n"
     "Topic: {topic}\n{brand_note}\n\n[RESEARCH NOTES]\n{facts}\n\n{mode_note}"
     "SEO: naturally include the main high-search keyword in the headline and hook.\n"
     "Return EXACTLY these blocks and nothing else:\n"
-    "===HEADLINE===\n4-6 words: crystal-clear, grammatically natural, curiosity-sparking Amharic hook that captures attention and makes readers want to read the full story; no quotes, no emoji, no full stop, ZERO awkward literal translations.\n"
+    "===HEADLINE===\n4-6 words: crystal-clear, grammatically natural, curiosity-sparking Amharic hook that captures attention and makes readers want to read the full story (for AI/tech/software topics, prefer high-save curiosity hooks like 'አዲሱ X ምንድነው?', 'X ከ Y በምን ይለያል?', or 'X ምን አዲስ ነገር ይዞ መጣ?'); no quotes, no emoji, no full stop, ZERO awkward literal translations.\n"
     "===LEAD===\nThe hook: 1-2 vivid sentences (25-45 words) answering who, what, where and when.\n"
     "===CONTEXT===\nThe full story: 4-6 connected sentences (80-130 words) with key figures, names, background, reactions "
     "and what comes next.\n"
@@ -1380,6 +1380,8 @@ def assemble_news_post(pkg, facts="", sources=None, unverified=False, brand="med
     if official.strip(" .።").upper() in ("", "NONE", "N/A"):
         official = ""
     if not lead or not context:
+        return None
+    if not re.search(r"[ሀ-፼]{3,}", lead):
         return None
     max_words = 5 if segment in ("coffee", "bego") else 7
     headline = clean_headline(pkg.get("headline"), lead, max_words=max_words)
@@ -3456,7 +3458,7 @@ ETH_TG_CHANNELS = os.environ.get(
 )
 SPORT_TG_CHANNELS = os.environ.get(
     "SPORT_TG_CHANNELS",
-    "tikvahethsport,ethiosport,433,FabrizioRomano,Arsenal_Ethiopia,ManUtd_Ethiopia,Ethiopian_Football"
+    "tikvahethsport,ethiosport,soccerethiopia,433,FabrizioRomano,Arsenal_Ethiopia,ManUtd_Ethiopia,Ethiopian_Football"
 )
 
 
@@ -3506,6 +3508,63 @@ def _fetch_one_tg_channel(handle, max_age_hours=24, per_channel=3):
                 break
     except Exception as e:
         log.info("TG scrape @%s skipped: %s", handle, short_reason(e, 70))
+    return out
+
+
+GOOGLE_NEWS_QUERIES = {
+    "media": [
+        ("ኢትዮጵያ", "am", "ET", "ET:am"),
+        ("አዲስ አበባ", "am", "ET", "ET:am"),
+        ("ብር ምንዛሪ ብሔራዊ ባንክ", "am", "ET", "ET:am"),
+        ("Ethiopia economy OR telecom OR bank OR ministry", "en-ET", "ET", "ET:en"),
+        ("Ethiopia AI OR tech OR startup", "en-ET", "ET", "ET:en"),
+    ],
+    "sport": [
+        ("ዋሊያዎቹ OR ኢትዮጵያ እግር ኳስ", "am", "ET", "ET:am"),
+        ("የኢትዮጵያ ፕሪሚየር ሊግ OR ቅዱስ ጊዮርጊስ", "am", "ET", "ET:am"),
+        ("Ethiopian athletes OR Ethiopia athletics", "en-ET", "ET", "ET:en"),
+        ("Premier League OR Champions League transfer", "en-ET", "ET", "ET:en"),
+    ],
+}
+_source_fails = {}
+
+
+def fetch_google_news_rss(brand="media", max_age_hours=24, per_query=3):
+    """Fetches fresh stories from Google News RSS search (Amharic + English Ethiopia/Sport queries)."""
+    out = []
+    now_utc = datetime.now(timezone.utc)
+    queries = GOOGLE_NEWS_QUERIES.get(brand, GOOGLE_NEWS_QUERIES["media"])
+    for q, hl, gl, ceid in queries:
+        try:
+            url = f"https://news.google.com/rss/search?q={quote_plus(q + ' when:1d')}&hl={hl}&gl={gl}&ceid={ceid}"
+            r = requests.get(url, timeout=(5, 10), headers=_PHOTO_HEADERS)
+            if r.status_code != 200:
+                continue
+            root = ET.fromstring(r.content)
+            cnt = 0
+            for it in root.iter("item"):
+                title = (it.findtext("title") or "").strip()
+                link = (it.findtext("link") or "").strip()
+                if not title:
+                    continue
+                dt = _parse_pub_dt(it.findtext("pubDate"))
+                if dt is not None and (now_utc - dt).total_seconds() > max_age_hours * 3600:
+                    continue
+                src_el = it.find("source")
+                src_name = (src_el.text or "").strip() if src_el is not None else "Google News"
+                out.append({
+                    "source": src_name or "Google News",
+                    "title": title[:180],
+                    "link": link,
+                    "image": None,
+                    "images": [],
+                    "age_h": round((now_utc - dt).total_seconds() / 3600, 1) if dt else 4.0,
+                })
+                cnt += 1
+                if cnt >= per_query:
+                    break
+        except Exception as e:
+            log.info("Google News RSS (%s) skipped: %s", q[:20], short_reason(e, 60))
     return out
 
 
@@ -3662,7 +3721,8 @@ def hunt_once(manual=False, min_importance=None, brand="media", force_strict=Non
         feed_items = fetch_feed_items(brand, max_age_hours=24, per_feed=5)
         trends = fetch_google_trends(max_age_hours=24) if brand == "media" else []
         besoccer_items = fetch_besoccer_items(max_items=8) if brand == "sport" else []
-        rss_pool = tg_items + feed_items + besoccer_items + trends[:5]
+        gnews_items = fetch_google_news_rss(brand, max_age_hours=24, per_query=3)
+        rss_pool = tg_items + feed_items + gnews_items + besoccer_items + trends[:5]
         feeds_txt = feed_items_text(rss_pool)
 
         def unseen(lst, min_imp=None):
@@ -3750,7 +3810,8 @@ def hunter_loop(brand):
                 log.info("hunt %s: %s (daily=%d)", brand, st, daily_n)
         except Exception as e:
             log.error("hunter loop error (%s): %s", brand, e)
-        time.sleep(max(3, int(os.environ.get(interval_env, "5" if brand == "media" else "6"))) * 60)
+        _sec = int(os.environ.get("FETCH_INTERVAL_SECONDS", "0") or 0) or (max(2, int(os.environ.get(interval_env, "2" if brand == "media" else "3"))) * 60)
+        time.sleep(max(60, _sec))
 
 
 def start_hunter():
