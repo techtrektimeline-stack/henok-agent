@@ -1011,6 +1011,21 @@ def llm_write(user_text, history=None, system=None, allow_gemini=True, max_token
                     return clean_md(txt.strip()), "groq:llama-3.3-70b"
         except Exception as e:
             log.warning("Groq fallback failed: %s", e)
+    # 4th emergency zero-key fallback (Pollinations OpenAI-compatible free endpoint)
+    try:
+        r = requests.post(
+            "https://text.pollinations.ai/openai",
+            headers={"Content-Type": "application/json"},
+            json={"model": "openai", "messages": messages, "temperature": temperature},
+            timeout=60,
+        )
+        if r.status_code == 200:
+            txt = ((r.json().get("choices") or [{}])[0].get("message") or {}).get("content") or ""
+            if txt.strip():
+                log.info("written by Pollinations Text (zero-key fallback)")
+                return clean_md(txt.strip()), "pollinations:openai"
+    except Exception as e:
+        log.warning("Pollinations text fallback failed: %s", e)
     return None, None
 
 
