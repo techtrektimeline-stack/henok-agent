@@ -979,10 +979,14 @@ def llm_write(user_text, history=None, system=None, allow_gemini=True, max_token
         messages.append({"role": "assistant" if role == "model" else "user", "content": txt})
     messages.append({"role": "user", "content": user_text})
     if GITHUB_AI_TOKEN:
-        for gh_model in ("openai/gpt-4o-mini", "openai/gpt-4o"):
+        for gh_url, gh_model in (
+            ("https://models.inference.ai.azure.com/chat/completions", "gpt-4o-mini"),
+            ("https://models.github.ai/inference/chat/completions", "openai/gpt-4o-mini"),
+            ("https://models.inference.ai.azure.com/chat/completions", "gpt-4o"),
+        ):
             try:
                 r = requests.post(
-                    "https://models.github.ai/inference/chat/completions",
+                    gh_url,
                     headers={"Authorization": f"Bearer {GITHUB_AI_TOKEN}", "Content-Type": "application/json"},
                     json={"model": gh_model, "messages": messages,
                           "temperature": min(temperature, 0.6), "max_tokens": max_tokens},
@@ -993,9 +997,10 @@ def llm_write(user_text, history=None, system=None, allow_gemini=True, max_token
                     if txt.strip():
                         log.info("written by GitHub Models %s", gh_model)
                         return clean_md(txt.strip()), f"github:{gh_model}"
-                elif r.status_code in (401, 403):
-                    log.warning("GitHub Models %s auth error", r.status_code)
-                    break
+                else:
+                    log.warning("GitHub Models (%s) HTTP %s: %s", gh_model, r.status_code, r.text[:140])
+                    if r.status_code == 401:
+                        break
             except Exception as e:
                 log.warning("GitHub Models (%s) failed: %s", gh_model, short_reason(e, 70))
     text, model = openrouter_chat(messages, max_tokens=max_tokens, temperature=temperature, models=models)
@@ -1027,6 +1032,8 @@ def llm_write(user_text, history=None, system=None, allow_gemini=True, max_token
                 if txt.strip():
                     log.info("written by Groq llama-3.3-70b-versatile (fallback)")
                     return clean_md(txt.strip()), "groq:llama-3.3-70b"
+            else:
+                log.warning("Groq HTTP %s: %s", r.status_code, r.text[:140])
         except Exception as e:
             log.warning("Groq fallback failed: %s", e)
     # 4th emergency zero-key fallback (Pollinations OpenAI-compatible free endpoint)
