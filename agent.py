@@ -1650,6 +1650,351 @@ def _fallback_backdrop(brand="media", segment=None, width=1080, height=1350):
     return bio.getvalue()
 
 
+_PHOTO_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+}
+_META_IMG = [
+    re.compile(r'<meta[^>]+(?:property|name)\s*=\s*["\'](?:og:image(?::secure_url|:url)?|twitter:image(?::src)?)["\']'
+               r'[^>]*?content\s*=\s*["\']([^"\']+)["\']', re.I),
+    re.compile(r'<meta[^>]+content\s*=\s*["\']([^"\']+)["\'][^>]*?(?:property|name)\s*=\s*["\']'
+               r'(?:og:image|twitter:image)["\']', re.I),
+    re.compile(r'"image"\s*:\s*\{?[^\}]*?"url"\s*:\s*"(https?://[^"]+)"', re.I),
+    re.compile(r'<img[^>]+(?:src|data-src)\s*=\s*["\'](https?://[^"\']+\.(?:jpg|jpeg|png|webp)[^"\']*)["\']', re.I),
+]
+_BAD_IMG = re.compile(
+    r"logo|favicon|placeholder|sprite|avatar|default[-_]?(?:image|thumb|share)|1x1|watermark|"
+    r"gettyimages|shutterstock|alamy|istockphoto|depositphotos|123rf|dreamstime|"
+    r"small[-_]?img|crest|badge|150x150|100x100", re.I
+)
+
+
+def download_photo(url, referer=None):
+    """Photo Quality Gate: accept real news/TG photos >=480x320, reject watermarks/icons/tiny thumbs."""
+    try:
+        if not url or _BAD_IMG.search(url):
+            return None
+        headers = dict(_PHOTO_HEADERS)
+        if referer:
+            headers["Referer"] = referer
+        r = requests.get(url, headers=headers, timeout=14, allow_redirects=True)
+        if r.status_code != 200 or not r.headers.get("Content-Type", "").startswith("image/") or len(r.content) < 16000:
+            return None
+        if PIL_OK:
+            im = Image.open(io.BytesIO(r.content))
+            w, h = im.size
+            if w < 480 or h < 320:
+                return None
+            if w / max(1, h) > 2.8 or h / max(1, w) > 2.8:
+                return None
+            edge_std = ImageStat.Stat(im.convert("L").resize((180, 180)).filter(ImageFilter.FIND_EDGES)).stddev[0]
+            if edge_std < 4.5:
+                return None
+        return r.content
+    except Exception as e:
+        log.info("photo download failed: %s", short_reason(e, 80))
+        return None
+
+
+def _wiki_real_photo(query):
+    try:
+        q = re.sub(r"[^A-Za-z0-9\s-]", " ", query or "").strip()
+        words = [w for w in q.split() if len(w) >= 3][:4]
+        if not words:
+            return None
+        r = requests.get(
+            "https://en.wikipedia.org/w/api.php",
+            params={"action": "query", "generator": "search", "gsrsearch": " ".join(words),
+                    "gsrlimit": 3, "prop": "pageimages", "pithumbsize": 1200, "format": "json"},
+            headers=_PHOTO_HEADERS, timeout=8,
+        )
+        if r.status_code != 200:
+            return None
+        pages = (r.json().get("query") or {}).get("pages") or {}
+        for pg in pages.values():
+            src_u = (pg.get("thumbnail") or {}).get("source")
+            if src_u:
+                b = download_photo(src_u)
+                if b:
+                    return b
+    except Exception:
+        pass
+    return None
+
+
+def _fit_panel(im, pw, ph, bg=(20, 21, 24)):
+    """Fits an image into a panel without chopping off text/documents or faces."""
+    w, h = im.size
+    panel_ratio = pw / max(1, ph)
+    img_ratio = w / max(1, h)
+    if max(panel_ratio / img_ratio, img_ratio / panel_ratio) <= 1.55:
+        return _cover_crop_resize(im, pw, ph)
+    scale = min(pw / max(1, w), ph / max(1, h))
+    nw, nh = max(1, int(w * scale)), max(1, int(h * scale))
+    resized = im.resize((nw, nh), Image.LANCZOS)
+    frame = Image.new("RGB", (pw, ph), bg)
+    frame.paste(resized, ((pw - nw) // 2, (ph - nh) // 2))
+    return frame
+
+
+def _compose_photo_collage(photo_bytes_list, width=1080, height=1350):
+    """Blends 2-4 real photos cleanly in the upper ~68% zone so faces & documents stay visible above the headline."""
+    if not PIL_OK or len(photo_bytes_list) < 2:
+        return photo_bytes_list[0] if photo_bytes_list else None
+    try:
+        ims = [Image.open(io.BytesIO(b)).convert("RGB") for b in photo_bytes_list[:4]]
+        W, H = width, height
+        top_h = int(H * 0.68)
+        gap = 8
+        canvas = Image.new("RGB", (W, H), (18, 20, 24))
+        n = len(ims)
+        if n == 2:
+            w1 = (W - gap) // 2
+            canvas.paste(_fit_panel(ims[0], w1, top_h), (0, 0))
+            canvas.paste(_fit_panel(ims[1], W - w1 - gap, top_h), (w1 + gap, 0))
+        elif n == 3:
+            h1 = int(top_h * 0.54)
+            h2 = top_h - h1 - gap
+            w2 = (W - gap) // 2
+            canvas.paste(_fit_panel(ims[0], W, h1), (0, 0))
+            canvas.paste(_fit_panel(ims[1], w2, h2), (0, h1 + gap))
+            canvas.paste(_fit_panel(ims[2], W - w2 - gap, h2), (w2 + gap, h1 + gap))
+        else:
+            w2, h2 = (W - gap) // 2, (top_h - gap) // 2
+            canvas.paste(_fit_panel(ims[0], w2, h2), (0, 0))
+            canvas.paste(_fit_panel(ims[1], W - w2 - gap, h2), (w2 + gap, 0))
+            canvas.paste(_fit_panel(ims[2], w2, top_h - h2 - gap), (0, h2 + gap))
+            canvas.paste(_fit_panel(ims[3], W - w2 - gap, top_h - h2 - gap), (w2 + gap, h2 + gap))
+        canvas = ImageEnhance.Contrast(canvas).enhance(1.05)
+        out = io.BytesIO()
+        canvas.save(out, "JPEG", quality=92)
+        return out.getvalue()
+    except Exception as e:
+        log.info("collage build failed: %s", short_reason(e, 70))
+        return photo_bytes_list[0]
+
+
+def find_real_photo(urls, direct_image=None, max_pages=5, topic_hint=None, extra_images=None):
+    cand_imgs = []
+    if direct_image:
+        cand_imgs.append(direct_image)
+    for u in (extra_images or []):
+        if u and u not in cand_imgs:
+            cand_imgs.append(u)
+    if cand_imgs:
+        downloaded = []
+        for u in cand_imgs[:4]:
+            b = download_photo(u)
+            if b:
+                downloaded.append(b)
+        if len(downloaded) >= 2:
+            return _compose_photo_collage(downloaded)
+        if downloaded:
+            return downloaded[0]
+    seen, pages = set(), 0
+    for u in urls or []:
+        if not u or u in seen or pages >= max_pages:
+            continue
+        seen.add(u)
+        pages += 1
+        try:
+            r = requests.get(u, headers=_PHOTO_HEADERS, timeout=10, allow_redirects=True)
+            if r.status_code != 200 or "html" not in r.headers.get("Content-Type", ""):
+                continue
+            html = r.text[:250000]
+            for rx in _META_IMG:
+                for m in rx.finditer(html):
+                    img = urljoin(r.url, html_lib.unescape(m.group(1)).strip())
+                    if _BAD_IMG.search(img):
+                        continue
+                    b = download_photo(img, referer=r.url)
+                    if b:
+                        return b
+                    break
+        except Exception as e:
+            log.info("article page fetch failed: %s", short_reason(e, 80))
+    if topic_hint:
+        b = _wiki_real_photo(topic_hint)
+        if b:
+            return b
+    return None
+
+
+FONT_URLS = [
+    "https://cdn.jsdelivr.net/gh/notofonts/ethiopic@main/fonts/NotoSansEthiopic/hinted/ttf/NotoSansEthiopic-Bold.ttf",
+    "https://github.com/notofonts/ethiopic/raw/main/fonts/NotoSansEthiopic/hinted/ttf/NotoSansEthiopic-Bold.ttf",
+    "https://github.com/googlefonts/noto-fonts/raw/main/hinted/ttf/NotoSansEthiopic/NotoSansEthiopic-Bold.ttf",
+]
+_font_cache = {}
+_font_lock = threading.Lock()
+
+
+def _font_loadable(path):
+    try:
+        ImageFont.truetype(path, 40)
+        return True
+    except Exception:
+        return False
+
+
+def find_ethiopic_font():
+    if not PIL_OK:
+        return None
+    with _font_lock:
+        if "eth" in _font_cache:
+            return _font_cache["eth"]
+        here = os.path.dirname(os.path.abspath(__file__))
+        cached = os.path.join(tempfile.gettempdir(), "sekela-NotoSansEthiopic-Bold.ttf")
+        cands = [os.environ.get("FONT_PATH", "").strip()]
+        for pat in ("*Ethiopic*Bold*.[to]tf", "*Ethiopic*.[to]tf", "fonts/*Ethiopic*.[to]tf"):
+            cands += sorted(glob.glob(os.path.join(here, pat)))
+        for pat in ("**/*Ethiopic*Bold*.[to]tf", "**/*Ethiopic*.[to]tf", "**/*Abyssinica*.[to]tf"):
+            cands += sorted(glob.glob("/usr/share/fonts/" + pat, recursive=True))
+        cands.append(cached)
+        for p in cands:
+            if p and os.path.isfile(p) and _font_loadable(p):
+                _font_cache["eth"] = p
+                return p
+        for url in FONT_URLS:
+            try:
+                r = requests.get(url, timeout=60)
+                if r.status_code == 200 and len(r.content) > 20000 and r.content[:4] in (
+                        b"\x00\x01\x00\x00", b"OTTO", b"true", b"ttcf"):
+                    with open(cached, "wb") as f:
+                        f.write(r.content)
+                    if _font_loadable(cached):
+                        log.info("Ethiopic font downloaded from %s", url)
+                        _font_cache["eth"] = cached
+                        return cached
+            except Exception as e:
+                log.warning("font download failed (%s): %s", url, e)
+        _font_cache["eth"] = None
+        return None
+
+
+def _latin_font(size):
+    for p in ("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+              "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+              "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf"):
+        if os.path.isfile(p):
+            try:
+                return ImageFont.truetype(p, size)
+            except Exception:
+                pass
+    return ImageFont.load_default()
+
+
+def _is_eth(ch):
+    o = ord(ch)
+    return 0x1200 <= o <= 0x137F or 0x1380 <= o <= 0x139F or 0x2D80 <= o <= 0x2DDF or 0xAB00 <= o <= 0xAB2F
+
+
+def _split_runs(text):
+    runs, buf, cur = [], "", None
+    for ch in text:
+        eth = _is_eth(ch)
+        if cur is None or eth == cur:
+            buf += ch
+            cur = eth
+        else:
+            runs.append((buf, cur))
+            buf, cur = ch, eth
+    if buf:
+        runs.append((buf, cur))
+    return runs
+
+
+def _measure(text, f_eth, f_lat):
+    return sum((f_eth if eth else f_lat).getlength(s) for s, eth in _split_runs(text))
+
+
+def _draw_mixed(draw, x, baseline, text, f_eth, f_lat, fill):
+    cx = float(x)
+    for s, eth in _split_runs(text):
+        f = f_eth if eth else f_lat
+        draw.text((cx, baseline), s, font=f, fill=fill, anchor="ls")
+        cx += f.getlength(s)
+
+
+def _wrap(text, f_eth, f_lat, max_w):
+    lines, cur = [], ""
+    for w in text.split():
+        cand = (cur + " " + w).strip()
+        if not cur or _measure(cand, f_eth, f_lat) <= max_w:
+            cur = cand
+        else:
+            lines.append(cur)
+            cur = w
+    if cur:
+        lines.append(cur)
+    return lines
+
+
+def _cover_crop_resize(img, width, height):
+    w, h = img.size
+    target = width / height
+    src_r = w / max(1, h)
+    if src_r > target:
+        new_w = int(h * target)
+        left = (w - new_w) // 2
+        img = img.crop((left, 0, left + new_w, h))
+    elif src_r < target:
+        new_h = int(w / target)
+        top = max(0, (h - new_h) // 4)
+        img = img.crop((0, top, w, top + new_h))
+    return img.resize((width, height), Image.LANCZOS)
+
+
+def _apply_seamless_gradient(img, start_ratio=0.56, tint=(12, 8, 12), max_alpha=245):
+    W, H = img.size
+    overlay = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    od = ImageDraw.Draw(overlay)
+    g0 = int(H * start_ratio)
+    span = max(1, H - g0)
+    for y in range(g0, H):
+        t = (y - g0) / span
+        s = t * t * (3.0 - 2.0 * t)
+        od.line([(0, y), (W, y)], fill=tint + (int(max_alpha * s),))
+    return Image.alpha_composite(img.convert("RGBA"), overlay).convert("RGB")
+
+
+def _draw_social_footer(draw, right_x, center_y, handle):
+    f_h = _latin_font(23)
+    hw = int(f_h.getlength(handle))
+    x_text = right_x - hw
+    r = 14
+    fx = x_text - 14 - r
+    draw.ellipse([fx - r, center_y - r, fx + r, center_y + r], fill=(24, 119, 242, 245))
+    f_fb = _latin_font(21)
+    draw.text((fx - 4, center_y + 8), "f", font=f_fb, fill=(255, 255, 255, 255), anchor="ls")
+    tx = fx - 2 * r - 8
+    draw.ellipse([tx - r, center_y - r, tx + r, center_y + r], fill=(38, 165, 228, 245))
+    draw.polygon([(tx - 7, center_y), (tx + 7, center_y - 6), (tx + 3, center_y + 7), (tx - 1, center_y + 2)],
+                 fill=(255, 255, 255, 255))
+    draw.text((x_text, center_y + 8), handle, font=f_h, fill=(238, 240, 246, 235), anchor="ls")
+
+
+CARD_THEMES = {
+    "media": {"main": (162, 20, 44), "deep": (16, 8, 14), "gold": (255, 212, 72), "accent": (255, 212, 72)},
+    "sport": {"main": (4, 128, 90), "deep": (6, 20, 16), "gold": (255, 212, 72), "accent": (64, 232, 162)},
+    "coffee": {"main": (118, 66, 24), "deep": (18, 11, 6), "gold": (255, 198, 68), "accent": (255, 198, 68)},
+    "bego": {"main": (14, 77, 100), "deep": (8, 26, 36), "gold": (244, 208, 63), "accent": (244, 208, 63)},
+}
+
+
+def _draw_bold_shadow(draw, x, baseline, text, f_eth, f_lat, fill, shadow=True):
+    if shadow:
+        for dx, dy, a in ((0, 9, 75), (3, 9, 75), (6, 9, 65), (0, 6, 100), (3, 6, 100), (5, 6, 95), (2, 4, 130),
+                          (4, 4, 130), (-2, 3, 140), (0, 3, 165), (3, 3, 165), (6, 3, 130)):
+            _draw_mixed(draw, x + dx, baseline + dy, text, f_eth, f_lat, (0, 0, 0, a))
+        for dx in (-3, -2, -1, 0, 1, 2, 3):
+            for dy in (-3, -2, -1, 0, 1, 2, 3):
+                if dx * dx + dy * dy in (4, 5, 8, 9, 10, 13, 18):
+                    _draw_mixed(draw, x + dx, baseline + dy, text, f_eth, f_lat, (6, 6, 10, 240))
+    for dx, dy in ((0, 0), (1, 0), (2, 0), (0, 1), (1, 1), (0, 2)):
+        _draw_mixed(draw, x + dx, baseline + dy, text, f_eth, f_lat, fill)
+
+
 def _draw_sekela_s_emblem(draw, x, y, h, accent):
     """Draws a crisp rounded Sekela S badge with bold geometric S and clean border."""
     s = h
@@ -2918,12 +3263,8 @@ DEFAULT_FEEDS = {
         "BBC Amharic|https://feeds.bbci.co.uk/amharic/rss.xml,"
         "Fana BC|https://www.fanabc.com/feed/,"
         "Walta|https://waltainfo.com/feed/,"
-        "Borkena|https://borkena.com/feed/,"
-        "DW Amharic|https://rss.dw.com/xml/rss-am-all,"
-        "VOA Amharic|https://amharic.voanews.com/api/z$pqveymop,"
         "Addis Standard|https://addisstandard.com/feed/,"
         "ENA|https://www.ena.et/feed,"
-        "Al Ain Amharic|https://am.al-ain.com/feed,"
         "EBC|https://www.ebc.et/feed/,"
         "Capital Ethiopia|https://www.capitalethiopia.com/feed/,"
         "Addis Fortune|https://addisfortune.news/feed/,"
