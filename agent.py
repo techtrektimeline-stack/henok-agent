@@ -70,6 +70,7 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "").strip()
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "").strip()
+GITHUB_AI_TOKEN = os.environ.get("GITHUB_AI_TOKEN", "").strip()
 OWNER_ID = int(os.environ.get("OWNER_ID", "511440586"))
 PORT = int(os.environ.get("PORT", "10000"))
 RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "").strip()
@@ -981,6 +982,26 @@ def llm_write(user_text, history=None, system=None, allow_gemini=True, max_token
     for role, txt in history:
         messages.append({"role": "assistant" if role == "model" else "user", "content": txt})
     messages.append({"role": "user", "content": user_text})
+    if GITHUB_AI_TOKEN:
+        for gh_model in ("openai/gpt-4o-mini", "openai/gpt-4o"):
+            try:
+                r = requests.post(
+                    "https://models.github.ai/inference/chat/completions",
+                    headers={"Authorization": f"Bearer {GITHUB_AI_TOKEN}", "Content-Type": "application/json"},
+                    json={"model": gh_model, "messages": messages,
+                          "temperature": min(temperature, 0.6), "max_tokens": max_tokens},
+                    timeout=60,
+                )
+                if r.status_code == 200:
+                    txt = ((r.json().get("choices") or [{}])[0].get("message") or {}).get("content") or ""
+                    if txt.strip():
+                        log.info("written by GitHub Models %s", gh_model)
+                        return clean_md(txt.strip()), f"github:{gh_model}"
+                elif r.status_code in (401, 403):
+                    log.warning("GitHub Models %s auth error", r.status_code)
+                    break
+            except Exception as e:
+                log.warning("GitHub Models (%s) failed: %s", gh_model, short_reason(e, 70))
     text, model = openrouter_chat(messages, max_tokens=max_tokens, temperature=temperature, models=models)
     if text:
         log.info("written by OpenRouter %s", model)
@@ -3413,7 +3434,7 @@ def hunt_once(manual=False, min_importance=None, brand="media", force_strict=Non
         if brand == "media":
             rss_pool = [it for it in rss_pool if not has_any(it["title"], SPORT_WORDS)]
         else:
-            _wom_skip = ("women's super league", "wsl", "man city women", "manchester city women", "arsenal women", "chelsea women", "barcelona femeni", "golf", "tiger woods", "tennis", "wimbledon", "us open tennis", "cricket", "rugby", "baseball", "nfl", "nba", "nhl", "kuwait", "shareholder", "boardroom", "lpga", "pga tour")
+            _wom_skip = ("women's super league", "wsl", "man city women", "manchester city women", "arsenal women", "chelsea women", "barcelona femeni", "golf", "tiger woods", "tennis", "wimbledon", "us open tennis", "cricket", "rugby", "baseball", "nfl", "nba", "nhl", "kuwait", "shareholder", "boardroom", "lpga", "pga tour", "disciplinary", "committee", "executive", "chairman", "governing body", "lawsuit", "court ruling", "ownership", "takeover bid")
             rss_pool = [it for it in rss_pool if not any(w in it["title"].lower() for w in _wom_skip) or "ethiopia" in it["title"].lower()]
         feeds_txt = feed_items_text(rss_pool)
         feed_stories = stories_from_feeds(rss_pool, n=25) if rss_pool else []
@@ -3500,7 +3521,7 @@ def hunter_loop(brand):
                 log.info("hunt %s: %s (daily=%d)", brand, st, daily_n)
         except Exception as e:
             log.error("hunter loop error (%s): %s", brand, e)
-        _sec = int(os.environ.get("FETCH_INTERVAL_SECONDS", "0") or 0) or (max(2, int(os.environ.get(interval_env, "2" if brand == "media" else "3"))) * 60)
+        _sec = int(os.environ.get("FETCH_INTERVAL_SECONDS", "0") or 0) or (max(2, int(os.environ.get(interval_env, "2" if brand == "media" else "8"))) * 60)
         time.sleep(max(60, _sec))
 
 
