@@ -50,7 +50,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, quote, urlencode, urljoin, urlparse
+from urllib.parse import parse_qs, quote, quote_plus, urlencode, urljoin, urlparse
 
 import requests
 import telebot
@@ -237,17 +237,13 @@ class HealthHandler(BaseHTTPRequestHandler):
 
 
 def start_health_server(port=None):
-    port = PORT if port is None else port
-
-    def _serve():
-        try:
-            server = ThreadingHTTPServer(("0.0.0.0", port), HealthHandler)
-            log.info("Health server listening on port %s", server.server_address[1])
-            server.serve_forever()
-        except Exception as e:
-            log.error("Health server error: %s", e)
-
-    threading.Thread(target=_serve, daemon=True, name="health").start()
+    port = int(os.environ.get("PORT", port if port is not None else PORT))
+    try:
+        server = ThreadingHTTPServer(("0.0.0.0", port), HealthHandler)
+        log.info("Health server listening on port %s", server.server_address[1])
+        threading.Thread(target=server.serve_forever, daemon=True, name="health").start()
+    except Exception as e:
+        log.error("Health server error: %s", e)
 
 
 def start_keepalive():
