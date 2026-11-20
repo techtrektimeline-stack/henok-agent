@@ -2354,7 +2354,7 @@ def build_draft(topic, facts=None, sources=None, allow_fallback=True, brand=None
                  .replace("{brand_note}", BRANDS[brand]["brief_note"])
                  .replace("{facts}", facts or topic or "(none)")
                  .replace("{source_hint}", src_hint)
-                 .replace("{mode_note}", UNVERIFIED_NOTE if (unverified and segment != "bego") else "")) + learning_block(brand) + extra
+                 .replace("{mode_note}", (UNVERIFIED_NOTE if (unverified and segment != "bego") else "") + ("\nSHORT NOTES RULE: Only ~" + str(len((facts or "").split())) + " words of facts are given. Write ONLY 2-3 concise sentences strictly from these facts. NEVER invent cities, numbers, or details not in the notes!\n" if len((facts or "").split()) < 45 and segment not in ("coffee", "bego") else ""))) + learning_block(brand) + extra
         text, engine = llm_write(brief, system=NEWSROOM_SYSTEM, max_tokens=3000,
                                  temperature=0.55 if segment == "coffee" else (0.35 if segment == "bego" else (0.5 if attempt == 0 else 0.3)),
                                  allow_gemini=True, models=NEWS_WRITER_MODELS)
@@ -3558,6 +3558,7 @@ def _fetch_one_tg_channel(handle, max_age_hours=24, per_channel=3):
             out.append({
                 "source": f"TG @{handle}",
                 "title": txt[:180],
+                "full_text": txt[:1800],
                 "link": link,
                 "image": imgs[0] if imgs else None,
                 "images": imgs[:4],
@@ -3668,7 +3669,8 @@ def feed_items_text(items, limit=32):
 
 
 def stories_from_feeds(items, n=8):
-    return [{"importance": 6, "title": i["title"], "outlets": i["source"], "summary": i["title"],
+    return [{"importance": 6, "title": i["title"], "outlets": i["source"],
+             "summary": (i.get("full_text") or i["title"])[:1800],
              "link": i.get("link"), "image": i.get("image"), "images": i.get("images") or []} for i in items[:n]]
 
 
