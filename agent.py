@@ -1211,19 +1211,26 @@ NEWSROOM_SYSTEM = (
     "and 'ሰከላ በጎ'. You THINK in Amharic and write with Sekela's own distinctive, authoritative, vivid Addis Ababa "
     "journalistic voice - combining the warmth and clarity of Zehabesha, Gursha, Getu Temesgen and Tikvah.\n"
     "NATIVE-VOICE RULES (highest priority):\n"
-    "- ZERO literal English-to-Amharic calques or broken idioms (NEVER translate 'ruled out' as 'ፍርድ' or 'by' as 'ባይ'; write crystal-clear natural Amharic like 'ከውድድሩ ውጪ ሊሆን ነው', 'በይፋ አረጋገጠ'). Put time/place naturally («ማክሰኞ ዕለት በአዲስ አበባ ...») and end sentences "
-    "with strong verbs («አስታውቋል», «ይፋ አድርጓል», «ተፈራርመዋል», «አሻቅቧል», «ወርዷል», «ተጠናቋል»).\n"
-    "- Connect sentences smoothly («በተጨማሪም», «ይህም», «ከዚህ ቀደም», «በሌላ በኩል», «በመሆኑም», «ይሁን እንጂ»). Mostly 12-22 words "
-    "per sentence, never more than 26.\n"
-    "- PERFECT GRAMMAR & HEADLINE ACCURACY: plural/collective subjects take PLURAL verbs («አምስት አሰልጣኞች ለቀቁ» or «ክለቡ አምስት አሰልጣኞችን አሰናበተ» — NEVER «አምስት አሰልጣኞችን ለቀቀ»), «ግጭቶች እየተባባሱ ናቸው», «ባለሥልጣናቱ አስታውቀዋል». Every paragraph MUST end with a complete sentence (።). "
-    "singular subjects take singular verbs («ሚኒስቴሩ አስታውቋል»). Consistent tense inside each paragraph.\n"
-    "- RICH AND SPECIFIC: give who, what, where, when, numbers, names, background, why it matters to Ethiopians, and "
-    "what happens next — strictly from the notes. Never invent facts, phone numbers, bank accounts, or quotes.\n"
-    "- ORIGINAL REWRITE RULE: NEVER copy or lightly paraphrase BBC Amharic, Fana, or any source wording. Extract ONLY the verified facts and rewrite 100% originally in Sekela's own voice with richer background context (4-6 clear sentences) and a short 2-line punchy card headline.\n"
+    "- Write natural, native Addis Ababa Amharic. Think in Amharic; do not translate English sentence structures word-for-word. "
+    "If an English expression has no natural direct equivalent, explain its meaning in ordinary Amharic.\n"
+    "- Never use a word merely because it resembles an English word. Check the meaning in context, especially in football, "
+    "politics, diplomacy, technology and financial reporting. Prefer a clear sentence over a forced idiom.\n"
+    "- Avoid repetition: do not repeat the headline in the lead, do not restate the same fact in consecutive sentences, "
+    "and do not reuse the same sentence structure or three-word phrase repeatedly. Every sentence must add new information.\n"
+    "- Connect ideas naturally, but do not insert transition words just to make the paragraph longer. "
+    "Use «በተጨማሪም», «ይሁን እንጂ» and similar expressions only when the meaning requires them.\n"
+    "- Use mostly 12-22 words per sentence; never exceed 26 words. Each paragraph must end with a complete sentence.\n"
+    "- HEADLINES: use 4-6 meaningful words, natural Amharic grammar, and one clear news angle. "
+    "Do not use vague clickbait, awkward translations, unnecessary filler, or a question that the story does not answer.\n"
+    "- PERFECT GRAMMAR: plural subjects take plural verbs; singular subjects take singular verbs. "
+    "Keep tense and subject consistent within each paragraph.\n"
+    "- RICH AND SPECIFIC: give who, what, where, when, numbers, names, background and what happens next, "
+    "strictly from the research notes. Never invent facts, phone numbers, bank accounts or quotes.\n"
     "- SAFETY RULE: NEVER write anything that incites ethnic or religious conflict, hate speech, or division.\n"
+    "- Rewrite verified facts in Sekela's own words. Never copy or lightly paraphrase a source's sentences.\n"
     "- Neutral third person; NEVER address anyone directly (never ሄኖክ/አንተ/እኛ).\n"
-    "- ALWAYS use standard Western digits (0-9, e.g. 2026, 5, 10%) — NEVER Geez numerals (፩,፪). Plain text, no markdown, no emojis inside paragraphs; keep widely used Latin terms (AI, Bitcoin, TikTok, clubs/players)."
-)
+    "- ALWAYS use Western digits (0-9), including dates, scores, percentages and quantities. "
+    "Never use Ethiopic numerals (፩,፪). Keep widely used Latin names and terms where clearer, such as AI, Bitcoin, TikTok and club names.")
 
 NEWS_BRIEF = (
     "Write ONE Amharic news item from the research notes in Sekela's signature journalistic voice (CRITICAL: even if Topic and Research Notes are 100% in English, write HEADLINE, LEAD, and CONTEXT 100% in natural Amharic Ethiopic script — NEVER output English sentences): bold headline -> "
@@ -1231,10 +1238,13 @@ NEWS_BRIEF = (
     "Topic: {topic}\n{brand_note}\n\n[RESEARCH NOTES]\n{facts}\n\n{mode_note}"
     "SEO: naturally include the main high-search keyword in the headline and hook.\n"
     "Return EXACTLY these blocks and nothing else:\n"
-    "===HEADLINE===\n4-6 words: crystal-clear, grammatically natural, curiosity-sparking Amharic hook that captures attention and makes readers want to read the full story (for AI/tech/software topics, prefer high-save curiosity hooks like 'አዲሱ X ምንድነው?', 'X ከ Y በምን ይለያል?', or 'X ምን አዲስ ነገር ይዞ መጣ?'); no quotes, no emoji, no full stop, ZERO awkward literal translations.\n"
-    "===LEAD===\nThe hook: 1-2 vivid sentences (25-45 words) answering who, what, where and when.\n"
-    "===CONTEXT===\nThe full story: 4-6 connected sentences (80-130 words) with key figures, names, background, reactions "
-    "and what comes next.\n"
+    "===HEADLINE===\n4-6 meaningful words. Natural, grammatically correct Amharic; "
+    "one clear and compelling news angle (for AI/tech topics, prefer curiosity hooks like 'አዲሱ X ምንድነው?' or 'X ከ Y በምን ይለያል?'). "
+    "No quotes, emoji or full stop. Do not translate an English headline literally.\n"
+    "===LEAD===\n1-2 natural Amharic sentences (25-45 words total). Start with the most important verified fact. "
+    "Do not repeat the headline as a sentence.\n"
+    "===CONTEXT===\n4-6 connected Amharic sentences (80-130 words). Each sentence must add a distinct fact, "
+    "background detail, verified reaction or relevant next step. Do not repeat the lead or recycle the same point.\n"
     "===OFFICIAL===\nONE sentence with an official statement or quote, attributed to the named speaker/body. If none, write: NONE\n"
     "===SOURCE===\nOutlet/platform names from the notes separated by ' / ' (ቢቢሲ አማርኛ, ሮይተርስ, ፋና, ኢቢሲ, ኢዜአ, ዋልታ, "
     "ቲክቫህ ኢትዮጵያ, ጉርሻ, 3-4-3 ስፖርት, አል-አይን, ዶቼ ቬለ አማርኛ, AP, X, TikTok, YouTube).\n"
@@ -1442,6 +1452,9 @@ def _clean_amharic_artifacts(text):
 
 
 def _has_repetition_loop(text):
+    sents = [re.sub(r"\s+", " ", s.strip()) for s in re.split(r"[።.!?]+", text or "") if len(s.strip()) > 12]
+    if len(sents) >= 2 and len(sents) != len(set(sents)):
+        return True
     words = (text or "").split()
     if len(words) < 12:
         return False
@@ -1474,9 +1487,12 @@ def assemble_news_post(pkg, facts="", sources=None, unverified=False, brand="med
         return None
     if _has_repetition_loop(lead) or _has_repetition_loop(context):
         return None
-    max_words = 5 if segment in ("coffee", "bego") else 7
+    max_words = 5 if segment in ("coffee", "bego") else 6
     headline = clean_headline(pkg.get("headline"), lead, max_words=max_words)
     if not headline:
+        return None
+    if re.search(r"[\u1369-\u137C]", " ".join((headline, lead, context, official))):
+        log.warning("Rejected draft containing Ethiopic numerals")
         return None
     if segment == "bego":
         src = (pkg.get("source") or "").strip() or "ሰከላ በጎ (ከተላከው መረጃ)"
@@ -1730,28 +1746,28 @@ def _wiki_real_photo(query):
 
 
 def _fit_panel(im, pw, ph, bg=(20, 21, 24)):
-    """Fits an image into a panel without chopping off text/documents or faces."""
+    """Contain the complete source image; never crop faces, documents or text."""
+    if im is None or pw <= 0 or ph <= 0:
+        return Image.new("RGB", (max(1, pw), max(1, ph)), bg)
+    im = im.convert("RGB")
     w, h = im.size
-    panel_ratio = pw / max(1, ph)
-    img_ratio = w / max(1, h)
-    if max(panel_ratio / img_ratio, img_ratio / panel_ratio) <= 1.55:
-        return _cover_crop_resize(im, pw, ph)
     scale = min(pw / max(1, w), ph / max(1, h))
-    nw, nh = max(1, int(w * scale)), max(1, int(h * scale))
+    nw = max(1, min(pw, int(w * scale)))
+    nh = max(1, min(ph, int(h * scale)))
     resized = im.resize((nw, nh), Image.LANCZOS)
     frame = Image.new("RGB", (pw, ph), bg)
     frame.paste(resized, ((pw - nw) // 2, (ph - nh) // 2))
     return frame
 
 
-def _compose_photo_collage(photo_bytes_list, width=1080, height=1350):
-    """Blends 2-4 real photos cleanly in the upper ~68% zone so faces & documents stay visible above the headline."""
+def _compose_photo_collage(photo_bytes_list, width=1080, height=918):
+    """Blends 2-4 real photos directly into the 1080x918 upper photo zone (no double-scaling in compose_card)."""
     if not PIL_OK or len(photo_bytes_list) < 2:
         return photo_bytes_list[0] if photo_bytes_list else None
     try:
         ims = [Image.open(io.BytesIO(b)).convert("RGB") for b in photo_bytes_list[:4]]
         W, H = width, height
-        top_h = int(H * 0.68)
+        top_h = H
         gap = 8
         canvas = Image.new("RGB", (W, H), (18, 20, 24))
         n = len(ims)
@@ -2053,9 +2069,9 @@ def compose_card(bg_bytes, headline, badge=None, ai=True, width=1080, height=135
         hy = H - 132 - total_text_h
         pill_y = hy - 64
 
-        # Full-bleed studio-graded photo (vibrant color, crisp sharpness, balanced contrast)
+        # Keep the complete real photo visible in the upper 68% without cropping faces or text
         src_im = Image.open(io.BytesIO(bg_bytes)).convert("RGB")
-        photo = _cover_crop_resize(src_im, W, H)
+        photo = _fit_panel(src_im, W, int(H * 0.68), CHARCOAL)
         photo = ImageEnhance.Color(photo).enhance(1.12)
         photo = ImageEnhance.Contrast(photo).enhance(1.08)
         photo = ImageEnhance.Sharpness(photo).enhance(1.10).convert("RGBA")
@@ -2351,7 +2367,7 @@ def build_draft(topic, facts=None, sources=None, allow_fallback=True, brand=None
             paras = [p.strip() for p in re.split(r"\n\s*\n", text.strip()) if p.strip()]
             if paras:
                 pkg = {
-                    "headline": clean_headline(paras[0], max_words=7) or clean_headline(topic, max_words=7) or "ሰበር ዜና",
+                    "headline": clean_headline(paras[0], max_words=6) or clean_headline(topic, max_words=6) or "ሰበር ዜና",
                     "lead": paras[0],
                     "context": " ".join(paras[1:3]) if len(paras) > 1 else paras[0],
                     "official": "NONE",
@@ -2756,7 +2772,7 @@ _learn_lock = threading.RLock()
 _L = None
 _learn_flags = {"dirty": False, "important": False, "perf_ts": 0.0, "loaded_from_disk": False}
 LEARN_TOPICS = ["economy", "tech", "addis", "diplomacy", "social", "culture", "coffee", "bego", "conflict", "politics",
-                "ethiopian_football", "athletics", "boxing", "womens", "premier", "champions", "transfers", "other"]
+                "ethiopian_football", "athletics", "boxing", "premier", "champions", "transfers", "other"]
 TOPIC_AM = {"economy": "ኢኮኖሚ", "tech": "ቴክኖሎጂ", "addis": "አዲስ አበባ/መሠረተ ልማት", "diplomacy": "ዲፕሎማሲ", "social": "ማህበራዊ ሚዲያ",
             "culture": "ባህል", "coffee": "ኮፊ ታይም", "bego": "ሰከላ በጎ", "conflict": "ግጭት", "politics": "ፖለቲካ",
             "ethiopian_football": "የኢትዮጵያ እግር ኳስ", "athletics": "አትሌቲክስ", "boxing": "ቦክስ",
@@ -3227,9 +3243,8 @@ SPORT_DESKS = {
     "ethiopian_football": "Ethiopian football: Ethiopian Premier League, Saint George (ቅዱስ ጊዮርጊስ), Ethiopia Bunna, Walia Ibex, CAF",
     "athletics": "Ethiopian athletics and running (ሩጫ): marathons, Diamond League, World Athletics, Olympic records",
     "boxing": "Boxing (ቦክስ): major fights and results, heavyweight scene, East-African boxers",
-    "womens": "Women's sports (የሴቶች ስፖርት): Women's Super League, Champions League, Ethiopian women athletes",
 }
-SPORT_WHEEL = ["premier", "ethiopian_football", "athletics", "champions", "womens", "boxing", "transfers", "ethiopian_football",
+SPORT_WHEEL = ["premier", "ethiopian_football", "athletics", "champions", "boxing", "transfers", "ethiopian_football",
                "premier", "athletics"]
 _wheel["sport"] = 0
 offer_log = []
@@ -3240,7 +3255,6 @@ _SPORT_WORDS = {
     "athletics": ["athletics", "marathon", "diamond league", "world athletics", "olympic", "10,000m", "5,000m", "half marathon",
                   "sprint", "ሩጫ", "አትሌት", "ማራቶን", "ዳይመንድ ሊግ", "አትሌቲክስ"],
     "boxing": ["boxing", "boxer", "heavyweight", "knockout", "title fight", "ቦክስ"],
-    "womens": ["women's", "womens", "wsl", "lionesses", "female", "women football", "ሴቶች", "የሴቶች"],
     "transfers": ["transfer", "signing", "signs", "here we go", "contract", "loan deal", "bid ", "ዝውውር", "ፈረመ", "ኮንትራት"],
     "champions": ["champions league", "uefa", "europa league", "la liga", "serie a", "bundesliga", "ligue 1", "real madrid",
                   "barcelona", "bayern", "ቻምፒየንስ ሊግ", "ላ ሊጋ", "ሴሪኤ", "ቡንደስሊጋ"],
@@ -3255,7 +3269,7 @@ def classify_sport_topic(text):
     best = max(scores.values())
     if best == 0:
         return "other"
-    order = ["ethiopian_football", "athletics", "boxing", "womens", "transfers", "champions", "premier"]
+    order = ["ethiopian_football", "athletics", "boxing", "transfers", "champions", "premier"]
     return next(k for k in order if scores.get(k) == best)
 
 
@@ -3734,7 +3748,7 @@ def hunt_once(manual=False, min_importance=None, brand="media", force_strict=Non
         return "busy"
     try:
         _last_ai_error["hunt"] = ""
-        if not GEMINI_API_KEY and not OPENROUTER_API_KEY:
+        if not (GEMINI_API_KEY or OPENROUTER_API_KEY or GITHUB_AI_TOKEN or GROQ_API_KEY):
             return "nokey"
         today = addis_now().strftime("%Y-%m-%d")
         daily = hunt_daily[brand]
@@ -3778,8 +3792,23 @@ def hunt_once(manual=False, min_importance=None, brand="media", force_strict=Non
         if brand == "media":
             rss_pool = [it for it in rss_pool if not has_any(it["title"], SPORT_WORDS)]
         else:
-            _wom_skip = ("women's super league", "wsl", "man city women", "manchester city women", "arsenal women", "chelsea women", "barcelona femeni", "golf", "tiger woods", "tennis", "wimbledon", "us open tennis", "cricket", "rugby", "baseball", "nfl", "nba", "nhl", "kuwait", "shareholder", "boardroom", "lpga", "pga tour", "disciplinary", "committee", "executive", "chairman", "governing body", "lawsuit", "court ruling", "ownership", "takeover bid")
-            rss_pool = [it for it in rss_pool if not any(w in it["title"].lower() for w in _wom_skip) or "ethiopia" in it["title"].lower()]
+            _eth_terms = ("ethiopia", "ethiopian", "walia", "walias", "ዋልያ", "ኢትዮጵያ", "ኢትዮጵያዊ")
+            _sport_skip = ("women's", "womens", "wsl", "femeni", "golf", "tennis", "cricket", "rugby", "baseball",
+                           "nfl", "nba", "nhl", "kuwait", "shareholder", "boardroom", "disciplinary", "committee",
+                           "chairman", "governing body", "lawsuit", "court ruling", "ownership", "takeover")
+
+            def _sport_allowed(it):
+                st_txt = f"{it.get('title', '')} {it.get('summary', '')}".lower()
+                if any(w in st_txt for w in _sport_skip) and not any(t in st_txt for t in _eth_terms):
+                    return False
+                tp = classify_sport_topic(st_txt)
+                if tp in ("premier", "champions", "transfers", "ethiopian_football"):
+                    return True
+                if tp in ("athletics", "boxing"):
+                    return any(t in st_txt for t in _eth_terms)
+                return False
+
+            rss_pool = [it for it in rss_pool if _sport_allowed(it)]
         feeds_txt = feed_items_text(rss_pool)
         feed_stories = stories_from_feeds(rss_pool, n=25) if rss_pool else []
         unseen_feeds = unseen(feed_stories, threshold) or unseen(feed_stories)
@@ -3788,7 +3817,9 @@ def hunt_once(manual=False, min_importance=None, brand="media", force_strict=Non
             stories, scan_sources = scan_stories(focus, hours=24, n=10, feeds=feeds_txt)
         else:
             stories, scan_sources = [], []
-        combined = [s for s in (list(stories) + feed_stories) if safety_gate_check(f"{s.get('title','')} {s.get('summary','')}")]
+        combined = [s for s in (list(stories) + feed_stories)
+                    if safety_gate_check(f"{s.get('title','')} {s.get('summary','')}")
+                    and (brand == "media" or _sport_allowed(s))]
         fresh = unseen(combined, threshold) or unseen(combined)
         if not fresh and manual:
             fresh = combined[:12]
@@ -3865,7 +3896,7 @@ def hunter_loop(brand):
                 log.info("hunt %s: %s (daily=%d)", brand, st, daily_n)
         except Exception as e:
             log.error("hunter loop error (%s): %s", brand, e)
-        _sec = int(os.environ.get("FETCH_INTERVAL_SECONDS", "0") or 0) or (max(2, int(os.environ.get(interval_env, "2" if brand == "media" else "8"))) * 60)
+        _sec = int(os.environ.get("FETCH_INTERVAL_SECONDS", "0") or 0) or (max(2, int(os.environ.get(interval_env, "2" if brand == "media" else "10"))) * 60)
         time.sleep(max(60, _sec))
 
 
