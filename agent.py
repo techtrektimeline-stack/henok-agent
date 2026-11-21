@@ -2525,6 +2525,150 @@ def qa_verify_and_polish_pkg(pkg, source_text, source_name):
         return False, f"Polished text failed re-check: {re_problem}", pkg
     return True, str(res.get("reason") or "OK"), new_pkg
 
+
+# ── Standard-Amharic Lexicon & Gibberish Guard (from sekela_amharic_guard.py) ──
+_GUARD_CACHE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "amharic_lexicon_cache.json")
+_GUARD_MIN_HITS, _GUARD_MIN_SCORE, _GUARD_PERFECT, _GUARD_MAX_UNVERIFIED = 2, 7, 9, 0.4
+_GUARD_WORD_RE = re.compile(r"[\u1200-\u135A]{2,}")
+_GUARD_PREFIXES = ("የ", "በ", "ለ", "ከ", "ስለ", "ወደ", "እንደ", "እና")
+_GUARD_SUFFIXES = ("ዎቹን", "ዎችን", "ዎች", "ዎቹ", "ኦች", "ው", "ን", "ም", "ች", "ና")
+_GUARD_KNOWN_FIXES = {
+    "ሴኔ": "ሰኔ", "ተሸከረካሪ": "ተሽከርካሪ", "ተሸከርካሪ": "ተሽከርካሪ",
+    "ተሸከርካር": "ተሽከርካሪ", "በሚቀተለው": "በሚቀጥለው",
+}
+_GUARD_FIX_SYSTEM = (
+    "You are the chief copy editor of an Addis Ababa Amharic newsroom (ETV, Fana, BBC Amharic, VOA Amharic). "
+    "Input JSON: headline, body, source_text, unverified_words, problems.\n"
+    "Fix ONLY the language: spelling (ሰኔ not ሴኔ, ተሽከርካሪ not ተሸከረካሪ), non-existent/garbled words, wrong verb agreement, "
+    "English-style syntax, and nonsense sentences. Use plain common Addis Ababa Amharic. Never change facts, names, numbers, or dates.\n"
+    "Return ONLY JSON with keys: headline, body."
+)
+_GUARD_JUDGE_SYSTEM = (
+    "You are a strict native-Amharic proofreader. Input JSON: headline, body, source_text, unverified_words.\n"
+    "Score 0-10: every word is real standard Amharic, grammar is correct, every sentence is meaningful and coherent, "
+    "and nothing contradicts source_text. 9-10 publishable as is; 7-8 minor slips; 6 or less NOT publishable (gibberish, invented words, nonsense).\n"
+    "Return ONLY JSON with keys: score (integer), problems (up to 5 short English notes quoting bad fragments)."
+)
+
+
+def _guard_wiki_hits(word):
+    qs = urllib.parse.urlencode({"action": "query", "list": "search", "srsearch": f'"{word}"', "srlimit": 1,
+                                 "srinfo": "totalhits", "format": "json"})
+    req = urllib.request.Request(f"https://am.wikipedia.org/w/api.php?{qs}", headers={"User-Agent": "SekelaBot/1.0"})
+    with urllib.request.urlopen(req, timeout=8) as resp:
+        return int(json.load(resp)["query"]["searchinfo"]["totalhits"])
+
+
+def _guard_load_cache(path=_GUARD_CACHE_PATH):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return {k: int(v) for k, v in json.load(f).items()}
+    except Exception:
+        return {}
+
+
+def _guard_save_cache(cache, path=_GUARD_CACHE_PATH):
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(cache, f, ensure_ascii=False)
+    except Exception:
+        pass
+
+
+def remember_approved_text(text, cache_path=_GUARD_CACHE_PATH):
+    cache = _guard_load_cache(cache_path)
+    cache.update({w: 999 for w in _GUARD_WORD_RE.findall(str(text or ""))})
+    _guard_save_cache(cache, cache_path)
+
+
+def _guard_known_fixes(text):
+    for wrong, right in _GUARD_KNOWN_FIXES.items():
+        pat = re.escape(wrong) if len(wrong) >= 4 else rf"(?<![\u1200-\u135A]){wrong}(?![\u1200-\u135A])"
+        text = re.sub(pat, right, text)
+    return text
+
+
+def _guard_variants(word):
+    forms = [word]
+    for pref in _GUARD_PREFIXES:
+        if word.startswith(pref) and len(word) > len(pref) + 1:
+            forms.append(word[len(pref):])
+    for f in list(forms):
+        for suf in _GUARD_SUFFIXES:
+            if f.endswith(suf) and len(f) > len(suf) + 1:
+                forms.append(f[:-len(suf)])
+    return list(dict.fromkeys(forms))[:4]
+
+
+def _guard_unverified(text, trusted, cache):
+    def supported(word):
+        for form in _guard_variants(word):
+            if form in trusted:
+                return True
+            if form not in cache:
+                try:
+                    cache[form] = int(_guard_wiki_hits(form))
+                except Exception:
+                    return True
+            if cache[form] >= _GUARD_MIN_HITS:
+                return True
+        return False
+
+    words = sorted(set(_GUARD_WORD_RE.findall(text)))
+    if not words:
+        return [], 0
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        flags = list(pool.map(supported, words))
+    return [w for w, ok in zip(words, flags) if not ok], len(words)
+
+
+def _guard_judge_call(system_prompt, user_prompt):
+    txt, _ = llm_write(user_prompt, system=system_prompt, max_tokens=900, temperature=0.1,
+                       allow_gemini=True, models=NEWS_WRITER_MODELS)
+    return txt or ""
+
+
+def amharic_guard(draft, source_text):
+    source, cache = str(source_text or ""), _guard_load_cache()
+    trusted = set(_GUARD_WORD_RE.findall(source))
+    head = _guard_known_fixes(str((draft or {}).get("headline") or "").strip())
+    body = _guard_known_fixes(str((draft or {}).get("body") or "").strip())
+
+    def _run_judge(h, b, unv):
+        res = _pipe_parse_json(_guard_judge_call(_GUARD_JUDGE_SYSTEM, json.dumps({
+            "headline": h, "body": b, "source_text": source[:4000], "unverified_words": unv[:30]
+        }, ensure_ascii=False)))
+        if not isinstance(res, dict):
+            return 0, ["proofreader unavailable"]
+        try:
+            sc = int(float(res.get("score")))
+        except Exception:
+            sc = 0
+        probs = res.get("problems")
+        return sc, [str(x) for x in probs][:5] if isinstance(probs, list) else []
+
+    unverified, total = _guard_unverified(f"{head} {body}", trusted, cache)
+    score, problems = _run_judge(head, body, unverified)
+    if score < _GUARD_PERFECT:
+        res = _pipe_parse_json(_pipe_llm_call(_GUARD_FIX_SYSTEM, json.dumps({
+            "headline": head, "body": body, "source_text": source[:4000],
+            "unverified_words": unverified[:30], "problems": problems
+        }, ensure_ascii=False)))
+        if isinstance(res, dict) and res.get("headline") and res.get("body"):
+            nh, nb = str(res["headline"]).strip(), str(res["body"]).strip()
+            nums = lambda t: set(re.findall(r"\d+", t.replace(",", "")))
+            if nh and nb and not (nums(f"{nh} {nb}") - nums(f"{head} {body} {source}")):
+                head, body = _norm_amharic_digits(nh), _norm_amharic_digits(nb)
+                unverified, total = _guard_unverified(f"{head} {body}", trusted, cache)
+                score, problems = _run_judge(head, body, unverified)
+    _guard_save_cache(cache)
+    ratio = len(unverified) / max(total, 1)
+    issues = list(problems)
+    if unverified:
+        issues.append(f"{len(unverified)}/{total} unverified: {', '.join(unverified[:10])}")
+    return {"ok": score >= _GUARD_MIN_SCORE and ratio <= _GUARD_MAX_UNVERIFIED,
+            "headline": head, "body": body, "score": score, "issues": issues, "unverified": unverified}
+
 def build_draft(topic, facts=None, sources=None, allow_fallback=True, brand=None, photo_urls=None, story_image=None,
                 segment=None, custom_photo=None, extra_images=None):
     if segment in ("coffee", "bego"):
@@ -2600,6 +2744,17 @@ def build_draft(topic, facts=None, sources=None, allow_fallback=True, brand=None
             log.warning("QA Gate rejected draft '%s': %s", pkg.get("headline", ""), _qa_reason)
             return None
         pkg = _qa_pkg
+        _g_body = f"{pkg.get('lead', '')}\n\n{pkg.get('context', '')}".strip()
+        _g_res = amharic_guard({"headline": pkg.get("headline", ""), "body": _g_body}, facts or topic)
+        if not _g_res["ok"]:
+            log.warning("Amharic Guard rejected draft '%s' (score=%s): %s", pkg.get("headline", ""), _g_res["score"], _g_res["issues"])
+            return None
+        pkg["headline"] = _g_res["headline"]
+        _g_paras = [x.strip() for x in _g_res["body"].split("\n\n") if x.strip()]
+        if _g_paras:
+            pkg["lead"] = _g_paras[0]
+            if len(_g_paras) > 1:
+                pkg["context"] = "\n\n".join(_g_paras[1:])
         re_ed = assemble_news_post(pkg, facts or "", sources, unverified and segment != "bego", brand, segment=segment)
         if re_ed:
             post, headline = re_ed
@@ -3088,6 +3243,7 @@ def approve_and_publish(chat_id, msg_id, did):
     if (d["tg"] or d["fb"]) and not d.get("learned"):
         d["learned"] = True
         learn_event("approve", d)
+        remember_approved_text(d.get("post", ""))
         learn_track(d, fb_post_id=d.get("fb_post_id"))
     if d["tg"] and (d["fb"] or not fb_on):
         with state_lock:
