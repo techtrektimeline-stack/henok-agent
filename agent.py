@@ -2412,6 +2412,30 @@ def build_draft(topic, facts=None, sources=None, allow_fallback=True, brand=None
         log.error("news writer produced nothing (both OpenRouter and Gemini failed)")
         return None
     pkg, (post, headline) = best
+    if segment != "bego":
+        # Always run 2nd-pass native Amharic editor on HEADLINE+LEAD+CONTEXT to kill English calques & sharpen the scroll-stopping hook
+        try:
+            ed_prompt = (
+                "You are the Chief Amharic Copy Editor for Sekela Media / Sekela Sport in Addis Ababa.\n"
+                "Polish ONLY the Amharic wording and hook below so it reads like native Addis Ababa journalism (Tikvah / Getu Temesgen / Gursha style).\n"
+                "RULES:\n"
+                "1) HEADLINE (4-6 words): Make it ultra-clear, punchy, and scroll-stopping so Facebook/Telegram readers immediately want to read more.\n"
+                "2) KILL ALL ENGLISH CALQUES & TRANSLITERATIONS: e.g. 'ankle'->'ቁርጭምጭሚት', 'ruled out'->'ከጨዋታ ውጪ ሆነ', 'Wall Street'->'የአሜሪካ የፋይናንስ ገበያ', never invent broken words.\n"
+                "3) Keep ALL facts, names, and 0-9 numbers 100% accurate. Zero repetition. Return ONLY ===HEADLINE===, ===LEAD===, ===CONTEXT===.\n\n"
+                f"===HEADLINE===\n{pkg.get('headline','')}\n===LEAD===\n{pkg.get('lead','')}\n===CONTEXT===\n{pkg.get('context','')}"
+            )
+            ed_txt, _ = llm_write(ed_prompt, system="You are an elite native Amharic newsroom editor.", max_tokens=1600, temperature=0.35, allow_gemini=True, models=NEWS_WRITER_MODELS)
+            if ed_txt:
+                ed_pkg = parse_package(ed_txt)
+                if ed_pkg.get("headline") and ed_pkg.get("lead") and ed_pkg.get("context"):
+                    pkg["headline"] = ed_pkg["headline"]
+                    pkg["lead"] = ed_pkg["lead"]
+                    pkg["context"] = ed_pkg["context"]
+                    re_ed = assemble_news_post(pkg, facts or "", sources, unverified and segment != "bego", brand, segment=segment)
+                    if re_ed:
+                        post, headline = re_ed
+        except Exception as _e:
+            log.info("2nd-pass Amharic edit skipped: %s", short_reason(_e, 60))
     fixed = proofread_pkg(pkg) if (segment != "bego" and best_score and best_score > 0) else pkg
     if fixed is not pkg:
         rebuilt = assemble_news_post(fixed, facts or "", sources, unverified, brand, segment=segment)
@@ -3857,7 +3881,21 @@ def hunt_once(manual=False, min_importance=None, brand="media", force_strict=Non
         none_streak[brand] = 0
         mark_seen(f"{story['title']} {story['summary']}")
         start = time.time()
-        topic = f"{story['title']}. {story['summary']}"
+        # Multi-Source Sibling Merger: merge matching stories from other outlets & mark them seen so duplicates never repeat
+        s_keys_main = story_keys(f"{story['title']} {story['summary']}")
+        merged_notes = [story.get("summary") or story.get("title") or ""]
+        merged_outlets = [story.get("outlets") or ""]
+        for sib in combined:
+            if sib is story:
+                continue
+            sib_txt = f"{sib.get('title', '')} {sib.get('summary', '')}"
+            if len(s_keys_main & story_keys(sib_txt)) >= 2:
+                mark_seen(sib_txt)
+                if sib.get("summary") and sib["summary"] not in merged_notes:
+                    merged_notes.append(sib["summary"][:600])
+                if sib.get("outlets") and sib["outlets"] not in merged_outlets:
+                    merged_outlets.append(sib["outlets"])
+        topic = f"{story['title']}. " + " | ".join(x for x in merged_notes[:3] if x)
         # Inherit matching real link/image from rss_pool if scan_stories omitted them
         s_keys = story_keys(topic)
         best_match_img = story.get("image")
