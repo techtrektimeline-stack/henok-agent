@@ -1295,7 +1295,8 @@ NEWSROOM_SYSTEM = (
     "- ALWAYS use Western digits (0-9) with a space before the unit or noun (e.g. '2 ሚሊዮን ካናሪ', never '2ሚሊዮን'; ordinals attach: '3ኛ'). "
     "Never use Ethiopic numerals (፩,፪). Keep widely used Latin names and terms where clearer, such as AI, Bitcoin, TikTok and club names.\n"
     "- ZERO-TOLERANCE GROUNDING: Use ONLY facts in the research notes. Do NOT add any Ethiopian angle, reaction, community, or impact "
-    "unless the source itself mentions Ethiopia or Ethiopians. A foreign story stays a foreign story. Never output NONE as source.")
+    "unless the source itself mentions Ethiopia or Ethiopians. A foreign story stays a foreign story. Never output NONE as source.\n"
+    "- STANDARD TERMS: ጎል(goal), ጨዋታ(match), ውጤት(score), ነጥብ(points), ደረጃ(standings), አቻ(draw), አሸነፈ(won), ተሸነፈ(lost), አሰልጣኝ(coach), ተጫዋች(player), አጥቂ(striker), ግብ ጠባቂ(goalkeeper), ተከላካይ(defender), አማካይ(midfielder), ዝውውር(transfer), ጉዳት(injury).")
 
 NEWS_BRIEF = (
     "Write ONE Amharic news item from the research notes in Sekela's signature journalistic voice (CRITICAL: even if Topic and Research Notes are 100% in English, write HEADLINE, LEAD, and CONTEXT 100% in natural Amharic Ethiopic script — NEVER output English sentences): bold headline -> "
@@ -2716,6 +2717,72 @@ def amharic_guard(draft, source_text):
     return {"ok": score >= _GUARD_MIN_SCORE and ratio <= _GUARD_MAX_UNVERIFIED,
             "headline": head, "body": body, "score": score, "issues": issues, "unverified": unverified}
 
+
+# ── Dedicated Amharic Desk: Glossary + Blind Back-Translation Verifier (from sekela_amharic_desk.py) ──
+_DESK_GLOSSARY = {
+    "goal": "ጎል", "match": "ጨዋታ", "score/result": "ውጤት", "points": "ነጥብ", "standings": "ደረጃ", "draw": "አቻ",
+    "won": "አሸነፈ", "lost": "ተሸነፈ", "league": "ሊግ", "cup": "ዋንጫ", "coach": "አሰልጣኝ", "player": "ተጫዋች",
+    "striker": "አጥቂ", "goalkeeper": "ግብ ጠባቂ", "defender": "ተከላካይ", "midfielder": "አማካይ",
+    "penalty": "ፍጹም ቅጣት ምት", "red card": "ቀይ ካርድ", "yellow card": "ቢጫ ካርድ", "referee": "ዳኛ",
+    "first half": "የመጀመሪያ አጋማሽ", "second half": "ሁለተኛ አጋማሽ", "minute": "ደቂቃ", "fans": "ደጋፊዎች",
+    "club": "ክለብ", "team": "ቡድን", "transfer": "ዝውውር", "injury": "ጉዳት", "announced": "አስታወቀ", "said": "ገለጸ",
+    "reported": "ዘገበ", "government": "መንግሥት", "ministry": "ሚኒስቴር", "company": "ኩባንያ", "price": "ዋጋ",
+    "technology": "ቴክኖሎጂ", "artificial intelligence": "አርቲፊሻል ኢንተለጀንስ", "internet": "ኢንተርኔት",
+    "percent": "በመቶ", "million": "ሚሊዮን", "billion": "ቢሊዮን", "dollar": "ዶላር", "today": "ዛሬ", "yesterday": "ትናንት",
+    "next week": "በሚቀጥለው ሳምንት", "last week": "ባለፈው ሳምንት",
+}
+_DESK_BACK_SYSTEM = (
+    "You are a quality-control translator. Translate the Amharic text into plain English, sentence by sentence, as LITERALLY as possible. "
+    "NEVER guess and NEVER auto-correct: if a word is not a real Amharic word, is so misspelled that you cannot be sure of its meaning, "
+    "or a sentence is ungrammatical or meaningless, write [UNCLEAR: <the Amharic fragment>] in its place. Output only the English."
+)
+_DESK_COMPARE_SYSTEM = (
+    "You are a fact-checker. Input JSON: brief (the true facts) and back_translation (a literal English back-translation of an Amharic post). "
+    "Score 0-10 how faithfully the post carries the brief. Deduct for missing/changed facts, unsupported additions, [UNCLEAR] markers, and nonsense. "
+    "Return ONLY JSON with keys: score (integer), added (list of strings), changed (list of strings)."
+)
+_DESK_EDITOR_SYSTEM = (
+    "You are a native Amharic copy editor. Input JSON: brief, headline, body, findings. "
+    "Rewrite ONLY the broken parts into correct, complete-fidel, standard Amharic with natural prepositions (በ, ለ, ከ, የ) that matches the brief; "
+    "delete unsupported statements. Leave everything else unchanged. Return ONLY JSON with keys: headline, body."
+)
+
+
+def _desk_llm_low_temp(system_prompt, user_prompt):
+    txt, _ = llm_write(user_prompt, system=system_prompt, max_tokens=1100, temperature=0.2,
+                       allow_gemini=True, models=NEWS_WRITER_MODELS)
+    return txt or ""
+
+
+def desk_verify_and_repair(headline, body, brief_text):
+    """Blind back-translation check + 1 repair round if [UNCLEAR] or score < 8. Fails open if free verifier hits 429."""
+    text = f"{headline}\n\n{body}".strip()
+    back = _desk_llm_low_temp(_DESK_BACK_SYSTEM, text)
+    if not back:
+        return True, headline, body, []  # free verifier unavailable: fall back to deterministic + QA checks
+    unclear = [u.strip() for u in re.findall(r"\[UNCLEAR:\s*([^\]]*)\]", back)]
+    res = _pipe_parse_json(_desk_llm_low_temp(_DESK_COMPARE_SYSTEM, json.dumps(
+        {"brief": str(brief_text)[:3500], "back_translation": back}, ensure_ascii=False)))
+    if not isinstance(res, dict):
+        return (len(unclear) == 0), headline, body, [f"unclear: {u}" for u in unclear]
+    try:
+        score = int(float(res.get("score")))
+    except Exception:
+        score = 8
+    added = [str(x) for x in (res.get("added") or [])] if isinstance(res.get("added"), list) else []
+    changed = [str(x) for x in (res.get("changed") or [])] if isinstance(res.get("changed"), list) else []
+    issues = [f"unclear: {u}" for u in unclear] + [f"added: {a}" for a in added] + [f"changed: {c}" for c in changed]
+    if (score < 8 or unclear or added) and issues:
+        fixed = _pipe_parse_json(_desk_llm_low_temp(_DESK_EDITOR_SYSTEM, json.dumps(
+            {"brief": str(brief_text)[:3500], "headline": headline, "body": body, "findings": issues}, ensure_ascii=False)))
+        if isinstance(fixed, dict) and fixed.get("headline") and fixed.get("body"):
+            nh = _norm_amharic_digits(_guard_known_fixes(str(fixed["headline"]).strip()))
+            nb = _norm_amharic_digits(_guard_known_fixes(str(fixed["body"]).strip()))
+            if nh and nb:
+                return True, nh, nb, issues
+    ok = (score - min(len(unclear), 4)) >= 7 and not unclear and not added
+    return ok, headline, body, issues
+
 def build_draft(topic, facts=None, sources=None, allow_fallback=True, brand=None, photo_urls=None, story_image=None,
                 segment=None, custom_photo=None, extra_images=None):
     if segment in ("coffee", "bego"):
@@ -2792,6 +2859,11 @@ def build_draft(topic, facts=None, sources=None, allow_fallback=True, brand=None
             return None
         pkg = _qa_pkg
         _g_body = f"{pkg.get('lead', '')}\n\n{pkg.get('context', '')}".strip()
+        _d_ok, _d_h, _d_b, _d_issues = desk_verify_and_repair(pkg.get("headline", ""), _g_body, facts or topic)
+        if not _d_ok:
+            log.warning("Amharic Desk rejected '%s': %s", pkg.get("headline", ""), _d_issues)
+            return None
+        pkg["headline"], _g_body = _d_h, _d_b
         _g_res = amharic_guard({"headline": pkg.get("headline", ""), "body": _g_body}, facts or topic)
         if not _g_res["ok"]:
             log.warning("Amharic Guard rejected draft '%s' (score=%s): %s", pkg.get("headline", ""), _g_res["score"], _g_res["issues"])
@@ -4535,6 +4607,130 @@ def filter_relevant_images(story_title, story_text, candidates, llm_call=None):
                 if len(story & _pipe_tokens(f"{c.get('source_title')} {c.get('caption')} {urlparse(c['url']).path.rsplit('/', 1)[-1]}")) >= 2}
     return [c for i, c in enumerate(pool) if i in keep]
 
+
+# ── Ethiopian-First Sport Filter & Data-Driven Match Posts (from sekela_sport.py) ──
+_SP_LEAGUES = {
+    "ethiopian premier league": (0, "የኢትዮጵያ ፕሪሚየር ሊግ"), "premier league": (1, "ፕሪሚየር ሊግ"),
+    "champions league": (2, "ቻምፒዮንስ ሊግ"), "world cup": (2, "የዓለም ዋንጫ"), "afcon": (2, "የአፍሪካ ዋንጫ"),
+    "africa cup of nations": (2, "የአፍሪካ ዋንጫ"), "la liga": (3, "ላ ሊጋ"), "serie a": (4, "ሴሪ ኤ"),
+    "bundesliga": (5, "ቡንደስሊጋ"), "ligue 1": (6, "ሊግ 1"), "europa league": (7, "ዩሮፓ ሊግ"),
+}
+_SP_FINAL = {"closed", "ended", "final", "ft", "finished", "complete", "completed"}
+_SP_SCORE_RE = re.compile(r"\b\d{1,2}\s*[-–:]\s*\d{1,2}\b")
+_SP_MATCH_RE = re.compile(
+    r"\b(?:beat|beats|defeat\w*|draws?|drew|won|wins?|lost|scored?|goals?|fixtures?|standings|table|points?"
+    r"|clean sheet)\b|አሸነፈ|ተሸነፈ|አቻ|ነጥብ|ደረጃ|ጨዋታ|ውድድር|ጎል|ግብ", re.I
+)
+_SP_FOOTBALL_RE = re.compile(
+    r"football|soccer|premier league|champions league|la liga|serie a|bundesliga|ligue 1|europa league"
+    r"|fa cup|afcon|world cup|striker|midfielder|goalkeeper|እግር ኳስ|ኳስ|ፕሪሚየር|ቻምፒዮንስ|ጎል", re.I
+)
+_SP_MOTOR_RE = re.compile(r"formula\s*(?:1|one)|\bf1\b|motogp|nascar|rally|grand prix|indycar|የመኪና ውድድር", re.I)
+_SP_OTHER_RE = re.compile(r"cricket|baseball|\bnfl\b|\bnba\b|\bmlb\b|\bnhl\b|rugby|golf|tennis|boxing|\bufc\b|\bwwe\b|hockey|swimming", re.I)
+_SP_OFF_RE = re.compile(
+    r"chairman|president|\bceo\b|owner\w*|sponsor\w*|broadcast\w*|tv rights|lawsuit|\bsued\b|governance"
+    r"|board member|election|corruption|investor|takeover|ሊቀመንበር|ፕሬዝዳንት|ባለቤት|ስፖንሰር|ክስ|ምርጫ", re.I
+)
+_SP_TRANSFER_RE = re.compile(r"transfer|\bsigns?\b|signing|loan deal|release clause|contract extension|ዝውውር|ፈረመ", re.I)
+_SP_ETHIOPIA_RE = re.compile(r"ethiopia|ኢትዮጵያ|ኢትዮ|addis|አዲስ አበባ|ቅዱስ ጊዮርጊስ|ፋሲል ከነማ|ባሕር ዳር ከተማ|ሀዋሳ ከተማ|መቻል|ዋልያ", re.I)
+_SP_POST_SYSTEM = (
+    "You are a sports presenter for Sekela Sport, writing for Ethiopian football fans on Facebook/Telegram in natural, fluent Addis Ababa Amharic.\n"
+    "- Use ONLY the facts: no history, form, injuries, quotes, or predictions not listed.\n"
+    "- headline: 4-7 natural Amharic words with proper prepositions (በ, ለ, ከ, የ) leading with the score/winner.\n"
+    "- body: 2-4 short lines, max 70 words: who won, score, goal scorers/minutes, points meaning. Do not list the standings table.\n"
+    "- End with one short fan question. Western digits with spaces: '2 ለ 1'. Return ONLY JSON with keys: headline, body."
+)
+_sport_posted_keys = set()
+
+
+def classify_sport_story(story, allow_transfers=False):
+    text = f"{story.get('title', '')} {story.get('facts', '') or story.get('summary', '')}"
+    football, et = bool(_SP_FOOTBALL_RE.search(text)), bool(_SP_ETHIOPIA_RE.search(text))
+    scored = _SP_SCORE_RE.search(text)
+    match = len(_SP_MATCH_RE.findall(text)) + 2 * len(_SP_SCORE_RE.findall(text))
+    if _SP_MOTOR_RE.search(text):
+        return {"keep": False, "category": "reject", "reason": "motorsport"}
+    if _SP_OTHER_RE.search(text) and not (football or et):
+        return {"keep": False, "category": "reject", "reason": "foreign non-football sport"}
+    if len(_SP_OFF_RE.findall(text)) >= max(match, 1):
+        return {"keep": False, "category": "reject", "reason": "officials/business"}
+    if not allow_transfers and _SP_TRANSFER_RE.search(text) and not scored:
+        return {"keep": False, "category": "reject", "reason": "transfer rumor"}
+    if (football or (scored and not _SP_OTHER_RE.search(text))) and match:
+        return {"keep": True, "category": "match", "reason": "football match"}
+    if et and (match or football):
+        return {"keep": True, "category": "ethiopian_sport", "reason": "Ethiopian sport"}
+    return {"keep": False, "category": "reject", "reason": "not match/Ethiopian sport"}
+
+
+def _sp_league(name):
+    low = str(name or "").lower()
+    for key, (rank, am) in sorted(_SP_LEAGUES.items(), key=lambda kv: -max(len(kv[0]), len(kv[1][1]))):
+        if key in low or am in str(name or ""):
+            return rank, am
+    return None
+
+
+def _sp_scores(e):
+    try:
+        return int(e["home_score"]), int(e["away_score"])
+    except Exception:
+        return None
+
+
+def _sp_event_key(e):
+    return str(e.get("id") or f"{e.get('league')}|{e.get('home')}|{e.get('away')}|{e.get('date')}").lower()
+
+
+def select_events_to_post(events, posted_keys):
+    out = []
+    for e in events or []:
+        league, key = _sp_league(e.get("league")), _sp_event_key(e)
+        if league and _sp_scores(e) and str(e.get("status", "")).lower() in _SP_FINAL and key not in posted_keys:
+            out.append((league[0], {**e, "event_key": key}))
+    return [e for _, e in sorted(out, key=lambda t: t[0])]
+
+
+def build_sport_post(event, llm_call=None):
+    league = _sp_league(event.get("league")) or (9, str(event.get("league") or "ውድድር"))
+    hs, as_ = _sp_scores(event)
+    result = "draw" if hs == as_ else f"{event['home'] if hs > as_ else event['away']} won"
+    lines = [f"Competition: {event.get('league')}", f"Final score: {event['home']} {hs} - {as_} {event['away']}", f"Result: {result}"]
+    if event.get("date"):
+        lines.append(f"Date: {event['date']}")
+    goals = [f"{g['player']} ({g.get('team', '')})" + (f" {g['minute']}'" if g.get("minute") else "")
+             for g in (event.get("scorers") or []) if g.get("player")]
+    if goals:
+        lines.append("Goals: " + ", ".join(goals))
+    for i, r in enumerate((event.get("table") or [])[:5], 1):
+        lines.append(f"Table #{r.get('rank', i)}: {r.get('team')} {r.get('points')} points")
+    facts = "\n".join(lines)
+    head = body = ""
+    if llm_call:
+        try:
+            res = _pipe_parse_json(llm_call(_SP_POST_SYSTEM, facts)) or {}
+            head, body = str(res.get("headline") or "").strip(), str(res.get("body") or "").strip()
+        except Exception:
+            head = body = ""
+    nums = lambda t: set(re.findall(r"\d+", t))
+    out = f"{head} {body}"
+    if (not head or not body or (nums(out) - nums(facts)) or not {str(hs), str(as_)} <= nums(out)
+            or (_SP_ETHIOPIA_RE.search(out) and not _SP_ETHIOPIA_RE.search(facts))):
+        h, a = event.get("home_am") or event["home"], event.get("away_am") or event["away"]
+        if hs == as_:
+            head = f"{h} እና {a} {hs} ለ {as_} አቻ ተለያዩ"
+        else:
+            w, l, x, y = (h, a, hs, as_) if hs > as_ else (a, h, as_, hs)
+            head = f"{w} {l}ን {x} ለ {y} አሸነፈ"
+        body = f"በ{league[1].removeprefix('የ')} በተካሄደ ጨዋታ {head}።"
+    rows = [f"{r.get('rank', i)}. {r.get('team')} - {r.get('points')} ነጥብ" + (f" ({r['played']} ጨዋታ)" if r.get("played") else "")
+            for i, r in enumerate((event.get("table") or [])[:5], 1)]
+    if rows:
+        body += "\n\n📊 ደረጃ\n" + "\n".join(rows)
+    return {"headline": _norm_amharic_digits(head), "body": _norm_amharic_digits(body),
+            "source_name": event.get("source") or "Sekela Sport ዳታ",
+            "event_key": _sp_event_key(event), "source_text": facts, "published": str(event.get("date") or "")}
+
 def hunt_once(manual=False, min_importance=None, brand="media", force_strict=None):
     """Proactive & manual news scan. Never skips silently if Gemini search fails — immediately falls back to RSS + Google Trends."""
     lock = hunt_locks[brand]
@@ -4595,12 +4791,14 @@ def hunt_once(manual=False, min_importance=None, brand="media", force_strict=Non
                 st_txt = f"{it.get('title', '')} {it.get('summary', '')}".lower()
                 if any(w in st_txt for w in _sport_skip) and not any(t in st_txt for t in _eth_terms):
                     return False
+                if not classify_sport_story(it, allow_transfers=False)["keep"]:
+                    return False
                 tp = classify_sport_topic(st_txt)
-                if tp in ("premier", "champions", "transfers", "ethiopian_football"):
+                if tp in ("premier", "champions", "ethiopian_football"):
                     return True
                 if tp in ("athletics", "boxing"):
                     return any(t in st_txt for t in _eth_terms)
-                return False
+                return any(t in st_txt for t in _eth_terms)
 
             rss_pool = [it for it in rss_pool if _sport_allowed(it)]
         feeds_txt = feed_items_text(rss_pool)
