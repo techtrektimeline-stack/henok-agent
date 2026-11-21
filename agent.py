@@ -1283,7 +1283,7 @@ NEWSROOM_SYSTEM = (
     "- Connect ideas naturally, but do not insert transition words just to make the paragraph longer. "
     "Use «በተጨማሪም», «ይሁን እንጂ» and similar expressions only when the meaning requires them.\n"
     "- Use mostly 12-22 words per sentence; never exceed 26 words. Each paragraph must end with a complete sentence.\n"
-    "- HEADLINES: use 4-6 meaningful words, natural Amharic grammar, and one clear news angle. "
+    "- HEADLINES: use 4-7 natural Amharic words with proper prepositions (በ, ለ, ከ, የ, ወደ) and the full subject name — NEVER drop connecting letters like የ/በ just to shorten (write 'የኢትዮጵያ አየር መንገድ በዓለም ደረጃ ሽልማት አገኘ', NEVER 'አየር መንገድ ዓለም ደረጃ ሽልማት አገኘ'). "
     "Do not use vague clickbait, awkward translations, unnecessary filler, or a question that the story does not answer.\n"
     "- PERFECT GRAMMAR: plural subjects take plural verbs; singular subjects take singular verbs. "
     "Keep tense and subject consistent within each paragraph.\n"
@@ -1882,18 +1882,41 @@ def _compose_photo_collage(photo_bytes_list, width=1080, height=918):
         return photo_bytes_list[0]
 
 
+_used_photo_urls = []
+
+
+def _mark_photo_used(u):
+    if u and u not in _used_photo_urls:
+        _used_photo_urls.append(u)
+        if len(_used_photo_urls) > 200:
+            del _used_photo_urls[:-200]
+
+
+def _is_article_url(u):
+    if not u:
+        return False
+    pu = urlparse(u)
+    path = (pu.path or "").strip("/")
+    if not path:
+        return False
+    if "t.me" in pu.netloc.lower() and not re.search(r"/\d+$", path):
+        return False  # skip generic channel links without a specific post ID
+    return len(path) > 3
+
+
 def find_real_photo(urls, direct_image=None, max_pages=5, topic_hint=None, extra_images=None):
     cand_imgs = []
-    if direct_image:
+    if direct_image and direct_image not in _used_photo_urls:
         cand_imgs.append(direct_image)
     for u in (extra_images or []):
-        if u and u not in cand_imgs:
+        if u and u not in cand_imgs and u not in _used_photo_urls:
             cand_imgs.append(u)
     if cand_imgs:
         downloaded = []
         for u in cand_imgs[:4]:
             b = download_photo(u)
             if b:
+                _mark_photo_used(u)
                 downloaded.append(b)
         if len(downloaded) >= 2:
             return _compose_photo_collage(downloaded)
@@ -1901,7 +1924,7 @@ def find_real_photo(urls, direct_image=None, max_pages=5, topic_hint=None, extra
             return downloaded[0]
     seen, pages = set(), 0
     for u in urls or []:
-        if not u or u in seen or pages >= max_pages:
+        if not _is_article_url(u) or u in seen or pages >= max_pages:
             continue
         seen.add(u)
         pages += 1
@@ -1913,10 +1936,11 @@ def find_real_photo(urls, direct_image=None, max_pages=5, topic_hint=None, extra
             for rx in _META_IMG:
                 for m in rx.finditer(html):
                     img = urljoin(r.url, html_lib.unescape(m.group(1)).strip())
-                    if _BAD_IMG.search(img):
+                    if _BAD_IMG.search(img) or img in _used_photo_urls:
                         continue
                     b = download_photo(img, referer=r.url)
                     if b:
+                        _mark_photo_used(img)
                         return b
                     break
         except Exception as e:
@@ -2473,7 +2497,7 @@ _QA_GATE_SYSTEM = (
     "- The draft adds an Ethiopian angle (Ethiopia, Addis Ababa, Ethiopian people, community, team, company, reaction) that source_text does not itself contain. Foreign stories must stay foreign.\n"
     "STEP 2 - POLISH (only when approved). In ONE pass rewrite the Amharic so it reads like native Addis Ababa journalism, not translation:\n"
     "- Fix grammar, verb agreement (ተገኘቶ -> ተገኝቷል), word order, and English calques; short active sentences.\n"
-    "- headline: scroll-stopping hook of 4-6 Amharic words leading with the most surprising concrete fact. No clickbait the body cannot back up.\n"
+    "- headline: scroll-stopping hook of 4-7 natural Amharic words keeping all prepositions (በ, ለ, ከ, የ) and full subject names intact (e.g. የኢትዮጵያ አየር መንገድ በዓለም ደረጃ..., never telegraphic noun-chains).\n"
     "- Western digits 0-9 with a space before the unit ('2 ሚሊዮን', never '2ሚሊዮን'); ordinals attach ('3ኛ').\n"
     "- Keep every fact intact; add nothing new. Do not write a source line.\n"
     "Return ONLY raw JSON with keys: approved (true/false), reason (short English string), headline, lead, context."
@@ -2562,7 +2586,7 @@ _GUARD_FIX_SYSTEM = (
     "You are the chief copy editor of an Addis Ababa Amharic newsroom (ETV, Fana, BBC Amharic, VOA Amharic). "
     "Input JSON: headline, body, source_text, unverified_words, problems.\n"
     "Fix ONLY the language: spelling (ሰኔ not ሴኔ, ተሽከርካሪ not ተሸከረካሪ), non-existent/garbled words, wrong verb agreement, "
-    "English-style syntax, and nonsense sentences. Use plain common Addis Ababa Amharic. Never change facts, names, numbers, or dates.\n"
+    "English-style syntax, and nonsense sentences. Use plain common Addis Ababa Amharic with natural prepositions (በ, ለ, ከ, የ) in both headline and body so every sentence flows smoothly when read aloud. Never change facts, names, numbers, or dates.\n"
     "Return ONLY JSON with keys: headline, body."
 )
 _GUARD_JUDGE_SYSTEM = (
@@ -3786,7 +3810,7 @@ TOPIC_DESK = {
     "culture": "Culture, Faith & Community: Ethiopian Orthodox & Islamic community announcements, holidays, music, film, tourism (strictly peaceful)",
     "coffee": "Sekela Coffee Time: surprising, funny, educational, or weird-but-true viral human-interest stories from ANY field",
 }
-TOPIC_WHEEL = ["economy", "tech", "coffee", "addis", "diplomacy", "social", "economy", "culture", "coffee", "tech", "diplomacy", "addis"]
+TOPIC_WHEEL = ["addis", "economy", "social", "politics", "diplomacy", "culture", "economy", "addis", "coffee", "tech", "social", "economy"]
 _wheel = {"media": 0}
 _TOPIC_WORDS = {
     "economy": ["economy", "economic", "business", "bank", "inflation", "birr", "exchange rate", "trade", "export",
@@ -3877,7 +3901,7 @@ DEFAULT_FEEDS = {
         "Capital Ethiopia|https://www.capitalethiopia.com/feed/,"
         "Addis Fortune|https://addisfortune.news/feed/,"
         "The Reporter Ethiopia|https://www.thereporterethiopia.com/feed/,"
-        "Ethio Negari|https://ethionegari.com/feed/,Zehabesha|https://zehabesha.com/feed/,OpenAI News|https://openai.com/news/rss.xml,TechCrunch AI|https://techcrunch.com/category/artificial-intelligence/feed/,The Verge AI|https://www.theverge.com/rss/ai-artificial-intelligence/index.xml,Hacker News|https://hnrss.org/frontpage,HuggingFace Blog|https://huggingface.co/blog/feed.xml,Product Hunt|https://www.producthunt.com/feed,Ars Technica|https://feeds.arstechnica.com/arstechnica/technology-lab"
+        "Ethio Negari|https://ethionegari.com/feed/,Zehabesha|https://zehabesha.com/feed/,TechCrunch AI|https://techcrunch.com/category/artificial-intelligence/feed/,The Verge AI|https://www.theverge.com/rss/ai-artificial-intelligence/index.xml"
     ),
     "sport": (
         "BBC Sport|https://feeds.bbci.co.uk/sport/football/rss.xml,"
@@ -4298,13 +4322,20 @@ def pick_story(fresh, brand, desk=None, strict=False):
             return None
         pool = [st for st in fresh if info(st)[0] != "bbc" and info(st)[1] != "conflict"] or list(fresh)
 
+    _ETH_SIGNALS = ("ኢትዮ", "አዲስ", "ብር", "ዋልያ", "ethiopia", "addis", "walia", "fana", "ebc", "ena", "walta", "tikvah", "mereja", "capital", "fortune", "reporter", "sheger")
+
+    def _is_eth(st):
+        blob = f"{st.get('outlets', '')} {st.get('title', '')} {st.get('summary', '')}".lower()
+        return any(k in blob for k in _ETH_SIGNALS) or str(st.get("outlets", "")).lower().startswith("tg@")
+
     def rank(st):
         outlet, topic = info(st)
         learned = -wmap.get(topic, 1.0)
+        eth_pri = 0 if _is_eth(st) else 1
         if brand != "media":
-            return (0 if topic == desk else 1, 1 if topic == last_topic else 0, learned, -st.get("importance", 0))
+            return (eth_pri, 0 if topic == desk else 1, 1 if topic == last_topic else 0, learned, -st.get("importance", 0))
         tier = 0 if topic == desk else (1 if topic in PRIORITY_TOPICS else (2 if topic in ("other", "politics") else 3))
-        return (tier, 1 if outlet == "bbc" else 0, learned, -st.get("importance", 0))
+        return (eth_pri, tier, 1 if outlet == "bbc" else 0, learned, -st.get("importance", 0))
 
     chosen = sorted(pool, key=rank)[0]
     outlet, topic = info(chosen)
@@ -4398,10 +4429,13 @@ def _pipe_urls(s):
 
 def _pipe_same_event(a, b):
     ta, tb = _pipe_tokens(a["title"]), _pipe_tokens(b["title"])
-    if len(ta & tb) >= 3 and _pipe_overlap(ta, tb) >= _PIPE_TITLE_OVERLAP:
+    t_shared = ta & tb
+    if len(t_shared) >= 3 and _pipe_overlap(ta, tb) >= 0.45:
+        return True
+    if len(t_shared) >= 2 and any(x.isdigit() or len(x) >= 5 for x in t_shared) and _pipe_overlap(ta, tb) >= 0.35:
         return True
     fa, fb = _pipe_tokens(f"{a['title']} {a['facts'][:600]}"), _pipe_tokens(f"{b['title']} {b['facts'][:600]}")
-    return len(fa & fb) >= _PIPE_MIN_SHARED and _pipe_overlap(fa, fb) >= _PIPE_BODY_OVERLAP
+    return len(fa & fb) >= 3 and _pipe_overlap(fa, fb) >= 0.35
 
 
 def dedup_and_merge_stories(new_stories, sent_history, llm_call=None):
@@ -4581,9 +4615,19 @@ def hunt_once(manual=False, min_importance=None, brand="media", force_strict=Non
                     if safety_gate_check(f"{s.get('title','')} {s.get('summary','')}")
                     and (brand == "media" or _sport_allowed(s))
                     and not re.search(r"\b(2020|2021|2022|2023|2024)\b", f"{s.get('title','')} {s.get('summary','')}")]
-        _hist_items = [{"title": d.get("headline") or d.get("topic", ""), "url": (d.get("sources") or [[None, ""]])[0][1] if d.get("sources") else ""}
-                       for d in list(drafts.values())[-40:]]
-        combined = dedup_and_merge_stories(combined, _hist_items, llm_call=_pipe_llm_call) or combined
+        _hist_items = []
+        for d in list(drafts.values())[-40:]:
+            _hist_items.append({
+                "title": f"{d.get('headline', '')} {d.get('topic', '')}".strip(),
+                "facts": (d.get("facts") or "")[:300],
+                "url": (d.get("sources") or [[None, ""]])[0][1] if d.get("sources") else "",
+            })
+        for p_it in list(published.values())[-30:]:
+            _hist_items.append({"title": f"{p_it.get('headline', '')} {p_it.get('topic', '')}".strip(), "facts": "", "url": ""})
+        for s_it in _seen_items[-50:]:
+            if s_it.get("raw"):
+                _hist_items.append({"title": s_it["raw"], "facts": "", "url": ""})
+        combined = dedup_and_merge_stories(combined, _hist_items, llm_call=None) or combined
         fresh = unseen(combined, threshold) or unseen(combined)
         if not fresh and manual:
             fresh = combined[:12]
