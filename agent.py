@@ -2289,6 +2289,41 @@ def fb_publish(post, image_bytes=None, brand="media"):
     return js.get("post_id") or js.get("id")
 
 
+def fb_comment_extra_photos(fb_post_id, raw_photos, headline="", brand="media"):
+    """Post up to 5 extra real photos as engaging comments under the published Facebook post."""
+    if not fb_post_id or not raw_photos or len(raw_photos) < 2:
+        return 0
+    pid = BRANDS[brand]["fb_id"]
+    extras = [u for u in raw_photos[1:6] if u]
+    if not extras:
+        return 0
+    captions = [
+        f"📸 ከዚህ ዜና ጋር የተያያዘ ተጨማሪ ምስል ይመልከቱ — ሀሳብዎን ከታች ያጋሩን 👇",
+        f"🔍 ተጨማሪ እይታ ({headline[:45]}) — ምን ይመስልዎታል?",
+        "📷 ቀጣይ ምስል 👇",
+        "📸 ተጨማሪ ማስረጃ ምስል 👇",
+        "✨ ሙሉውን ዝርዝር ለማየት ይቀላቀሉን 👇",
+    ]
+    posted = 0
+    for idx, url in enumerate(extras):
+        msg = captions[min(idx, len(captions) - 1)]
+        try:
+            raw = _download_image_bytes(url) if "_download_image_bytes" in globals() else None
+            if raw:
+                up = _fb_request("POST", f"{pid}/photos", data={"published": "false"},
+                                 files={"source": (f"extra-{idx+1}.jpg", raw, "image/jpeg")}, timeout=60, brand=brand)
+                att_id = up.get("id")
+                if att_id:
+                    _fb_request("POST", f"{fb_post_id}/comments", data={"message": msg, "attachment_id": att_id}, brand=brand)
+                    posted += 1
+                    continue
+            _fb_request("POST", f"{fb_post_id}/comments", data={"message": msg, "attachment_url": url}, brand=brand)
+            posted += 1
+        except Exception as _ce:
+            log.info("fb extra photo comment skipped (%s): %s", idx + 1, short_reason(_ce, 80))
+    return posted
+
+
 def fb_error_hint(e):
     code = getattr(e, "code", None)
     if code == 190:
@@ -2578,9 +2613,14 @@ def build_draft(topic, facts=None, sources=None, allow_fallback=True, brand=None
     card = compose_card(bg, headline, badge, ai=is_ai, brand=brand, segment=segment) if bg else None
     bot_stats["drafts"] += 1
     mark_seen(headline + " " + _para(pkg.get("lead")))
+    _raw_photos = []
+    for _pu in ([story_image] + list(extra_images or [])):
+        if _pu and str(_pu).startswith(("http://", "https://")) and _pu not in _raw_photos:
+            _raw_photos.append(_pu)
     return {"post": post, "headline": headline, "image": card or bg, "card": bool(card), "sources": sources,
             "unverified": unverified and segment != "bego", "brand": brand, "segment": segment, "pkg": pkg,
             "facts": facts or "", "bg": bg, "real": is_real, "is_ai": is_ai,
+            "raw_photos": _raw_photos[:6],
             "topic": segment if segment in ("coffee", "bego") else None}
 
 
@@ -2812,7 +2852,8 @@ def rebrand_draft(chat_id, msg_id, did):
     card = compose_card(d["bg"], headline, BRANDS[new]["badge"], ai=d.get("is_ai", False), brand=new) if d.get("bg") else None
     nd = {"post": post, "headline": headline, "image": card or d.get("bg"), "card": bool(card),
           "sources": d["sources"], "unverified": d["unverified"], "brand": new, "pkg": d["pkg"],
-          "facts": d["facts"], "bg": d.get("bg"), "real": d.get("real", False), "is_ai": d.get("is_ai", False)}
+          "facts": d["facts"], "bg": d.get("bg"), "real": d.get("real", False), "is_ai": d.get("is_ai", False),
+          "raw_photos": d.get("raw_photos", [])}
     for mid in {d.get("photo_msg"), d.get("details_msg"), msg_id}:
         drop_message(chat_id, mid)
     present_draft(chat_id, "", nd, f"🔄 ወደ {brand_label(new)} ተቀይሯል")
@@ -2927,6 +2968,30 @@ def run_bego_search(chat_id):
 def publish_telegram(d):
     chan = BRANDS[d["brand"]]["tg"]
     post = d["post"]
+    raw_photos = [u for u in (d.get("raw_photos") or []) if u]
+    if len(raw_photos) >= 2:
+        media_items = []
+        for idx, u in enumerate(raw_photos[:10]):
+            try:
+                raw_b = _download_image_bytes(u) if "_download_image_bytes" in globals() else None
+                src_item = raw_b if raw_b else u
+                if idx == 0 and len(post) <= CAPTION_LIMIT:
+                    media_items.append(types.InputMediaPhoto(src_item, caption=post))
+                elif idx == 0 and d.get("headline"):
+                    media_items.append(types.InputMediaPhoto(src_item, caption=f"🔴 {d['headline']}"))
+                else:
+                    media_items.append(types.InputMediaPhoto(src_item))
+            except Exception:
+                pass
+        if len(media_items) >= 2:
+            msgs = bot.send_media_group(chan, media_items)
+            if len(post) <= CAPTION_LIMIT:
+                return msgs[0].message_id, "text", chan
+            text_id = None
+            for chunk in split_text(post, 4000):
+                m = bot.send_message(chan, chunk, disable_web_page_preview=True)
+                text_id = text_id or m.message_id
+            return text_id or msgs[0].message_id, "text", chan
     photo = d.get("file_id") or (_as_photo(d["image"]) if d.get("image") else None)
     if photo:
         if len(post) <= CAPTION_LIMIT:
@@ -3003,6 +3068,8 @@ def approve_and_publish(chat_id, msg_id, did):
                 d["fb_post_id"] = fb_publish(d["post"], d.get("image"), brand)
                 d["fb"] = True
                 bot_stats["fb_posts"] += 1
+                if d.get("fb_post_id") and len(d.get("raw_photos") or []) >= 2:
+                    fb_comment_extra_photos(d["fb_post_id"], d["raw_photos"], d.get("headline", ""), brand)
             except FBError as e:
                 log.error("facebook publish failed: %s", e)
                 fb_err = short_reason(e, 200) + (" — " + fb_error_hint(e) if fb_error_hint(e) else "")
