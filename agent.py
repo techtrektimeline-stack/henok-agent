@@ -654,25 +654,33 @@ def _ai_error_hint():
 
 def _gemini_call(model, payload, retries=3, timeout=GEMINI_TIMEOUT):
     global _gm_key_idx
-    url = f"{GEMINI_BASE}/models/{model}:generateContent"
     keys = GEMINI_API_KEYS or [GEMINI_API_KEY]
     last_r = None
     for k_try in range(len(keys)):
         key = keys[(_gm_key_idx + k_try) % len(keys)]
-        headers = {"x-goog-api-key": key, "Content-Type": "application/json"}
-        for attempt in range(1, retries + 1):
-            r = requests.post(url, headers=headers, json=payload, timeout=timeout)
-            last_r = r
-            if r.status_code == 200:
-                _gm_key_idx = (_gm_key_idx + k_try) % len(keys)
-                return r.json()
-            if r.status_code == 429 and len(keys) > 1:
-                break  # rotate immediately to next free Gemini key
-            if r.status_code in (429, 500, 502, 503, 504) and attempt < retries:
-                time.sleep(2 * attempt)
-                continue
-            break
-    raise GeminiError(f"{model} HTTP {last_r.status_code if last_r else 0}: {(last_r.text[:200] if last_r else '')}")
+        urls = [
+            (f"{GEMINI_BASE}/models/{model}:generateContent", {"x-goog-api-key": key, "Content-Type": "application/json"}, None),
+        ]
+        if str(key).startswith("AQ."):
+            urls.append((f"https://aiplatform.googleapis.com/v1/publishers/google/models/{model}:generateContent", {"Content-Type": "application/json"}, {"key": key}))
+        for url, headers, params in urls:
+            for attempt in range(1, retries + 1):
+                r = requests.post(url, headers=headers, params=params, json=payload, timeout=timeout)
+                last_r = r
+                if r.status_code == 200:
+                    _gm_key_idx = (_gm_key_idx + k_try) % len(keys)
+                    return r.json()
+                if r.status_code == 429 and len(keys) > 1:
+                    break
+                if r.status_code in (429, 500, 502, 503, 504) and attempt < retries:
+                    time.sleep(2 * attempt)
+                    continue
+                break
+            if last_r is not None and last_r.status_code == 429:
+                break
+    code = last_r.status_code if last_r is not None else 0
+    txt = (last_r.text[:200] if last_r is not None else "")
+    raise GeminiError(f"{model} HTTP {code}: {txt}")
     raise GeminiError(f"{model}: exhausted retries")
 
 
