@@ -2289,6 +2289,15 @@ def fb_publish(post, image_bytes=None, brand="media"):
     return js.get("post_id") or js.get("id")
 
 
+
+def _fetch_img_bytes(url):
+    try:
+        r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+        return r.content if r.ok and len(r.content) > 1500 else None
+    except Exception:
+        return None
+
+
 def fb_comment_extra_photos(fb_post_id, raw_photos, headline="", brand="media"):
     """Post up to 5 extra real photos as engaging comments under the published Facebook post."""
     if not fb_post_id or not raw_photos or len(raw_photos) < 2:
@@ -2308,7 +2317,7 @@ def fb_comment_extra_photos(fb_post_id, raw_photos, headline="", brand="media"):
     for idx, url in enumerate(extras):
         msg = captions[min(idx, len(captions) - 1)]
         try:
-            raw = _download_image_bytes(url) if "_download_image_bytes" in globals() else None
+            raw = _fetch_img_bytes(url)
             if raw:
                 up = _fb_request("POST", f"{pid}/photos", data={"published": "false"},
                                  files={"source": (f"extra-{idx+1}.jpg", raw, "image/jpeg")}, timeout=60, brand=brand)
@@ -2480,7 +2489,7 @@ def _qa_precheck_pkg(pkg, source_text, source_name):
     low_src = str(source_text or "").lower()
     if any(k in low_text for k in _QA_ET_MARKERS) and not any(k in low_src for k in _QA_ET_MARKERS):
         return "Invented Ethiopian angle absent from source"
-    known_years = set(_QA_YEAR_RE.findall(f"{source_text} {datetime.now(EAT).year}"))
+    known_years = set(_QA_YEAR_RE.findall(f"{source_text} {addis_now().year}"))
     bad_years = sorted(set(_QA_YEAR_RE.findall(text)) - known_years)
     if bad_years:
         return f"Unsupported year(s): {', '.join(bad_years)}"
@@ -2496,7 +2505,7 @@ def qa_verify_and_polish_pkg(pkg, source_text, source_name):
     if problem:
         return False, problem, pkg
     payload = json.dumps({
-        "today": datetime.now(EAT).strftime("%Y-%m-%d"),
+        "today": addis_now().strftime("%Y-%m-%d"),
         "source_name": source_name,
         "source_text": src[:5500],
         "headline": pkg.get("headline", ""),
@@ -2552,11 +2561,12 @@ _GUARD_JUDGE_SYSTEM = (
 
 
 def _guard_wiki_hits(word):
-    qs = urllib.parse.urlencode({"action": "query", "list": "search", "srsearch": f'"{word}"', "srlimit": 1,
-                                 "srinfo": "totalhits", "format": "json"})
-    req = urllib.request.Request(f"https://am.wikipedia.org/w/api.php?{qs}", headers={"User-Agent": "SekelaBot/1.0"})
-    with urllib.request.urlopen(req, timeout=8) as resp:
-        return int(json.load(resp)["query"]["searchinfo"]["totalhits"])
+    r = requests.get("https://am.wikipedia.org/w/api.php",
+                     params={"action": "query", "list": "search", "srsearch": f'"{word}"', "srlimit": 1,
+                             "srinfo": "totalhits", "format": "json"},
+                     headers={"User-Agent": "SekelaBot/1.0"}, timeout=8)
+    r.raise_for_status()
+    return int(r.json()["query"]["searchinfo"]["totalhits"])
 
 
 def _guard_load_cache(path=_GUARD_CACHE_PATH):
@@ -2867,11 +2877,11 @@ def _feat_orthodox_easter(year):
     d = (19 * (year % 19) + 15) % 30
     e = (2 * (year % 4) + 4 * (year % 7) - d + 34) % 7
     month, day = divmod(d + e + 114, 31)
-    return date(year, month, day + 1) + timedelta(days=13)
+    return datetime(year, month, day + 1).date() + timedelta(days=13)
 
 
 def build_sekela_day_or_holiday(today_iso, trending_hints="", llm_call=None):
-    today, hints = date.fromisoformat(str(today_iso).strip()[:10]), str(trending_hints or "").strip()
+    today, hints = datetime.strptime(str(today_iso).strip()[:10], '%Y-%m-%d').date(), str(trending_hints or "").strip()
     _, em, ed = _feat_ethiopian(today)
     easter = _feat_orthodox_easter(today.year)
     known = [n for n in (
@@ -3128,7 +3138,7 @@ def publish_telegram(d):
         media_items = []
         for idx, u in enumerate(raw_photos[:10]):
             try:
-                raw_b = _download_image_bytes(u) if "_download_image_bytes" in globals() else None
+                raw_b = _fetch_img_bytes(u)
                 src_item = raw_b if raw_b else u
                 if idx == 0 and len(post) <= CAPTION_LIMIT:
                     media_items.append(types.InputMediaPhoto(src_item, caption=post))
@@ -3296,7 +3306,7 @@ def edit_draft_action(chat_id, did, user_input):
         drop_message(chat_id, mid)
     with state_lock:
         drafts.pop(did, None)
-    save_drafts_to_disk()
+    _save_drafts_disk()
     present_draft(chat_id, "", nd, "✏️ ረቂቁ ተስተካክሏል — እንደገና እየው")
 
 
@@ -4346,7 +4356,7 @@ def _pipe_tokens(text):
     return {t[:3] if "\u1200" <= t[0] <= "\u135a" else t[:6] for t in _PIPE_TOKEN_RE.findall(str(text or "").lower())}
 
 
-def _pipe_overlap(a, b):
+def _pipe_pipe_overlap(a, b):
     return len(a & b) / min(len(a), len(b)) if a and b else 0.0
 
 
@@ -4375,10 +4385,10 @@ def _pipe_urls(s):
 
 def _pipe_same_event(a, b):
     ta, tb = _pipe_tokens(a["title"]), _pipe_tokens(b["title"])
-    if len(ta & tb) >= 3 and _overlap(ta, tb) >= _PIPE_TITLE_OVERLAP:
+    if len(ta & tb) >= 3 and _pipe_overlap(ta, tb) >= _PIPE_TITLE_OVERLAP:
         return True
     fa, fb = _pipe_tokens(f"{a['title']} {a['facts'][:600]}"), _pipe_tokens(f"{b['title']} {b['facts'][:600]}")
-    return len(fa & fb) >= _PIPE_MIN_SHARED and _overlap(fa, fb) >= _PIPE_BODY_OVERLAP
+    return len(fa & fb) >= _PIPE_MIN_SHARED and _pipe_overlap(fa, fb) >= _PIPE_BODY_OVERLAP
 
 
 def dedup_and_merge_stories(new_stories, sent_history, llm_call=None):
@@ -4428,7 +4438,7 @@ def dedup_and_merge_stories(new_stories, sent_history, llm_call=None):
             for s in grp:
                 for sent_line in re.split(r"(?<=[.!?።፧])\s+|\n+", s["facts"]):
                     sent_line, toks = sent_line.strip(), _pipe_tokens(sent_line)
-                    if len(sent_line) > 8 and not any(_pipe_overlap(toks, k) >= 0.7 for k in kept):
+                    if len(sent_line) > 8 and not any(_pipe_pipe_overlap(toks, k) >= 0.7 for k in kept):
                         kept.append(toks)
                         lines.append(f"[{s['source']}] {sent_line}" if s["source"] else sent_line)
             facts = "\n".join(lines)
