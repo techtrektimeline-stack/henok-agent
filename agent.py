@@ -67,7 +67,9 @@ except Exception:
 # Config
 # ----------------------------------------------------------------------------
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
+GEMINI_API_KEYS = [k.strip() for k in os.environ.get("GEMINI_API_KEY", "").split(",") if k.strip()]
+GEMINI_API_KEY = GEMINI_API_KEYS[0] if GEMINI_API_KEYS else ""
+_gm_key_idx = 0
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "").strip()
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "").strip()
 GITHUB_AI_TOKEN = os.environ.get("GITHUB_AI_TOKEN", "").strip()
@@ -618,16 +620,26 @@ def _ai_error_hint():
 
 
 def _gemini_call(model, payload, retries=3, timeout=GEMINI_TIMEOUT):
+    global _gm_key_idx
     url = f"{GEMINI_BASE}/models/{model}:generateContent"
-    headers = {"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"}
-    for attempt in range(1, retries + 1):
-        r = requests.post(url, headers=headers, json=payload, timeout=timeout)
-        if r.status_code == 200:
-            return r.json()
-        if r.status_code in (429, 500, 502, 503, 504) and attempt < retries:
-            time.sleep(2 * attempt)
-            continue
-        raise GeminiError(f"{model} HTTP {r.status_code}: {r.text[:200]}")
+    keys = GEMINI_API_KEYS or [GEMINI_API_KEY]
+    last_r = None
+    for k_try in range(len(keys)):
+        key = keys[(_gm_key_idx + k_try) % len(keys)]
+        headers = {"x-goog-api-key": key, "Content-Type": "application/json"}
+        for attempt in range(1, retries + 1):
+            r = requests.post(url, headers=headers, json=payload, timeout=timeout)
+            last_r = r
+            if r.status_code == 200:
+                _gm_key_idx = (_gm_key_idx + k_try) % len(keys)
+                return r.json()
+            if r.status_code == 429 and len(keys) > 1:
+                break  # rotate immediately to next free Gemini key
+            if r.status_code in (429, 500, 502, 503, 504) and attempt < retries:
+                time.sleep(2 * attempt)
+                continue
+            break
+    raise GeminiError(f"{model} HTTP {last_r.status_code if last_r else 0}: {(last_r.text[:200] if last_r else '')}")
     raise GeminiError(f"{model}: exhausted retries")
 
 
@@ -980,14 +992,18 @@ def llm_write(user_text, history=None, system=None, allow_gemini=True, max_token
     messages.append({"role": "user", "content": user_text})
     if GITHUB_AI_TOKEN:
         for gh_url, gh_model in (
-            ("https://models.inference.ai.azure.com/chat/completions", "gpt-4o-mini"),
             ("https://models.github.ai/inference/chat/completions", "openai/gpt-4o-mini"),
-            ("https://models.inference.ai.azure.com/chat/completions", "gpt-4o"),
+            ("https://models.github.ai/inference/chat/completions", "openai/gpt-4o"),
         ):
             try:
                 r = requests.post(
                     gh_url,
-                    headers={"Authorization": f"Bearer {GITHUB_AI_TOKEN}", "Content-Type": "application/json"},
+                    headers={
+                        "Authorization": f"Bearer {GITHUB_AI_TOKEN}",
+                        "Accept": "application/vnd.github+json",
+                        "X-GitHub-Api-Version": "2022-11-28",
+                        "Content-Type": "application/json",
+                    },
                     json={"model": gh_model, "messages": messages,
                           "temperature": min(temperature, 0.6), "max_tokens": max_tokens},
                     timeout=60,
@@ -1018,39 +1034,40 @@ def llm_write(user_text, history=None, system=None, allow_gemini=True, max_token
         except Exception as e:
             log.error("Gemini fallback failed too: %s", e)
     if GROQ_API_KEY:
+        groq_cands = ["openai/gpt-oss-120b", "qwen/qwen3-32b", "meta-llama/llama-4-scout-17b-16e-instruct",
+                      "llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
         try:
-            r = requests.post(
-                "https://api.groq.com/openai/v1/chat/completions",
-                headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
-                json={"model": "llama-3.3-70b-versatile", "messages": messages,
-                      "temperature": min(temperature, 0.55), "max_tokens": max_tokens,
-                      "frequency_penalty": 0.45, "presence_penalty": 0.25},
-                timeout=60,
-            )
-            if r.status_code == 200:
-                txt = ((r.json().get("choices") or [{}])[0].get("message") or {}).get("content") or ""
-                if txt.strip():
-                    log.info("written by Groq llama-3.3-70b-versatile (fallback)")
-                    return clean_md(txt.strip()), "groq:llama-3.3-70b"
-            else:
-                log.warning("Groq HTTP %s: %s", r.status_code, r.text[:140])
-        except Exception as e:
-            log.warning("Groq fallback failed: %s", e)
-    # 4th emergency zero-key fallback (Pollinations OpenAI-compatible free endpoint)
-    try:
-        r = requests.post(
-            "https://text.pollinations.ai/openai",
-            headers={"Content-Type": "application/json"},
-            json={"model": "openai", "messages": messages, "temperature": temperature},
-            timeout=60,
-        )
-        if r.status_code == 200:
-            txt = ((r.json().get("choices") or [{}])[0].get("message") or {}).get("content") or ""
-            if txt.strip():
-                log.info("written by Pollinations Text (zero-key fallback)")
-                return clean_md(txt.strip()), "pollinations:openai"
-    except Exception as e:
-        log.warning("Pollinations text fallback failed: %s", e)
+            mr = requests.get("https://api.groq.com/openai/v1/models",
+                              headers={"Authorization": f"Bearer {GROQ_API_KEY}"}, timeout=10)
+            if mr.status_code == 200:
+                avail = {m.get("id") for m in (mr.json().get("data") or []) if m.get("id")}
+                ordered = [m for m in groq_cands if m in avail]
+                if not ordered:
+                    ordered = sorted(m for m in avail if not any(x in m.lower() for x in ("whisper", "guard", "tts")))[:3]
+                if ordered:
+                    groq_cands = ordered
+        except Exception:
+            pass
+        for gm in groq_cands[:3]:
+            try:
+                r = requests.post(
+                    "https://api.groq.com/openai/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
+                    json={"model": gm, "messages": messages,
+                          "temperature": min(temperature, 0.55), "max_tokens": max_tokens,
+                          "frequency_penalty": 0.45, "presence_penalty": 0.25},
+                    timeout=60,
+                )
+                if r.status_code == 200:
+                    txt = ((r.json().get("choices") or [{}])[0].get("message") or {}).get("content") or ""
+                    if txt.strip():
+                        log.info("written by Groq %s (fallback)", gm)
+                        return clean_md(txt.strip()), f"groq:{gm}"
+                else:
+                    log.warning("Groq (%s) HTTP %s: %s", gm, r.status_code, r.text[:120])
+            except Exception as e:
+                log.warning("Groq (%s) failed: %s", gm, e)
+
     return None, None
 
 
