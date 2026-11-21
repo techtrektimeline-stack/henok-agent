@@ -4356,7 +4356,7 @@ def _pipe_tokens(text):
     return {t[:3] if "\u1200" <= t[0] <= "\u135a" else t[:6] for t in _PIPE_TOKEN_RE.findall(str(text or "").lower())}
 
 
-def _pipe_pipe_overlap(a, b):
+def _pipe_overlap(a, b):
     return len(a & b) / min(len(a), len(b)) if a and b else 0.0
 
 
@@ -4438,7 +4438,7 @@ def dedup_and_merge_stories(new_stories, sent_history, llm_call=None):
             for s in grp:
                 for sent_line in re.split(r"(?<=[.!?።፧])\s+|\n+", s["facts"]):
                     sent_line, toks = sent_line.strip(), _pipe_tokens(sent_line)
-                    if len(sent_line) > 8 and not any(_pipe_pipe_overlap(toks, k) >= 0.7 for k in kept):
+                    if len(sent_line) > 8 and not any(_pipe_overlap(toks, k) >= 0.7 for k in kept):
                         kept.append(toks)
                         lines.append(f"[{s['source']}] {sent_line}" if s["source"] else sent_line)
             facts = "\n".join(lines)
