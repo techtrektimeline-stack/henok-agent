@@ -749,7 +749,13 @@ def gemini_active_models(force=False):
 get_gemini_models = gemini_active_models
 
 
+_gm_cooldown_until = 0.0
+
+
 def gemini_generate(contents, system=None, grounding=False, temperature=0.8, max_tokens=8192):
+    global _gm_cooldown_until
+    if time.time() < _gm_cooldown_until:
+        raise GeminiError("Gemini on cooldown after HTTP 0")
     if not GEMINI_API_KEY:
         raise GeminiError("GEMINI_API_KEY missing")
     payload = {
@@ -780,6 +786,8 @@ def gemini_generate(contents, system=None, grounding=False, temperature=0.8, max
             except Exception as e:
                 last_err = e
     _last_ai_error["gm"] = short_reason(last_err, 90)
+    if "HTTP 0" in str(last_err):
+        _gm_cooldown_until = time.time() + 600
     raise GeminiError(f"all Gemini models failed: {last_err}")
 
 
@@ -1025,8 +1033,6 @@ def llm_write(user_text, history=None, system=None, allow_gemini=True, max_token
     messages.append({"role": "user", "content": user_text})
     if GITHUB_AI_TOKEN:
         for gh_url, gh_model in (
-            ("https://models.inference.ai.azure.com/chat/completions", "gpt-4o-mini"),
-            ("https://models.inference.ai.azure.com/chat/completions", "gpt-4o"),
             ("https://models.github.ai/inference/chat/completions", "openai/gpt-4o-mini"),
         ):
             try:
@@ -1057,19 +1063,20 @@ def llm_write(user_text, history=None, system=None, allow_gemini=True, max_token
         log.info("written by OpenRouter %s", model)
         return clean_md(text), f"openrouter:{model}"
     if GROQ_API_KEY:
-        groq_cands = ["llama-3.3-70b-versatile", "qwen/qwen3-32b", "meta-llama/llama-4-scout-17b-16e-instruct",
-                      "openai/gpt-oss-120b", "llama-3.1-8b-instant"]
+        groq_cands = ["llama-3.3-70b-versatile", "qwen/qwen3-32b", "openai/gpt-oss-120b",
+                      "openai/gpt-oss-20b", "meta-llama/llama-4-scout-17b-16e-instruct", "llama-3.1-8b-instant"]
         try:
             mr = requests.get("https://api.groq.com/openai/v1/models",
                               headers={"Authorization": f"Bearer {GROQ_API_KEY}"}, timeout=8)
             if mr.status_code == 200:
                 avail = {m.get("id") for m in (mr.json().get("data") or []) if m.get("id")}
                 ordered = [m for m in groq_cands if m in avail]
-                extras = sorted(m for m in avail if m not in ordered and not any(x in m.lower() for x in ("whisper", "guard", "tts", "prompt")))
-                groq_cands = (ordered + extras)[:5] or groq_cands
+                _ban = ("whisper", "guard", "tts", "prompt", "allam", "orpheus", "playai", "compound")
+                extras = sorted(m for m in avail if m not in ordered and not any(x in m.lower() for x in _ban))
+                groq_cands = (ordered + extras)[:6] or groq_cands
         except Exception:
             pass
-        for gm in groq_cands[:5]:
+        for gm in groq_cands[:6]:
             try:
                 r = requests.post(
                     "https://api.groq.com/openai/v1/chat/completions",
