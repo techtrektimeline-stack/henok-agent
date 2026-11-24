@@ -396,6 +396,8 @@ def system_prompt():
         "- PRONOUN CONSISTENCY: you speak in first person SINGULAR (እኔ; አደርጋለሁ, እልካለሁ) and address Henok in "
         "masculine singular (አንተ; ታደርጋለህ, ትችላለህ, ሄኖክ).\n"
         "- Telegram plain text: NO markdown symbols (**, ##, backticks, tables). Use emojis and '•' bullets.\n"
+        "- CONCISE & HIGH-SIGNAL: Keep replies short, crisp, and easy to scan — NEVER write long rambling essays. Give the exact key idea, numbers, and actionable steps Henok needs right away.\n"
+        "- ADAPTIVE TRAINER: Remember and obey every editorial rule and preference Henok teaches you across text, voice, and files.\n"
         "- Never invent facts, numbers, phone numbers, bank accounts, or quotes. Never claim anything was published."
     )
 
@@ -1143,7 +1145,8 @@ def answer(user_text, history=None, live=False):
                    "and numbers; never invent others]\n" + facts)
     elif live:
         prompt += "\n\n[Note: live web search was unavailable. Say briefly that figures may be outdated.]"
-    text, engine = llm_write(prompt, history=history)
+    _sys_chat = system_prompt() + learning_block('media')
+    text, engine = llm_write(prompt, history=history, system=_sys_chat)
     if not text:
         return BUSY_TEXT, [], None
     return text, sources, engine
@@ -1919,10 +1922,8 @@ def find_real_photo(urls, direct_image=None, max_pages=5, topic_hint=None, extra
             if b:
                 _mark_photo_used(u)
                 downloaded.append(b)
-        if len(downloaded) >= 2:
-            return _compose_photo_collage(downloaded)
         if downloaded:
-            return downloaded[0]
+            return downloaded[0]  # Always 1 clean photo on the poster; extra photos go to FB comments / TG album
     seen, pages = set(), 0
     for u in urls or []:
         if not _is_article_url(u) or u in seen or pages >= max_pages:
@@ -2340,6 +2341,7 @@ def fb_comment_extra_photos(fb_post_id, raw_photos, headline="", brand="media"):
     """Post up to 5 extra real photos as engaging comments under the published Facebook post."""
     if not fb_post_id or not raw_photos or len(raw_photos) < 2:
         return 0
+    log.info("fb_comment_extra_photos: posting %d extra photo(s) on %s", min(len(raw_photos) - 1, 5), fb_post_id)
     pid = BRANDS[brand]["fb_id"]
     extras = [u for u in raw_photos[1:6] if u]
     if not extras:
@@ -2780,7 +2782,7 @@ def desk_verify_and_repair(headline, body, brief_text):
             nb = _norm_amharic_digits(_guard_known_fixes(str(fixed["body"]).strip()))
             if nh and nb:
                 return True, nh, nb, issues
-    ok = (score - min(len(unclear), 4)) >= 7 and not unclear and not added
+    ok = (score - min(len(unclear), 2)) >= 6 and len(unclear) <= 1 and not added
     return ok, headline, body, issues
 
 def build_draft(topic, facts=None, sources=None, allow_fallback=True, brand=None, photo_urls=None, story_image=None,
@@ -6731,17 +6733,19 @@ AN_INSIGHT_PROMPT = (
 
 
 def an_insights(secs, period):
-    facts = "\n".join(f for sec in secs for f in sec["facts"])
-    lf = learn_summary_facts()
-    if lf and facts:
-        facts += "\n" + lf
-    if not facts:
-        return "ℹ️ ለዚህ ምርጫ ቁጥሮች አልተገኙም — ከላይ ያሉትን ማስታወሻዎች አረጋግጥ።"
-    text, _ = llm_write(AN_INSIGHT_PROMPT.replace("{period}", period).replace("{facts}", facts), max_tokens=900,
-                        temperature=0.4, models=NEWS_WRITER_MODELS)
+    facts = "\n".join(s["title"] + ":\n" + "\n".join("  " + r for r in s["rows"]) for s in secs)
+    prompt = (
+        f"You are Henok's senior social media strategist. Below are live metrics for ({period}):\n{facts}\n\n"
+        "Write a CRISP, SCANNABLE Amharic summary (max 140 words, NO markdown ** or ##, use emojis + • bullets) with EXACTLY these 3 short sections:\n"
+        "1) 👀 ቪው እና ተደራሽነት (Views/Reach): state the exact view/reach numbers for each platform (Facebook Media, Facebook Sport, Telegram, YouTube) in this period.\n"
+        "2) 💬 ኢንጌጅመንት (Engagement): state exact likes/reactions, comments, shares, and which post performed best.\n"
+        "3) 🎯 መፍትሄ እና ቀጣይ እርምጃ: 2 concrete, practical actions to grow views & comments today.\n"
+        "Never invent any number not in the data."
+    )
+    text, _ = llm_write(prompt, allow_gemini=True, max_tokens=600, temperature=0.35, models=NEWS_WRITER_MODELS)
     if text:
-        return text if "📈" in text else "📈 ግንዛቤ\n" + text
-    return "📊 ቁጥሮች\n" + "\n".join("• " + f for f in facts.splitlines())
+        return text
+    return "📊 አጭር ማጠቃለያ\n" + "\n".join("• " + f for f in facts.splitlines()[:12])
 
 
 def an_platform_keyboard():
@@ -7253,8 +7257,24 @@ def handle_media(message):
             caption = (message.caption or "").strip()
             if kind == "audio":
                 result = analyze_voice(data, mime)
-                if caption:
+                if _is_training_message(caption) or _is_training_message(result):
+                    r = learn_add_rule((caption + " " + result)[:300])
+                    result = f"✅ ከድምፅህ ተምሬዋለሁ ሄኖክ!\n«{r['rule']}»\n\n" + result
+                elif caption:
                     result = f"📎 ማስታወሻህ: {caption}\n\n" + result
+            elif kind == "document":
+                doc_txt = data.decode("utf-8", errors="ignore").strip()
+                if doc_txt and len(doc_txt) >= 10:
+                    if _is_training_message(caption) or "rule" in caption.lower() or "ህግ" in caption:
+                        r = learn_add_rule((caption + " " + doc_txt)[:300])
+                        result = f"✅ ከፋይሉ ተምሬዋለሁ ሄኖክ!\n«{r['rule']}»"
+                    else:
+                        q = (f"{caption}\n\n" if caption else "") + f"ይህን የጽሑፍ ፋይል ተረድተህ በአማርኛ አብራራልኝ/ተወያይበት:\n{doc_txt[:4000]}"
+                        result, _, _ = answer(q, history=list(histories.get(uid, [])), live=False)
+                else:
+                    raw = multimodal_generate([{"text": (caption or "Read and explain this file in natural Addis Ababa Amharic.")}, _media_part(data, mime, kind)],
+                                              temperature=0.4, max_tokens=4000)
+                    result = clean_md(raw)
             else:
                 prompt = VIDEO_PROMPT if kind == "video" else PHOTO_PROMPT
                 if caption:
@@ -8388,6 +8408,19 @@ def on_callback(call):
 # ----------------------------------------------------------------------------
 # Free text
 # ----------------------------------------------------------------------------
+_TRAIN_CUES = (
+    "ከአሁን በኋላ", "ሁልጊዜ", "አትጠቀም", "ተጠቀም", "አሰልጥን", "ተማር", "አትጻፍ", "አስተካክል",
+    "እንዲህ አድርግ", "አሰራርህ", "ቃላት", "from now on", "always ", "never ", "remember ", "train:",
+)
+
+
+def _is_training_message(text):
+    low = (text or "").strip().lower()
+    if any(low.startswith(t.lower()) for t in RULE_TRIGGERS):
+        return True
+    return len(low) >= 12 and any(c in low for c in _TRAIN_CUES)
+
+
 @bot.message_handler(content_types=["text"])
 @private_owner_only
 def handle_text(message):
@@ -8445,6 +8478,9 @@ def handle_text(message):
         (run_news if pending_mode == "news" else run_post)(chat_id, label, text)
         return
 
+    if any(k in low_t for k in ("አናሊቲክስ", "analytics", "ቪው ስንት", "ኢንጌጅመንት")):
+        run_analytics(chat_id, "all", "today")
+        return
     if is_greeting(text):
         bot.send_message(chat_id, greeting_reply(), reply_markup=sekela_hub_keyboard())
         return
@@ -8453,7 +8489,7 @@ def handle_text(message):
         return
 
     low_t = text.strip().lower()
-    if any(low_t.startswith(t.lower()) for t in RULE_TRIGGERS):
+    if _is_training_message(text):
         with Typing(chat_id):
             r = learn_add_rule(re.sub(r"^(ህግ|ሕግ|rule)\s*[:፦]\s*", "", text.strip(), flags=re.I))
         extra = ""
