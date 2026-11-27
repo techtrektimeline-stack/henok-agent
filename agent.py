@@ -1012,6 +1012,9 @@ def openrouter_chat(messages, max_tokens=1800, temperature=0.8, models=None):
                 _last_ai_error["or"] = "HTTP 401 (bad key)"
                 log.warning("OpenRouter 401 (bad key) - switching to Gemini")
                 return None, None
+            if r.status_code == 429 and "free-models-per-day" in (r.text or ""):
+                _last_ai_error["or"] = "HTTP 429 (daily free limit)"
+                break
             if r.status_code == 402:
                 _or_no_credits = True
                 _last_ai_error["or"] = "HTTP 402 (no credits)"
@@ -1068,10 +1071,6 @@ def llm_write(user_text, history=None, system=None, allow_gemini=True, max_token
                         break
             except Exception as e:
                 log.warning("GitHub Models (%s) failed: %s", gh_model, short_reason(e, 70))
-    text, model = openrouter_chat(messages, max_tokens=max_tokens, temperature=temperature, models=models)
-    if text:
-        log.info("written by OpenRouter %s", model)
-        return clean_md(text), f"openrouter:{model}"
     if GROQ_API_KEY:
         groq_cands = ["llama-3.3-70b-versatile", "qwen/qwen3-32b", "openai/gpt-oss-120b",
                       "openai/gpt-oss-20b", "meta-llama/llama-4-scout-17b-16e-instruct", "llama-3.1-8b-instant"]
@@ -1106,6 +1105,10 @@ def llm_write(user_text, history=None, system=None, allow_gemini=True, max_token
             except Exception as e:
                 log.warning("Groq (%s) failed: %s", gm, e)
 
+    text, model = openrouter_chat(messages, max_tokens=max_tokens, temperature=temperature, models=models)
+    if text:
+        log.info("written by OpenRouter %s", model)
+        return clean_md(text), f"openrouter:{model}"
     if allow_gemini:
         contents = [{"role": r, "parts": [{"text": t}]} for r, t in history]
         contents.append({"role": "user", "parts": [{"text": user_text}]})
@@ -2959,33 +2962,20 @@ def build_draft(topic, facts=None, sources=None, allow_fallback=True, brand=None
         return None
     pkg, (post, headline) = best
     if segment != "bego":
-        # Pre-Delivery AI QA Gate + Amharic Polish (Claude sekela_newsroom.py integration)
+        # Lean 1-call QA + deterministic Amharic fixes (cuts 8-9 LLM calls/post down to 2 for 50-100 posts/day free!)
         _src_label = resolve_source(pkg.get("source", ""), facts or "", sources, unverified)
         _qa_ok, _qa_reason, _qa_pkg = qa_verify_and_polish_pkg(pkg, facts or topic, _src_label)
         if not _qa_ok:
             log.warning("QA Gate rejected draft '%s': %s", pkg.get("headline", ""), _qa_reason)
             return None
         pkg = _qa_pkg
-        _g_body = f"{pkg.get('lead', '')}\n\n{pkg.get('context', '')}".strip()
-        _d_ok, _d_h, _d_b, _d_issues = desk_verify_and_repair(pkg.get("headline", ""), _g_body, facts or topic)
-        if not _d_ok:
-            log.warning("Amharic Desk rejected '%s': %s", pkg.get("headline", ""), _d_issues)
-            return None
-        pkg["headline"], _g_body = _d_h, _d_b
-        _g_res = amharic_guard({"headline": pkg.get("headline", ""), "body": _g_body}, facts or topic)
-        if not _g_res["ok"]:
-            log.warning("Amharic Guard rejected draft '%s' (score=%s): %s", pkg.get("headline", ""), _g_res["score"], _g_res["issues"])
-            return None
-        pkg["headline"] = _g_res["headline"]
-        _g_paras = [x.strip() for x in _g_res["body"].split("\n\n") if x.strip()]
-        if _g_paras:
-            pkg["lead"] = _g_paras[0]
-            if len(_g_paras) > 1:
-                pkg["context"] = "\n\n".join(_g_paras[1:])
+        for _k in ("headline", "lead", "context"):
+            if pkg.get(_k):
+                pkg[_k] = _norm_amharic_digits(fix_common_amharic_errors(_guard_known_fixes(pkg[_k])))
         re_ed = assemble_news_post(pkg, facts or "", sources, unverified and segment != "bego", brand, segment=segment)
         if re_ed:
             post, headline = re_ed
-    fixed = proofread_pkg(pkg) if (segment != "bego" and best_score and best_score > 0) else pkg
+    fixed = pkg  # already polished & checked above (saves extra proofread LLM call)
     if fixed is not pkg:
         rebuilt = assemble_news_post(fixed, facts or "", sources, unverified, brand, segment=segment)
         if rebuilt:
@@ -4938,10 +4928,12 @@ def detect_ethiopia_social_buzz(items):
         if k in seen:
             continue
         seen.add(k)
+        _src_lbl = it.get("source") or "ከማህበራዊ ሚዲያ ትሬንድ"
         out.append({
             "title": t,
             "summary": fix_common_amharic_errors(str(it.get("summary") or t)[:400]),
-            "outlets": it.get("source") or "ከማህበራዊ ሚዲያ ትሬንድ",
+            "source": _src_lbl,
+            "outlets": _src_lbl,
             "link": it.get("link") or "",
             "image": it.get("image"),
             "images": it.get("images") or [],
