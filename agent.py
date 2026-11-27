@@ -1073,8 +1073,7 @@ def llm_write(user_text, history=None, system=None, allow_gemini=True, max_token
                 log.warning("GitHub Models (%s) failed: %s", gh_model, short_reason(e, 70))
     if GROQ_API_KEY:
         groq_keys = [k.strip() for k in GROQ_API_KEY.split(",") if k.strip()]
-        groq_cands = ["llama-3.3-70b-versatile", "qwen/qwen3-32b", "meta-llama/llama-4-scout-17b-16e-instruct",
-                      "llama-3.1-8b-instant", "openai/gpt-oss-120b", "openai/gpt-oss-20b"]
+        groq_cands = ["openai/gpt-oss-20b", "openai/gpt-oss-120b"]
         groq_msgs = [{"role": m["role"], "content": str(m["content"])[:4500]} for m in messages]
         for gk in groq_keys:
             for gm in groq_cands:
@@ -1097,7 +1096,7 @@ def llm_write(user_text, history=None, system=None, allow_gemini=True, max_token
                     log.warning("Groq (%s) failed: %s", gm, short_reason(e, 70))
     for _env_k, _ep_url, _ep_models in (
         ("CEREBRAS_API_KEY", "https://api.cerebras.ai/v1/chat/completions", ("llama-3.3-70b", "qwen-3-32b", "llama3.1-8b")),
-        ("MISTRAL_API_KEY", "https://api.mistral.ai/v1/chat/completions", ("mistral-small-latest", "open-mistral-nemo")),
+        ("MISTRAL_API_KEY", "https://api.mistral.ai/v1/chat/completions", ("mistral-small-latest", "open-mistral-nemo", "ministral-8b-latest")),
         ("SAMBANOVA_API_KEY", "https://api.sambanova.ai/v1/chat/completions", ("Meta-Llama-3.3-70B-Instruct", "Qwen2.5-72B-Instruct")),
     ):
         _kval = os.environ.get(_env_k, "").strip()
@@ -1113,6 +1112,8 @@ def llm_write(user_text, history=None, system=None, allow_gemini=True, max_token
                     if txt.strip():
                         log.info("written by %s %s", _env_k, _em)
                         return clean_md(txt.strip()), f"{_env_k.lower()}:{_em}"
+                else:
+                    log.warning("%s (%s) HTTP %s: %s", _env_k, _em, r.status_code, (r.text or "")[:120])
             except Exception as e:
                 log.warning("%s (%s) failed: %s", _env_k, _em, short_reason(e, 70))
 
@@ -5185,7 +5186,7 @@ def start_hunter():
     if os.environ.get("HUNTER_SPORT_ENABLED", "1") != "0":
         threading.Thread(target=hunter_loop, args=("sport",), daemon=True, name="hunter-sport").start()
     log.info("Hunters started (media every %s min, sport every %s min, quiet %s)",
-             os.environ.get("HUNT_INTERVAL_MIN", "30"), os.environ.get("HUNT_SPORT_INTERVAL_MIN", "40"),
+             os.environ.get("HUNT_INTERVAL_MIN", "10"), os.environ.get("HUNT_SPORT_INTERVAL_MIN", "15"),
              os.environ.get("HUNT_QUIET", "23-6") or "off")
 
 
