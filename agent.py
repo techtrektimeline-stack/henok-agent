@@ -796,8 +796,8 @@ def gemini_generate(contents, system=None, grounding=False, temperature=0.8, max
             except Exception as e:
                 last_err = e
     _last_ai_error["gm"] = short_reason(last_err, 90)
-    if "HTTP 0" in str(last_err):
-        _gm_cooldown_until = time.time() + 600
+    if "HTTP 0" in str(last_err) or "HTTP 429" in str(last_err):
+        _gm_cooldown_until = time.time() + 300
     raise GeminiError(f"all Gemini models failed: {last_err}")
 
 
@@ -1072,38 +1072,49 @@ def llm_write(user_text, history=None, system=None, allow_gemini=True, max_token
             except Exception as e:
                 log.warning("GitHub Models (%s) failed: %s", gh_model, short_reason(e, 70))
     if GROQ_API_KEY:
-        groq_cands = ["llama-3.3-70b-versatile", "qwen/qwen3-32b", "openai/gpt-oss-120b",
-                      "openai/gpt-oss-20b", "meta-llama/llama-4-scout-17b-16e-instruct", "llama-3.1-8b-instant"]
-        try:
-            mr = requests.get("https://api.groq.com/openai/v1/models",
-                              headers={"Authorization": f"Bearer {GROQ_API_KEY}"}, timeout=8)
-            if mr.status_code == 200:
-                avail = {m.get("id") for m in (mr.json().get("data") or []) if m.get("id")}
-                ordered = [m for m in groq_cands if m in avail]
-                _ban = ("whisper", "guard", "tts", "prompt", "allam", "orpheus", "playai", "compound")
-                extras = sorted(m for m in avail if m not in ordered and not any(x in m.lower() for x in _ban))
-                groq_cands = (ordered + extras)[:6] or groq_cands
-        except Exception:
-            pass
-        for gm in groq_cands[:6]:
+        groq_keys = [k.strip() for k in GROQ_API_KEY.split(",") if k.strip()]
+        groq_cands = ["llama-3.3-70b-versatile", "qwen/qwen3-32b", "meta-llama/llama-4-scout-17b-16e-instruct",
+                      "llama-3.1-8b-instant", "openai/gpt-oss-120b", "openai/gpt-oss-20b"]
+        groq_msgs = [{"role": m["role"], "content": str(m["content"])[:4500]} for m in messages]
+        for gk in groq_keys:
+            for gm in groq_cands:
+                try:
+                    r = requests.post(
+                        "https://api.groq.com/openai/v1/chat/completions",
+                        headers={"Authorization": f"Bearer {gk}", "Content-Type": "application/json"},
+                        json={"model": gm, "messages": groq_msgs,
+                              "temperature": min(temperature, 0.55), "max_tokens": min(max_tokens, 1200)},
+                        timeout=30,
+                    )
+                    if r.status_code == 200:
+                        txt = ((r.json().get("choices") or [{}])[0].get("message") or {}).get("content") or ""
+                        if txt.strip():
+                            log.info("written by Groq %s", gm)
+                            return clean_md(txt.strip()), f"groq:{gm}"
+                    else:
+                        log.warning("Groq (%s) HTTP %s: %s", gm, r.status_code, r.text[:120])
+                except Exception as e:
+                    log.warning("Groq (%s) failed: %s", gm, short_reason(e, 70))
+    for _env_k, _ep_url, _ep_models in (
+        ("CEREBRAS_API_KEY", "https://api.cerebras.ai/v1/chat/completions", ("llama-3.3-70b", "qwen-3-32b", "llama3.1-8b")),
+        ("MISTRAL_API_KEY", "https://api.mistral.ai/v1/chat/completions", ("mistral-small-latest", "open-mistral-nemo")),
+        ("SAMBANOVA_API_KEY", "https://api.sambanova.ai/v1/chat/completions", ("Meta-Llama-3.3-70B-Instruct", "Qwen2.5-72B-Instruct")),
+    ):
+        _kval = os.environ.get(_env_k, "").strip()
+        if not _kval:
+            continue
+        for _em in _ep_models:
             try:
-                r = requests.post(
-                    "https://api.groq.com/openai/v1/chat/completions",
-                    headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
-                    json={"model": gm, "messages": messages,
-                          "temperature": min(temperature, 0.55), "max_tokens": max_tokens,
-                          "frequency_penalty": 0.45, "presence_penalty": 0.25},
-                    timeout=60,
-                )
+                r = requests.post(_ep_url, headers={"Authorization": f"Bearer {_kval}", "Content-Type": "application/json"},
+                                  json={"model": _em, "messages": messages, "temperature": min(temperature, 0.55), "max_tokens": min(max_tokens, 1400)},
+                                  timeout=35)
                 if r.status_code == 200:
                     txt = ((r.json().get("choices") or [{}])[0].get("message") or {}).get("content") or ""
                     if txt.strip():
-                        log.info("written by Groq %s (fallback)", gm)
-                        return clean_md(txt.strip()), f"groq:{gm}"
-                else:
-                    log.warning("Groq (%s) HTTP %s: %s", gm, r.status_code, r.text[:120])
+                        log.info("written by %s %s", _env_k, _em)
+                        return clean_md(txt.strip()), f"{_env_k.lower()}:{_em}"
             except Exception as e:
-                log.warning("Groq (%s) failed: %s", gm, e)
+                log.warning("%s (%s) failed: %s", _env_k, _em, short_reason(e, 70))
 
     text, model = openrouter_chat(messages, max_tokens=max_tokens, temperature=temperature, models=models)
     if text:
@@ -5040,7 +5051,7 @@ def hunt_once(manual=False, min_importance=None, brand="media", force_strict=Non
         feed_stories = stories_from_feeds(rss_pool, n=25) if rss_pool else []
         unseen_feeds = unseen(feed_stories, threshold) or unseen(feed_stories)
         # Save Gemini quota: only call scan_stories when feeds have <4 unseen items or on manual breaking/sport
-        if manual or len(unseen_feeds) < 4:
+        if len(unseen_feeds) < 3:
             stories, scan_sources = scan_stories(focus, hours=24, n=10, feeds=feeds_txt)
         else:
             stories, scan_sources = [], []
@@ -5121,7 +5132,7 @@ def hunt_once(manual=False, min_importance=None, brand="media", force_strict=Non
         best_match_img = _kept_urls[0] if _kept_urls else None
         best_extra_imgs = _kept_urls[1:] if len(_kept_urls) > 1 else []
         # Skip extra Gemini research call if TG/RSS item already has >=25 words of real context
-        if len(topic.split()) >= 25 and not manual:
+        if len(topic.split()) >= 15:
             facts = f"{story['title']}. {story['summary']} (Reported by: {story['outlets']})"
             sources = scan_sources or ([(story['outlets'] or "Sekela Media Desk", story.get("link") or BRANDS[brand]["tg_link"])])
         else:
