@@ -1299,7 +1299,8 @@ NEWSROOM_SYSTEM = (
     "Never use Ethiopic numerals (፩,፪). Keep widely used Latin names and terms where clearer, such as AI, Bitcoin, TikTok and club names.\n"
     "- ZERO-TOLERANCE GROUNDING: Use ONLY facts in the research notes. Do NOT add any Ethiopian angle, reaction, community, or impact "
     "unless the source itself mentions Ethiopia or Ethiopians. A foreign story stays a foreign story. Never output NONE as source.\n"
-    "- STANDARD TERMS: ጎል(goal), ጨዋታ(match), ውጤት(score), ነጥብ(points), ደረጃ(standings), አቻ(draw), አሸነፈ(won), ተሸነፈ(lost), አሰልጣኝ(coach), ተጫዋች(player), አጥቂ(striker), ግብ ጠባቂ(goalkeeper), ተከላካይ(defender), አማካይ(midfielder), ዝውውር(transfer), ጉዳት(injury).")
+    "- STANDARD TERMS: ጎል(goal), ጨዋታ(match), ውጤት(score), ነጥብ(points), ደረጃ(standings), አቻ(draw), አሸነፈ(won), ተሸነፈ(lost), አሰልጣኝ(coach), ተጫዋች(player), አጥቂ(striker), ግብ ጠባቂ(goalkeeper), ተከላካይ(defender), አማካይ(midfielder), ዝውውር(transfer), ጉዳት(injury).\n"
+    "- HEADLINE SELF-CHECK: Every Amharic headline MUST end with a complete finite verb (e.g. አሸነፈ, ተከፈተ, ተገኘ, አስታወቀ). Never end with a noun, number, or preposition fragment. Never repeat the same stem word twice (WRONG: የገደብ ገደብ).")
 
 NEWS_BRIEF = (
     "Write ONE Amharic news item from the research notes in Sekela's signature journalistic voice (CRITICAL: even if Topic and Research Notes are 100% in English, write HEADLINE, LEAD, and CONTEXT 100% in natural Amharic Ethiopic script — NEVER output English sentences): bold headline -> "
@@ -1396,10 +1397,16 @@ def clean_headline(h, fallback_text="", max_words=10):
     words = h.split()
     dedup = []
     for w in words:
-        if dedup and (w == dedup[-1] or (len(w) >= 3 and dedup[-1].endswith(w))):
-            continue
+        if dedup:
+            prev = dedup[-1]
+            if w == prev or (len(w) >= 3 and (prev.endswith(w) or w.endswith(prev)) and abs(len(prev) - len(w)) <= 2):
+                continue
         dedup.append(w)
-    return " ".join(dedup[:max(max_words, 10)])
+    lim = max(max_words, 10)
+    if len(dedup) > lim:
+        head, tail = dedup[:lim - 1], dedup[-1]
+        dedup = head + [tail] if head and tail not in head[-2:] else head
+    return re.sub(r"[፣፤,;\-]+$", "", " ".join(dedup)).strip()
 
 
 def detect_outlets(text):
@@ -1562,7 +1569,17 @@ def assemble_news_post(pkg, facts="", sources=None, unverified=False, brand="med
     if not re.search(r"[ሀ-፼]{3,}", lead):
         return None
     if _has_repetition_loop(lead) or _has_repetition_loop(context):
-        return None
+        def _dedup_sents(txt):
+            seen_s, out_s = set(), []
+            for s in re.split(r"(?<=[።.!?])\s+", txt):
+                k = re.sub(r"\s+", " ", s.strip().lower())
+                if k and k not in seen_s:
+                    seen_s.add(k)
+                    out_s.append(s.strip())
+            return " ".join(out_s)
+        lead, context = _dedup_sents(lead), _dedup_sents(context)
+        if _has_repetition_loop(lead) or _has_repetition_loop(context):
+            return None
     max_words = 8 if segment in ("coffee", "bego") else 10
     headline = clean_headline(pkg.get("headline"), lead, max_words=max_words)
     if not headline:
@@ -1584,7 +1601,7 @@ def assemble_news_post(pkg, facts="", sources=None, unverified=False, brand="med
     if official:
         parts.append(official)
     parts += [f"📌 ምንጭ፡ {src}", brand_footer(brand), tags]
-    return "\n\n".join(parts), headline
+    return fix_common_amharic_errors("\n\n".join(parts)), fix_common_amharic_errors(headline)
 
 
 STORY_PROMPT = (
@@ -1607,6 +1624,7 @@ STORY_PROMPT = (
     "Importance: 8-10 = major breaking/viral/utility/match story, 4-7 = strong daily, ministry, creator, or global story."
 )
 _STORY_RE = re.compile(r"^\s*STORY\s*\|\s*(\d+)\s*\|(.*?)\|(.*?)\|(.*)$")
+STORY_PROMPT += "\nETHIOPIA-PRIORITY RULE: 80% of returned stories MUST be Ethiopia-focused (+2 importance); max 20% foreign-only (-2 importance)."
 
 
 def parse_story_lines(text):
@@ -1668,8 +1686,8 @@ def run_news(chat_id, label, topic, brand=None, segment=None):
     ack_id = send_progress(chat_id, f"⏳ {label} — ዋና ዋና ዜናዎችን እየፈተሽኩ ነው (ከ15-35 ሰከንድ)...")
     try:
         with Typing(chat_id):
-            tg_items = fetch_tg_channel_items(brand, max_age_hours=24, per_channel=3)
-            feed_items = fetch_feed_items(brand, max_age_hours=24, per_feed=5)
+            tg_items = fetch_tg_channel_items(brand, max_age_hours=8, per_channel=3)
+            feed_items = fetch_feed_items(brand, max_age_hours=8, per_feed=5)
             trends = fetch_google_trends(max_age_hours=24) if brand == "media" else []
         if brand == "media" and daily["count"] == 0 and not manual:
             try:
@@ -1892,6 +1910,32 @@ def _compose_photo_collage(photo_bytes_list, width=1080, height=918):
         return photo_bytes_list[0]
 
 
+_LOGO_HINTS = re.compile(
+    r"\b(logo|brand|watermark|advert|sponsor|banner|promo|masthead|subscribe|follow[-_]?us|"
+    r"getty|shutterstock|alamy|istock|123rf|book[-_]?cover|buy[-_]?book)\b", re.I
+)
+
+
+def _image_quality_score(img_bytes):
+    """Score real photo quality 0-100; rejects flat logos/ads/low-res thumbnails (<35)."""
+    if not PIL_OK or not img_bytes:
+        return 50
+    try:
+        im = Image.open(io.BytesIO(img_bytes))
+        w, h = im.size
+        if w < 420 or h < 280:
+            return 0
+        ratio = w / max(h, 1)
+        penalty = 0 if 0.4 <= ratio <= 2.5 else 25
+        gray = im.convert("L").resize((256, 256))
+        edge_std = ImageStat.Stat(gray.filter(ImageFilter.FIND_EDGES)).stddev[0]
+        color_var = ImageStat.Stat(gray).stddev[0]
+        top_std = ImageStat.Stat(gray.crop((0, 0, 256, 102))).stddev[0]
+        return max(0, min(100, int(min(40, edge_std * 2) + min(30, color_var / 3) + min(30, top_std) - penalty)))
+    except Exception:
+        return 50
+
+
 _used_photo_urls = []
 
 
@@ -1923,11 +1967,20 @@ def find_real_photo(urls, direct_image=None, max_pages=5, topic_hint=None, extra
             cand_imgs.append(u)
     if cand_imgs:
         downloaded = []
-        for u in cand_imgs[:4]:
+        scored = []
+        for u in cand_imgs[:6]:
+            if _LOGO_HINTS.search(u):
+                continue
             b = download_photo(u)
-            if b:
-                _mark_photo_used(u)
-                downloaded.append(b)
+            if not b:
+                continue
+            q = _image_quality_score(b)
+            if q >= 35:
+                scored.append((q, u, b))
+        if scored:
+            scored.sort(key=lambda x: -x[0])
+            _mark_photo_used(scored[0][1])
+            downloaded.append(scored[0][2])
         if downloaded:
             return downloaded[0]  # Always 1 clean photo on the poster; extra photos go to FB comments / TG album
     seen, pages = set(), 0
@@ -1944,7 +1997,7 @@ def find_real_photo(urls, direct_image=None, max_pages=5, topic_hint=None, extra
             for rx in _META_IMG:
                 for m in rx.finditer(html):
                     img = urljoin(r.url, html_lib.unescape(m.group(1)).strip())
-                    if _BAD_IMG.search(img) or img in _used_photo_urls:
+                    if _BAD_IMG.search(img) or _LOGO_HINTS.search(img) or img in _used_photo_urls:
                         continue
                     b = download_photo(img, referer=r.url)
                     if b:
@@ -4768,6 +4821,141 @@ def build_sport_post(event, llm_call=None):
             "source_name": event.get("source") or "Sekela Sport ዳታ",
             "event_key": _sp_event_key(event), "source_text": facts, "published": str(event.get("date") or "")}
 
+
+# ── Real-Time Freshness, Ethiopia Social Buzz & Amharic Tidier (from sekela_realtime_buzz.py) ──
+_BUZZ_HATE = re.compile(r"(የሚጠላ|የሚገድል|የሚያጠፋ|የሚያባርር|ሽብር)", re.I)
+_BUZZ_GOSSIP = re.compile(r"(አልተረጋገጠ|ያልተረጋገጠ ወሬ)", re.I)
+_BUZZ_DOUBLE = re.compile(r"\b([ሀ-፼]{3,})\s+\1\b")
+
+
+def fix_common_amharic_errors(text):
+    """Remove doubled Amharic words, convert Ethiopic digits ፩-፱ to 1-9, tidy punctuation spacing."""
+    if not text:
+        return ""
+    t = str(text)
+    for _ in range(3):
+        t2 = _BUZZ_DOUBLE.sub(r"\1", t)
+        if t2 == t:
+            break
+        t = t2
+    t = t.translate(str.maketrans("፩፪፫፬፭፮፯፰፱", "123456789"))
+    t = re.sub(r"\s+([፣፤።!?])", r"\1", t)
+    t = re.sub(r"([።!?])([ሀ-፼A-Za-z])", r"\1 \2", t)
+    return re.sub(r"[ \t]{2,}", " ", t).strip()
+
+
+def filter_fresh_items(items, max_age_hours=6):
+    """Prefer ultra-fresh stories (<=max_age_hours) so yesterday's news is never recycled today."""
+    if not items:
+        return []
+    fresh = [it for it in items if float(it.get("age_h", 12) or 12) <= max_age_hours]
+    if len(fresh) >= 2:
+        return sorted(fresh, key=lambda x: float(x.get("age_h", 12) or 12))
+    return sorted(items, key=lambda x: float(x.get("age_h", 12) or 12))
+
+
+_BUZZ_MEDIA_QUERIES = (
+    "TikTok Creative Awards Ethiopia", "TikTok ኢትዮጵያ", "YouTube ኢትዮጵያ trending",
+    "Ethiopian creator awards", "Ethiopia economy Birr", "Addis Ababa news",
+    "Ethiopia ministry announcement", "Ethiopia news today",
+)
+_BUZZ_SPORT_QUERIES = (
+    "Ethiopian Premier League today", "Walias Ethiopia", "Ethiopian athletics",
+    "Ethiopian football live", "EPL live today", "UCL highlights Ethiopia",
+)
+
+
+def fetch_social_signals(brand="media", max_queries=4):
+    """Fetch live Ethiopian TikTok/YouTube/Creator/Sport buzz signals from Google News Ethiopia RSS (<=8h)."""
+    qs = _BUZZ_MEDIA_QUERIES if brand == "media" else _BUZZ_SPORT_QUERIES
+    out, seen = [], set()
+    now_utc = datetime.now(timezone.utc)
+    for qq in qs[:max_queries]:
+        try:
+            r = requests.get(
+                f"https://news.google.com/rss/search?q={quote(qq)}+when:1d&hl=en-ET&gl=ET&ceid=ET:en",
+                headers={"User-Agent": "Mozilla/5.0 (compatible; SekelaBuzz/2.0)"}, timeout=8,
+            )
+            if not r.ok:
+                continue
+            for m in re.finditer(r"<item>(.*?)</item>", r.text, re.S):
+                blk = m.group(1)
+                tt = re.search(r"<title>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?</title>", blk, re.S)
+                lk = re.search(r"<link>(.*?)</link>", blk, re.S)
+                pd = re.search(r"<pubDate>(.*?)</pubDate>", blk, re.S)
+                if not tt:
+                    continue
+                title = html_lib.unescape(tt.group(1)).strip()[:180]
+                if not title or title.lower() in seen:
+                    continue
+                age_h = 4.0
+                if pd:
+                    try:
+                        age_h = max(0.1, (now_utc - parsedate_to_datetime(pd.group(1).strip()).astimezone(timezone.utc)).total_seconds() / 3600.0)
+                    except Exception:
+                        pass
+                if age_h > 10.0:
+                    continue
+                seen.add(title.lower())
+                out.append({
+                    "title": title,
+                    "summary": title,
+                    "source": "ከማህበራዊ ሚዲያ ትሬንድ",
+                    "link": lk.group(1).strip() if lk else "",
+                    "age_h": age_h,
+                })
+        except Exception:
+            pass
+    return out[:12]
+
+
+def detect_ethiopia_social_buzz(items):
+    """Turn safe Ethiopian social/trend signals into buzz story dicts without extra LLM credit."""
+    out, seen = [], set()
+    for it in (items or [])[:8]:
+        t = fix_common_amharic_errors(str(it.get("title") or "").strip())
+        if len(t) < 10 or _BUZZ_HATE.search(t) or _BUZZ_GOSSIP.search(t):
+            continue
+        k = t.lower()
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append({
+            "title": t,
+            "summary": fix_common_amharic_errors(str(it.get("summary") or t)[:400]),
+            "outlets": it.get("source") or "ከማህበራዊ ሚዲያ ትሬንድ",
+            "link": it.get("link") or "",
+            "image": it.get("image"),
+            "images": it.get("images") or [],
+            "importance": 7,
+            "age_h": float(it.get("age_h", 2.0) or 2.0),
+        })
+    return out
+
+
+_CAT_BEGO = re.compile(
+    r"(አፋልጉኝ|የጠፋ|ጠፍቶ|እርዳታ|ድጋፍ|ልገሳ|ለመርዳት|ህክምና እርዳታ|ደም ልገሳ|"
+    r"missing person|medical help|blood donation|fundraise)", re.I
+)
+_CAT_COFFEE = re.compile(
+    r"(የሚያስገርም|የማይታመን|ድንቅ|አስደናቂ|የተለየ|አዲስ ፈጠራ|አዲስ ተሰጥኦ|ተአምር|ሪከርድ|"
+    r"amazing|incredible|unbelievable|surprising|world record|talent|viral|million views)", re.I
+)
+_CAT_SERIOUS = re.compile(r"(ሚኒስቴር|ፓርላማ|ውሳኔ|ስምምነት|ጦርነት|ሰላም|ፖለቲካ|ነዳጅ|ባንክ|ምንዛሬ|ግብር|በጀት)", re.I)
+
+
+def classify_story_type(item, brand="media"):
+    """Accurately route story -> 'bego' | 'coffee' | 'news' so serious news never gets a Coffee Time badge."""
+    if not isinstance(item, dict) or brand != "media":
+        return "news"
+    blob = f"{item.get('title', '')} {item.get('summary', '')} {item.get('facts', '')}"
+    if _CAT_BEGO.search(blob):
+        return "bego"
+    if _CAT_COFFEE.search(blob) and not _CAT_SERIOUS.search(blob):
+        return "coffee"
+    return "news"
+
+
 def hunt_once(manual=False, min_importance=None, brand="media", force_strict=None):
     """Proactive & manual news scan. Never skips silently if Gemini search fails — immediately falls back to RSS + Google Trends."""
     lock = hunt_locks[brand]
@@ -4807,8 +4995,9 @@ def hunt_once(manual=False, min_importance=None, brand="media", force_strict=Non
         feed_items = fetch_feed_items(brand, max_age_hours=24, per_feed=5)
         trends = fetch_google_trends(max_age_hours=24) if brand == "media" else []
         besoccer_items = fetch_besoccer_items(max_items=8) if brand == "sport" else []
-        gnews_items = fetch_google_news_rss(brand, max_age_hours=24, per_query=3)
-        rss_pool = tg_items + feed_items + gnews_items + besoccer_items + trends[:5]
+        gnews_items = fetch_google_news_rss(brand, max_age_hours=8, per_query=3)
+        _buzz_items = detect_ethiopia_social_buzz(fetch_social_signals(brand) + (trends[:6] if brand == 'media' else []))
+        rss_pool = filter_fresh_items(tg_items + feed_items + gnews_items + besoccer_items + _buzz_items, max_age_hours=6 if not manual else 8)
         feeds_txt = feed_items_text(rss_pool)
 
         def unseen(lst, min_imp=None):
@@ -4878,6 +5067,9 @@ def hunt_once(manual=False, min_importance=None, brand="media", force_strict=Non
             none_streak[brand] += 1
             return "none"
         none_streak[brand] = 0
+        if brand == "media":
+            _ctype = classify_story_type(story, brand)
+            segment = _ctype if _ctype in ("coffee", "bego") else None
         mark_seen(f"{story['title']} {story['summary']}")
         start = time.time()
         # Multi-Source Sibling Merger: merge matching stories from other outlets & mark them seen so duplicates never repeat
