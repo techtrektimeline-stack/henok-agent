@@ -1163,6 +1163,21 @@ def remember(user_id, user_text, reply):
 # ----------------------------------------------------------------------------
 # Unified /sekela Hub + Menus
 # ----------------------------------------------------------------------------
+def mynews_brand_keyboard():
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        types.InlineKeyboardButton("📰 ሰከላ ሚዲያ", callback_data="mynews:media:news"),
+        types.InlineKeyboardButton("⚽ ሰከላ ስፖርት", callback_data="mynews:sport:news"),
+    )
+    kb.add(
+        types.InlineKeyboardButton("☕ ሰከላ ኮፊ ታይም", callback_data="mynews:media:coffee"),
+        types.InlineKeyboardButton("🤍 ሰከላ በጎ", callback_data="mynews:media:bego"),
+    )
+    kb.add(types.InlineKeyboardButton("🤖 ራስህ ምረጥ (Auto)", callback_data="mynews:auto:auto"))
+    kb.add(types.InlineKeyboardButton("⬅️ ወደ ዋናው መምረጫ", callback_data="hub:main"))
+    return kb
+
+
 def sekela_hub_keyboard():
     kb = types.InlineKeyboardMarkup(row_width=2)
     kb.add(
@@ -1170,7 +1185,10 @@ def sekela_hub_keyboard():
         types.InlineKeyboardButton("⚽ ሰከላ ስፖርት (Sport)", callback_data="hub:sport"),
     )
     kb.add(
+        types.InlineKeyboardButton("✍️ የኔ ዜና (My News)", callback_data="hub:mynews"),
         types.InlineKeyboardButton("📊 Analytics", callback_data="hub:an"),
+    )
+    kb.add(
         types.InlineKeyboardButton("🎨 Image / Canva", callback_data="hub:img"),
     )
     kb.add(
@@ -6614,7 +6632,7 @@ def hist_delta(key, current, days):
     return int(current - ref[1]), max(1, (today - ref[0]).days)
 
 
-TIMEFRAMES = {"today": ("ዛሬ", 1), "week": ("7 ቀን", 7), "month": ("30 ቀን", 30), "last": ("የቅርብ ቪዲዮ/ፖስት", 0)}
+TIMEFRAMES = {"today": ("ዛሬ", 1), "yesterday": ("ትናንት", 2), "3days": ("3 ቀን", 3), "week": ("7 ቀን", 7), "month": ("30 ቀን", 30), "last": ("የቅርብ ቪዲዮ/ፖስት", 0)}
 AN_PLATFORMS = {"media": "📰 ሰከላ ሚዲያ", "sport": "⚽ ሰከላ ስፖርት", "yt": "▶️ YouTube", "all": "📊 ሁሉም (All)"}
 
 
@@ -6962,7 +6980,11 @@ def an_insights(secs, period):
     facts = "\n".join(s["title"] + ":\n" + "\n".join("  " + r for r in s["rows"]) for s in secs)
     prompt = (
         f"You are Henok's senior social media strategist. Below are live metrics for ({period}):\n{facts}\n\n"
-        "Write a CRISP, SCANNABLE Amharic summary (max 140 words, NO markdown ** or ##, use emojis + • bullets) with EXACTLY these 3 short sections:\n"
+        "Write a CLEAR, SCANNABLE Amharic analytics report (max 220 words, NO markdown ** or ##, use emojis + • bullets) with EXACTLY these 3 sections:\n"
+        "1) 📌 የእያንዳንዱ ፖስት/ቪዲዮ አፈጻጸም: list recent posts/videos with their exact Views, Likes/Reactions, Comments, Shares, and Follows.\n"
+        "2) 📊 አጠቃላይ ድምር ({period}): state total Views, total Engagement, and total/new Followers across Facebook Media, Facebook Sport, Telegram, and YouTube.\n"
+        "3) 🎯 ግምገማ እና መፍትሄ: clearly state what is working well right now and 2 concrete improvements to grow views & followers.\n"
+        "IGNORE THE OLD 3 LINES BELOW AND FOLLOW THE 3 SECTIONS ABOVE:\n"
         "1) 👀 ቪው እና ተደራሽነት (Views/Reach): state the exact view/reach numbers for each platform (Facebook Media, Facebook Sport, Telegram, YouTube) in this period.\n"
         "2) 💬 ኢንጌጅመንት (Engagement): state exact likes/reactions, comments, shares, and which post performed best.\n"
         "3) 🎯 መፍትሄ እና ቀጣይ እርምጃ: 2 concrete, practical actions to grow views & comments today.\n"
@@ -6987,9 +7009,11 @@ def an_platform_keyboard():
 def an_timeframe_keyboard(platform):
     kb = types.InlineKeyboardMarkup(row_width=3)
     kb.add(types.InlineKeyboardButton("ዛሬ (Today)", callback_data=f"an:t:{platform}:today"),
-           types.InlineKeyboardButton("7 ቀን (Week)", callback_data=f"an:t:{platform}:week"),
-           types.InlineKeyboardButton("30 ቀን (Month)", callback_data=f"an:t:{platform}:month"))
-    kb.add(types.InlineKeyboardButton("🎬 የቅርብ ቪዲዮ", callback_data=f"an:t:{platform}:last"))
+           types.InlineKeyboardButton("ትናንት (Yesterday)", callback_data=f"an:t:{platform}:yesterday"),
+           types.InlineKeyboardButton("3 ቀን (3 Days)", callback_data=f"an:t:{platform}:3days"))
+    kb.add(types.InlineKeyboardButton("7 ቀን (Week)", callback_data=f"an:t:{platform}:week"),
+           types.InlineKeyboardButton("30 ቀን (Month)", callback_data=f"an:t:{platform}:month"),
+           types.InlineKeyboardButton("🎬 የቅርብ ቪዲዮ", callback_data=f"an:t:{platform}:last"))
     kb.add(types.InlineKeyboardButton("⬅️ ተመለስ", callback_data="an:m"))
     return kb
 
@@ -7436,6 +7460,42 @@ def handle_media(message):
         except Exception as e:
             log.error("voice edit failed: %s", e)
             deliver(chat_id, ack_id, f"ሄኖክ፣ የድምፅ ማስተካከያው አልተሳካም 😅 ({short_reason(e)})")
+            return
+    if pending_mode and pending_mode.startswith("custom_news:") and kind in ("photo", "audio"):
+        _, _cb, _cs = pending_mode.split(":", 2)
+        _seg = _cs if _cs in ("coffee", "bego") else None
+        with state_lock:
+            awaiting_topic.pop(uid, None)
+        ack_id = send_progress(chat_id, "✍️ ሄኖክ፣ የላክኸውን መረጃ ተቀብዬ በሰከላ ስታይል 1080x1350 ካርድና ዜና እያዘጋጀሁ ነው...")
+        try:
+            data = bot.download_file(bot.get_file(file_id).file_path)
+            caption = (message.caption or "").strip()
+            if kind == "photo":
+                raw_info = caption
+                if not raw_info:
+                    raw_info = clean_md(multimodal_generate(
+                        [{"text": "Extract all news details, names, dates, and context from this image in plain text."},
+                         _media_part(data, mime, "photo")], temperature=0.2, max_tokens=2000))
+                drop_message(chat_id, ack_id)
+                if not raw_info or len(raw_info) < 8:
+                    with state_lock:
+                        awaiting_topic[uid] = pending_mode
+                    bot.send_message(chat_id, "ሄኖክ፣ ፎቶውን ከአጭር ጽሑፍ (caption) ጋር ላክልኝ ወይም ዜናውን ጻፍልኝ 🙏")
+                    return
+                if _cb == "auto":
+                    _cb = detect_brand(raw_info)
+                    _cs2 = classify_story_type({"title": raw_info, "summary": raw_info}, _cb)
+                    _seg = _cs2 if _cs2 in ("coffee", "bego") else None
+                run_post(chat_id, f"✍️ {raw_info[:40]}", raw_info, context_text=raw_info, brand=_cb, segment=_seg, custom_photo=data)
+            else:
+                transcript = transcribe_voice(data, mime)
+                drop_message(chat_id, ack_id)
+                full_t = (caption + "\n" + (transcript or "")).strip()
+                run_post(chat_id, f"✍️ {full_t[:40]}", full_t, context_text=full_t, brand=_cb, segment=_seg)
+            return
+        except Exception as e:
+            log.error("custom_news media failed: %s", e)
+            deliver(chat_id, ack_id, f"ሄኖክ፣ ረቂቁን ማዘጋጀት አልተቻለም 😅 ({short_reason(e)})")
             return
     if pending_mode == "bego" and kind in ("photo", "audio"):
         with state_lock:
@@ -8408,6 +8468,17 @@ def on_callback(call):
                 awaiting_topic.pop(uid, None)
             run_bego_search(chat_id)
 
+        elif data == "hub:mynews":
+            bot.send_message(chat_id, "✍️ የኔ ዜና — ይህን ዜና ለየትኛው ቻናል/ፕሮግራም እናዘጋጀው? 👇",
+                             reply_markup=mynews_brand_keyboard())
+
+        elif data.startswith("mynews:"):
+            _, _mb, _ms = data.split(":", 2)
+            with state_lock:
+                awaiting_topic[uid] = f"custom_news:{_mb}:{_ms}"
+            _lbl = "🤖 ራስ-ሰር ምርጫ (Auto)" if _mb == "auto" else {"coffee": "☕ ሰከላ ኮፊ ታይም", "bego": "🤍 ሰከላ በጎ"}.get(_ms, brand_label(_mb))
+            bot.send_message(chat_id, f"✅ {_lbl} ተመርጧል!\nአሁን የዜናውን **ፎቶ (ከጽሑፍ/caption ጋር)** ወይም **ጽሑፍ/ድምፅ** ላክልኝ — ቆንጆ አድርጌ በራሳችን የሰከላ ስታይል 1080×1350 ካርድና ዜና አዘጋጅልሃለሁ (ለመሰረዝ /cancel)።")
+
         elif data == "hub:an":
             show_analytics_menu(chat_id, edit_id=msg_id)
 
@@ -8671,6 +8742,14 @@ def handle_text(message):
         else:
             edit_published(chat_id, pid, text)
         return
+    if pending_mode and pending_mode.startswith("custom_news:"):
+        _, _cb, _cs = pending_mode.split(":", 2)
+        if _cb == "auto":
+            _cb = detect_brand(text)
+            _cs = classify_story_type({"title": text, "summary": text}, _cb)
+        _seg = _cs if _cs in ("coffee", "bego") else None
+        run_post(chat_id, f"✍️ {text[:40]}", text, context_text=text, brand=_cb, segment=_seg)
+        return
     if pending_mode == "bego":
         run_bego_draft(chat_id, text)
         return
@@ -8705,7 +8784,17 @@ def handle_text(message):
         return
 
     if any(k in low_t for k in ("አናሊቲክስ", "analytics", "ቪው ስንት", "ኢንጌጅመንት")):
-        run_analytics(chat_id, "all", "today")
+        _tf_pick = "yesterday" if "ትናንት" in low_t else ("3days" if ("3 ቀን" in low_t or "ሶስት ቀን" in low_t) else ("week" if ("ሳምንት" in low_t or "7 ቀን" in low_t) else ("month" if ("ወር" in low_t or "30 ቀን" in low_t) else "today")))
+        run_analytics(chat_id, "all", _tf_pick)
+        return
+    if any(k in low_t for k in ("የኔ ዜና", "የራሴ ዜና", "ዜና ልስጥህ", "ፎቶ ልላክ")):
+        bot.send_message(chat_id, "✍️ የኔ ዜና — ይህን ዜና ለየትኛው ቻናል እናዘጋጀው? 👇", reply_markup=mynews_brand_keyboard())
+        return
+    if any(k in low_t for k in ("ሰበር ዜና አምጣ", "አዲስ ዜና አምጣ")):
+        run_fast_post(chat_id, brand="media")
+        return
+    if any(k in low_t for k in ("የስፖርት ዜና አምጣ", "ስፖርት ዜና አምጣ")):
+        run_fast_post(chat_id, brand="sport")
         return
     if is_greeting(text):
         bot.send_message(chat_id, greeting_reply(), reply_markup=sekela_hub_keyboard())
