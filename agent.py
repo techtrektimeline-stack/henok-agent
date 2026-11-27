@@ -6977,17 +6977,22 @@ AN_INSIGHT_PROMPT = (
 
 
 def an_insights(secs, period):
-    facts = "\n".join(s["title"] + ":\n" + "\n".join("  " + r for r in s["rows"]) for s in secs)
+    blocks = []
+    for s in (secs or []):
+        title = s.get("title") or "Platform"
+        items = list(s.get("facts") or s.get("rows") or [])
+        for k in (s.get("kpis") or []):
+            if isinstance(k, (list, tuple)) and len(k) >= 2:
+                items.append(f"{k[0]}: {k[1]}")
+        items.extend(s.get("notes") or [])
+        blocks.append(title + ":\n" + "\n".join("  " + str(r) for r in items if r))
+    facts = "\n".join(blocks)
     prompt = (
         f"You are Henok's senior social media strategist. Below are live metrics for ({period}):\n{facts}\n\n"
         "Write a CLEAR, SCANNABLE Amharic analytics report (max 220 words, NO markdown ** or ##, use emojis + • bullets) with EXACTLY these 3 sections:\n"
         "1) 📌 የእያንዳንዱ ፖስት/ቪዲዮ አፈጻጸም: list recent posts/videos with their exact Views, Likes/Reactions, Comments, Shares, and Follows.\n"
-        "2) 📊 አጠቃላይ ድምር ({period}): state total Views, total Engagement, and total/new Followers across Facebook Media, Facebook Sport, Telegram, and YouTube.\n"
+        f"2) 📊 አጠቃላይ ድምር ({period}): state total Views, total Engagement, and total/new Followers across Facebook Media, Facebook Sport, Telegram, and YouTube.\n"
         "3) 🎯 ግምገማ እና መፍትሄ: clearly state what is working well right now and 2 concrete improvements to grow views & followers.\n"
-        "IGNORE THE OLD 3 LINES BELOW AND FOLLOW THE 3 SECTIONS ABOVE:\n"
-        "1) 👀 ቪው እና ተደራሽነት (Views/Reach): state the exact view/reach numbers for each platform (Facebook Media, Facebook Sport, Telegram, YouTube) in this period.\n"
-        "2) 💬 ኢንጌጅመንት (Engagement): state exact likes/reactions, comments, shares, and which post performed best.\n"
-        "3) 🎯 መፍትሄ እና ቀጣይ እርምጃ: 2 concrete, practical actions to grow views & comments today.\n"
         "Never invent any number not in the data."
     )
     text, _ = llm_write(prompt, allow_gemini=True, max_tokens=600, temperature=0.35, models=NEWS_WRITER_MODELS)
@@ -8724,6 +8729,7 @@ def handle_text(message):
     text = (message.text or "").strip()
     if not text or text.startswith("/"):
         return
+    low_t = text.lower()
     uid, chat_id = message.from_user.id, message.chat.id
 
     with state_lock:
