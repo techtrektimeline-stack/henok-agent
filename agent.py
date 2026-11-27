@@ -1391,9 +1391,15 @@ def _tidy_headline(s):
     return s.rstrip(".።").strip()
 
 
-def clean_headline(h, fallback_text="", max_words=7):
+def clean_headline(h, fallback_text="", max_words=10):
     h = _tidy_headline(h) or _tidy_headline(fallback_text)
-    return " ".join(h.split()[:max_words])
+    words = h.split()
+    dedup = []
+    for w in words:
+        if dedup and (w == dedup[-1] or (len(w) >= 3 and dedup[-1].endswith(w))):
+            continue
+        dedup.append(w)
+    return " ".join(dedup[:max(max_words, 10)])
 
 
 def detect_outlets(text):
@@ -1557,7 +1563,7 @@ def assemble_news_post(pkg, facts="", sources=None, unverified=False, brand="med
         return None
     if _has_repetition_loop(lead) or _has_repetition_loop(context):
         return None
-    max_words = 5 if segment in ("coffee", "bego") else 6
+    max_words = 8 if segment in ("coffee", "bego") else 10
     headline = clean_headline(pkg.get("headline"), lead, max_words=max_words)
     if not headline:
         return None
@@ -1947,10 +1953,7 @@ def find_real_photo(urls, direct_image=None, max_pages=5, topic_hint=None, extra
                     break
         except Exception as e:
             log.info("article page fetch failed: %s", short_reason(e, 80))
-    if topic_hint:
-        b = _wiki_real_photo(topic_hint)
-        if b:
-            return b
+    # Disabled random _wiki_real_photo fallback (prevented unrelated foreign building photos on Ethiopian stories)
     return None
 
 
@@ -2318,14 +2321,46 @@ def _fb_request(method, path, params=None, data=None, files=None, timeout=90, br
     return js
 
 
+def _fb_clean_caption(post):
+    """Remove outbound t.me / facebook.com links & repetitive footer from FB main caption to maximize organic reach."""
+    lines = []
+    skip_footer = False
+    for ln in str(post or "").splitlines():
+        s = ln.strip()
+        if "ፈጣን እና ታማኝ መረጃ" in s or "ጥቆማ / መረጃ" in s:
+            skip_footer = True
+            continue
+        if skip_footer and (s.startswith(("Telegram:", "Facebook:", "http://", "https://")) or not s):
+            continue
+        skip_footer = False
+        if "https://t.me/" in s or "http://t.me/" in s or "facebook.com/" in s:
+            continue
+        if s.startswith("#"):
+            tags = [t for t in s.split() if t.startswith("#")][:3]
+            if tags:
+                lines.append(" ".join(tags))
+            continue
+        lines.append(ln)
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
+
+
 def fb_publish(post, image_bytes=None, brand="media"):
     pid = BRANDS[brand]["fb_id"]
+    clean_post = _fb_clean_caption(post) or post
     if image_bytes:
-        js = _fb_request("POST", f"{pid}/photos", data={"caption": post, "published": "true"},
+        js = _fb_request("POST", f"{pid}/photos", data={"caption": clean_post, "published": "true"},
                          files={"source": ("sekela-card.jpg", image_bytes, "image/jpeg")}, timeout=120, brand=brand)
     else:
-        js = _fb_request("POST", f"{pid}/feed", data={"message": post}, brand=brand)
-    return js.get("post_id") or js.get("id")
+        js = _fb_request("POST", f"{pid}/feed", data={"message": clean_post}, brand=brand)
+    post_id = js.get("post_id") or js.get("id")
+    if post_id and BRANDS[brand].get("tg_link"):
+        try:
+            _fb_request("POST", f"{post_id}/comments", data={
+                "message": f"🔗 ፈጣን እና ታማኝ መረጃ በ Telegram ለማግኘት ይቀላቀሉን 👇\n{BRANDS[brand]['tg_link']}"
+            }, brand=brand)
+        except Exception as _fce:
+            log.info("fb first-comment tg link skipped: %s", short_reason(_fce, 80))
+    return post_id
 
 
 
@@ -4756,8 +4791,7 @@ def hunt_once(manual=False, min_importance=None, brand="media", force_strict=Non
             wheel_topic = TOPIC_WHEEL[_wheel["media"] % len(TOPIC_WHEEL)]
             _wheel["media"] += 1
             desk = choose_desk("media", wheel_topic, PRIORITY_TOPICS)
-            if desk == "coffee":
-                segment = "coffee"
+            # Only tag as coffee after pick_story if the picked story is genuinely coffee/viral (never serious fuel/economy news)
             focus = ("PRIORITY DESK FOR THIS SCAN: " + TOPIC_DESK[desk] + ". Return at least 3 stories from this desk or "
                      "the other priority topics. " + focus)
         else:
